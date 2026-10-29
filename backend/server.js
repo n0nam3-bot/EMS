@@ -83,6 +83,8 @@ if (!ON_VERCEL) {
   app.set("io", io);
 }
 
+app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok" }));
+
 app.use("/api", incidentRoutes);
 app.use("/api", locationRoutes);
 app.use("/api", unitRoutes);
@@ -96,8 +98,6 @@ app.use("/api", auditRoutes);
 // what's already here) each need a route file of their own,
 // following the exact same withTenant pattern as these six. That's
 // real work still to do, not a placeholder — see README.md.
-
-app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok" }));
 
 // Safety net for anything a route handler didn't already turn into a
 // specific 4xx response — not a replacement for the business-logic
