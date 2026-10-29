@@ -20,8 +20,8 @@ const PANEL = "#131A24";
 const VOID = "#0A0E13";
 const SUNKEN = "#0D131B";
 const TEXT_PRIMARY = "#E7ECF2";
-const TEXT_SECONDARY = "#8593A3";
-const TEXT_FAINT = "#57647A";
+const TEXT_SECONDARY = "#A9B6C6";
+const TEXT_FAINT = "#8795AB";
 const BLUE = "#4EA1F0";
 const AMBER = "#F5934A";
 const GREEN = "#34D399";
@@ -79,6 +79,9 @@ function project(lat, lon) {
   const y = (1 - (lat - MAP_BOUNDS.latMin) / (MAP_BOUNDS.latMax - MAP_BOUNDS.latMin)) * 100;
   return { x, y };
 }
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const TOMTOM_KEY = import.meta.env?.VITE_TOMTOM_KEY || "";
+
 function formatElapsed(ms) {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(totalSec / 3600);
@@ -242,6 +245,8 @@ export default function DispatchConsole() {
   const [apiToken, setApiToken] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("demo"); // demo | connecting | live | failed
   const [actionError, setActionError] = useState("");
+  const [selIncidentId, setSelIncidentId] = useState(null);
+  const [selUnitId, setSelUnitId] = useState(null);
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
@@ -343,6 +348,16 @@ export default function DispatchConsole() {
       }
     );
   }
+  const selIncident = incidents.find((i) => i.id === selIncidentId) || null;
+  const selUnit = units.find((u) => u.id === selUnitId) || null;
+  function toggleIncident(id) { setSelIncidentId((p) => (p === id ? null : id)); }
+  function toggleUnit(id) { setSelUnitId((p) => (p === id ? null : id)); }
+  function assignSelected() {
+    if (!selIncident || !selUnit) return;
+    const role = selIncident.assignedUnits.some((a) => a.role === "primary") ? "support" : "primary";
+    handleAssign(selIncident.id, selUnit.id, role);
+    setSelUnitId(null);
+  }
   function handleRelease(incidentId, unitId) {
     performAction(
       () => apiRequest("DELETE", `/incidents/${incidentId}/assignments/${unitId}`),
@@ -402,7 +417,7 @@ export default function DispatchConsole() {
   }
 
   return (
-    <div style={{ backgroundColor: VOID, color: TEXT_PRIMARY, fontFamily: "'Inter', system-ui, -apple-system, sans-serif" }} className="min-h-screen w-full">
+    <div style={{ backgroundColor: VOID, color: TEXT_PRIMARY, fontFamily: "'Inter', system-ui, -apple-system, sans-serif" }} className="min-h-screen w-full dispatch-root">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
         .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
@@ -412,6 +427,17 @@ export default function DispatchConsole() {
         .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #131A24; color: #E7ECF2; }
         .leaflet-container { background: #0D131B; }
         .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9); }
+        .dispatch-root .text-xs { font-size: 13px; line-height: 1.4; }
+        .dispatch-root .text-sm { font-size: 15px; }
+        .ems-icon { background: none; border: none; }
+        .ems-pin { position: absolute; display: flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; }
+        .ems-unit { transform: translate(-8px, -50%); }
+        .ems-inc { transform: translate(-11px, -50%); }
+        .ems-pin .lbl { font: 600 12px/1 Inter, system-ui, sans-serif; color: #fff; background: rgba(10,14,19,0.92); border: 1.5px solid var(--c); padding: 4px 7px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.6); }
+        .ems-pin .dot { width: 16px; height: 16px; border-radius: 50%; background: var(--c); border: 2px solid #fff; box-shadow: 0 0 0 2px rgba(0,0,0,0.5); }
+        .ems-pin .ring { width: 22px; height: 22px; border-radius: 50%; border: 3px solid var(--c); background: rgba(0,0,0,0.35); box-shadow: 0 0 0 2px rgba(0,0,0,0.5); }
+        .ems-pin.sel .dot, .ems-pin.sel .ring { box-shadow: 0 0 0 4px #fff, 0 0 14px 5px var(--c); transform: scale(1.25); }
+        .ems-pin.dim { opacity: 0.6; }
       `}</style>
 
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
@@ -442,12 +468,21 @@ export default function DispatchConsole() {
         </div>
       )}
 
-      <div className="px-4 pt-4">
-        <LiveMap units={units} incidents={activeIncidents} />
-      </div>
-
-      <div className="p-4 flex flex-col md:grid md:grid-cols-5 gap-4">
-        <div className="md:col-span-3 rounded-lg border" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
+      <div className="p-4 flex flex-col lg:grid lg:grid-cols-[minmax(0,1fr)_440px] gap-4 lg:items-start">
+        <div className="flex flex-col gap-3 lg:sticky lg:top-3 min-w-0">
+          <LiveMap
+            units={units} incidents={activeIncidents}
+            selUnitId={selUnitId} selIncidentId={selIncidentId}
+            onSelectUnit={toggleUnit} onSelectIncident={toggleIncident}
+          />
+          <DispatchBar
+            incident={selIncident} unit={selUnit}
+            onAssign={assignSelected}
+            onClear={() => { setSelIncidentId(null); setSelUnitId(null); }}
+          />
+        </div>
+        <div className="flex flex-col gap-4 min-w-0">
+        <div className="rounded-lg border" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
           <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
             <div className="text-sm font-semibold tracking-wide">TRANSPORT QUEUE</div>
             <button onClick={() => setShowNewCall(true)} className="flex items-center gap-1 text-xs font-medium px-3 py-1.5 rounded-md" style={{ backgroundColor: SUNKEN, color: TEXT_PRIMARY, border: `1px solid ${HAIRLINE}` }}>
@@ -459,18 +494,19 @@ export default function DispatchConsole() {
               <div className="px-4 py-8 text-center text-sm" style={{ color: TEXT_FAINT }}>Queue clear. No active transports.</div>
             )}
             {activeIncidents.map((incident) => (
-              <IncidentRow key={incident.id} incident={incident} now={now} units={units} onAssign={handleAssign} onRelease={handleRelease} onComplete={handleComplete} />
+              <IncidentRow key={incident.id} incident={incident} now={now} units={units} onAssign={handleAssign} onRelease={handleRelease} onComplete={handleComplete} selected={incident.id === selIncidentId} onSelect={toggleIncident} />
             ))}
           </div>
         </div>
 
-        <div className="md:col-span-2 rounded-lg border" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
+        <div className="rounded-lg border" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
           <div className="px-4 py-3 border-b text-sm font-semibold tracking-wide" style={{ borderColor: HAIRLINE }}>UNIT BOARD</div>
           <div className="p-3 flex flex-col gap-2">
             {units.map((unit) => (
-              <UnitCard key={unit.id} unit={unit} onStatusChange={handleStatusChange} />
+              <UnitCard key={unit.id} unit={unit} onStatusChange={handleStatusChange} selected={unit.id === selUnitId} onSelect={toggleUnit} />
             ))}
           </div>
+        </div>
         </div>
       </div>
 
@@ -566,13 +602,18 @@ function useLeafletLoader() {
   return status;
 }
 
-function LiveMap({ units, incidents }) {
+function LiveMap({ units, incidents, selUnitId, selIncidentId, onSelectUnit, onSelectIncident }) {
   const leafletStatus = useLeafletLoader();
   const [tilesWorking, setTilesWorking] = useState(null);
+  const [trafficOn, setTrafficOn] = useState(true);
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const layerRef = useRef(null);
+  const trafficRef = useRef(null);
+  const fittedRef = useRef(false);
   const tileStatsRef = useRef({ errors: 0, loads: 0 });
+  const cbRef = useRef({});
+  cbRef.current = { unit: onSelectUnit, incident: onSelectIncident };
 
   useEffect(() => {
     if (leafletStatus !== "ready" || !containerRef.current || mapRef.current) return;
@@ -581,7 +622,6 @@ function LiveMap({ units, incidents }) {
     const tileLayer = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
       attribution: "&copy; OpenStreetMap contributors",
       maxZoom: 19,
-      subdomains: "abcd",
     });
     tileLayer.on("tileload", () => {
       tileStatsRef.current.loads++;
@@ -596,6 +636,15 @@ function LiveMap({ units, incidents }) {
       }
     });
     tileLayer.addTo(map);
+    if (TOMTOM_KEY) {
+      // Own pane: sits above the (darkened) base map but is not inverted by it.
+      map.createPane("traffic");
+      map.getPane("traffic").style.zIndex = 250;
+      trafficRef.current = L.tileLayer(
+        `https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
+        { pane: "traffic", maxZoom: 19, opacity: 0.9 }
+      );
+    }
     layerRef.current = L.layerGroup().addTo(map);
     mapRef.current = map;
     return () => {
@@ -604,36 +653,124 @@ function LiveMap({ units, incidents }) {
   }, [leafletStatus]);
 
   useEffect(() => {
+    const map = mapRef.current;
+    const t = trafficRef.current;
+    if (!map || !t) return;
+    if (trafficOn) t.addTo(map); else map.removeLayer(t);
+  }, [trafficOn, tilesWorking]);
+
+  function fitAll() {
+    const map = mapRef.current;
+    if (!map) return;
+    const pts = [
+      ...units.filter((u) => u.lat != null && u.lon != null).map((u) => [u.lat, u.lon]),
+      ...incidents.filter((i) => i.lat != null && i.lon != null).map((i) => [i.lat, i.lon]),
+    ];
+    if (pts.length > 0) map.fitBounds(pts, { padding: [60, 60], maxZoom: 14 });
+  }
+
+  useEffect(() => {
     if (!mapRef.current || !layerRef.current) return;
     const L = window.L;
     layerRef.current.clearLayers();
-    units.forEach((u) => {
-      if (u.lat == null || u.lon == null) return;
-      const color = STATUS_CONFIG[u.status].color;
-      L.circleMarker([u.lat, u.lon], { radius: 7, color: "#fff", weight: 1.5, fillColor: color, fillOpacity: 0.9 })
-        .bindPopup(`<b>${u.designation}</b><br/>${STATUS_CONFIG[u.status].label} \u00b7 ${u.capability}`)
-        .addTo(layerRef.current);
-    });
-    incidents.filter((i) => i.assignedUnits.length === 0 && i.lat != null && i.lon != null).forEach((i) => {
+    const selU = units.find((u) => u.id === selUnitId);
+    const selI = incidents.find((i) => i.id === selIncidentId);
+    if (selU && selI && selU.lat != null && selI.lat != null) {
+      L.polyline([[selU.lat, selU.lon], [selI.lat, selI.lon]], { color: "#4EA1F0", weight: 3, dashArray: "6 8" }).addTo(layerRef.current);
+    }
+    incidents.filter((i) => i.lat != null && i.lon != null).forEach((i) => {
       const color = PRIORITY_CONFIG[i.priority].color;
-      L.circleMarker([i.lat, i.lon], { radius: 9, color, weight: 2, fillOpacity: 0 })
-        .bindPopup(`<b>${i.address}</b><br/>${PRIORITY_CONFIG[i.priority].label}`)
+      const dim = i.assignedUnits.length > 0 && i.id !== selIncidentId;
+      const short = i.address.length > 30 ? i.address.slice(0, 29) + "\u2026" : i.address;
+      const icon = L.divIcon({
+        className: "ems-icon", iconSize: [0, 0],
+        html: `<div class="ems-pin ems-inc${i.id === selIncidentId ? " sel" : ""}${dim ? " dim" : ""}" style="--c:${color}"><span class="ring"></span><span class="lbl">${esc(short)}</span></div>`,
+      });
+      L.marker([i.lat, i.lon], { icon, zIndexOffset: i.id === selIncidentId ? 1000 : 0 })
+        .on("click", () => cbRef.current.incident && cbRef.current.incident(i.id))
         .addTo(layerRef.current);
     });
-  }, [units, incidents]);
+    units.filter((u) => u.lat != null && u.lon != null).forEach((u) => {
+      const color = STATUS_CONFIG[u.status].color;
+      const icon = L.divIcon({
+        className: "ems-icon", iconSize: [0, 0],
+        html: `<div class="ems-pin ems-unit${u.id === selUnitId ? " sel" : ""}" style="--c:${color}"><span class="dot"></span><span class="lbl">${esc(u.designation)} \u00b7 ${esc(u.capability)}</span></div>`,
+      });
+      L.marker([u.lat, u.lon], { icon, zIndexOffset: u.id === selUnitId ? 1000 : 500 })
+        .on("click", () => cbRef.current.unit && cbRef.current.unit(u.id))
+        .addTo(layerRef.current);
+    });
+    if (!fittedRef.current) {
+      const any = units.some((u) => u.lat != null) || incidents.some((i) => i.lat != null);
+      if (any) { fitAll(); fittedRef.current = true; }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [units, incidents, selUnitId, selIncidentId, tilesWorking]);
 
   if (leafletStatus === "failed" || tilesWorking === false) {
     return <ZoneMap units={units} incidents={incidents} />;
   }
+  const chip = { backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY };
   return (
     <div className="rounded-lg border p-3" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
       <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
-        <div className="text-xs tracking-wide" style={{ color: TEXT_FAINT }}>SERVICE AREA — BRONX, NY</div>
-        <div className="text-xs" style={{ color: tilesWorking === true ? GREEN : TEXT_FAINT }}>
-          {tilesWorking === true ? "Real map tiles · live" : "Loading map…"}
+        <div className="text-xs tracking-wide font-semibold" style={{ color: TEXT_SECONDARY }}>LIVE MAP — tap a unit or a call to select it</div>
+        <div className="flex items-center gap-2 text-xs">
+          <button onClick={fitAll} className="px-2.5 py-1.5 rounded-md" style={chip}>Fit all</button>
+          {TOMTOM_KEY ? (
+            <button onClick={() => setTrafficOn((v) => !v)} className="px-2.5 py-1.5 rounded-md" style={{ ...chip, borderColor: trafficOn ? GREEN : HAIRLINE, color: trafficOn ? GREEN : TEXT_PRIMARY }}>
+              Traffic {trafficOn ? "on" : "off"}
+            </button>
+          ) : (
+            <span style={{ color: TEXT_FAINT }} title="Set VITE_TOMTOM_KEY in Vercel to enable the traffic layer">Traffic: not configured</span>
+          )}
+          <span style={{ color: tilesWorking === true ? GREEN : TEXT_FAINT }}>{tilesWorking === true ? "Map live" : "Loading map…"}</span>
         </div>
       </div>
-      <div ref={containerRef} style={{ height: "220px", borderRadius: "6px", backgroundColor: SUNKEN }} />
+      <div ref={containerRef} style={{ height: "clamp(340px, calc(100vh - 330px), 900px)", borderRadius: "6px", backgroundColor: SUNKEN }} />
+    </div>
+  );
+}
+
+function DispatchBar({ incident, unit, onAssign, onClear }) {
+  if (!incident && !unit) {
+    return (
+      <div className="rounded-lg border px-4 py-3 text-sm" style={{ backgroundColor: PANEL, borderColor: HAIRLINE, color: TEXT_SECONDARY }}>
+        Select a call and a unit (on the map or in the lists) to dispatch.
+      </div>
+    );
+  }
+  const located = (o) => o && o.lat != null && o.lon != null;
+  const miles = located(incident) && located(unit) ? haversineMiles(unit, incident) : null;
+  const eta = miles != null ? Math.max(1, Math.round(estimateEtaMinutes(miles))) : null;
+  const needsAls = incident && incident.capabilityNeeded === "ALS" && unit && unit.capability === "BLS";
+  const unitFree = unit && unit.status === "available";
+  const canAssign = incident && unit && unitFree;
+  let hint = "";
+  if (incident && unit && !unitFree) hint = `${unit.designation} is ${STATUS_CONFIG[unit.status].label.toLowerCase()} \u2014 free it first.`;
+  else if (needsAls) hint = "This call needs ALS; this unit is BLS.";
+  else if (incident && !unit) hint = "Now pick a unit.";
+  else if (unit && !incident) hint = "Now pick a call.";
+  return (
+    <div className="rounded-lg border px-4 py-3 flex flex-col gap-2" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-sm">
+        <div>
+          <span style={{ color: TEXT_FAINT }}>Call: </span>
+          {incident ? <span className="font-semibold">{incident.address} <span style={{ color: PRIORITY_CONFIG[incident.priority].color }}>({PRIORITY_CONFIG[incident.priority].label}, {incident.capabilityNeeded})</span></span> : <span style={{ color: TEXT_FAINT }}>none</span>}
+        </div>
+        <div>
+          <span style={{ color: TEXT_FAINT }}>Unit: </span>
+          {unit ? <span className="font-semibold mono">{unit.designation} <span style={{ color: STATUS_CONFIG[unit.status].color }}>({unit.capability}, {STATUS_CONFIG[unit.status].label})</span></span> : <span style={{ color: TEXT_FAINT }}>none</span>}
+        </div>
+        {eta != null && <div style={{ color: TEXT_SECONDARY }}>{miles.toFixed(1)} mi straight-line \u00b7 ~{eta} min (estimate, no live traffic)</div>}
+      </div>
+      <div className="flex items-center gap-3 flex-wrap">
+        <button onClick={onAssign} disabled={!canAssign} className="px-4 rounded-md text-sm font-semibold" style={{ minHeight: "44px", backgroundColor: canAssign ? "#1F6B4A" : SUNKEN, color: canAssign ? "#fff" : TEXT_FAINT, border: `1px solid ${canAssign ? GREEN : HAIRLINE}`, cursor: canAssign ? "pointer" : "not-allowed" }}>
+          {unit && incident ? `Assign ${unit.designation} to this call` : "Assign"}
+        </button>
+        <button onClick={onClear} className="px-4 rounded-md text-sm" style={{ minHeight: "44px", backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }}>Clear</button>
+        {hint && <span className="text-xs" style={{ color: needsAls || (unit && !unitFree) ? AMBER : TEXT_SECONDARY }}>{hint}</span>}
+      </div>
     </div>
   );
 }
@@ -662,7 +799,7 @@ function ZoneMap({ units, incidents }) {
   );
 }
 
-function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete }) {
+function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, selected, onSelect }) {
   const [confirming, setConfirming] = useState(false);
   const elapsedMs = now - incident.callReceivedAt;
   const target = PRIORITY_CONFIG[incident.priority].targetMin * 60 * 1000;
@@ -675,7 +812,7 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete }) 
   const { routed, status: routeStatus } = useRoutedEta(rec?.unit, incident);
 
   return (
-    <div className="px-4 py-3 border-b" style={{ borderColor: "#1B2330" }}>
+    <div className="px-4 py-3 border-b" onClick={() => onSelect && onSelect(incident.id)} style={{ borderColor: "#1B2330", cursor: "pointer", backgroundColor: selected ? "rgba(78,161,240,0.10)" : undefined, boxShadow: selected ? `inset 4px 0 0 ${BLUE}` : undefined }}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
@@ -742,11 +879,11 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete }) 
   );
 }
 
-function UnitCard({ unit, onStatusChange }) {
+function UnitCard({ unit, onStatusChange, selected, onSelect }) {
   const cfg = STATUS_CONFIG[unit.status];
   const Icon = cfg.icon;
   return (
-    <div className="rounded-md px-3 py-2 flex items-center justify-between gap-2" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}` }}>
+    <div className="rounded-md px-3 py-2 flex items-center justify-between gap-2" onClick={() => onSelect && onSelect(unit.id)} style={{ backgroundColor: SUNKEN, border: `1px solid ${selected ? BLUE : HAIRLINE}`, cursor: "pointer", boxShadow: selected ? `0 0 0 1px ${BLUE}` : undefined }}>
       <div className="flex items-center gap-2 min-w-0">
         <Icon size={16} color={cfg.color} className="shrink-0" />
         <div className="min-w-0">
