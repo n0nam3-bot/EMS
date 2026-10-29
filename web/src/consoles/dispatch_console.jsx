@@ -238,7 +238,7 @@ export default function DispatchConsole() {
   const [form, setForm] = useState({ type: "emergency_911", priority: "emergent", address: "", capabilityNeeded: "BLS" });
 
   const [showSettings, setShowSettings] = useState(false);
-  const [apiBaseUrl, setApiBaseUrl] = useState("");
+  const [apiBaseUrl, setApiBaseUrl] = useState(`${window.location.origin}/api`);
   const [apiToken, setApiToken] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("demo"); // demo | connecting | live | failed
   const [actionError, setActionError] = useState("");
