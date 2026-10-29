@@ -22,9 +22,28 @@
 // -----------------------------------------------------------------------
 
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 import { requestContext } from "./backend_context.js";
 import { withTenant } from "./backend_db.js";
 import { auditDenied } from "./backend_audit.js";
+
+// The public key arrives through an environment variable, and phones, dashboards
+// and copy-paste mangle it in many ways: real newlines, literal "\\n", wrapping
+// quotes, a missing BEGIN/END header. Accept all of them.
+export function normalizeKey(raw) {
+  let k = (raw || "").trim().replace(/^["']|["']$/g, "").replace(/\\n/g, "\n").trim();
+  if (k && !k.includes("BEGIN")) {
+    const body = k.replace(/\s+/g, "");
+    k = `-----BEGIN PUBLIC KEY-----\n${(body.match(/.{1,64}/g) || []).join("\n")}\n-----END PUBLIC KEY-----`;
+  }
+  return k;
+}
+
+// For /api/health: says whether the key can be read, never what it is.
+export function publicKeyStatus() {
+  if (!process.env.JWT_PUBLIC_KEY) return "missing";
+  try { crypto.createPublicKey(normalizeKey(process.env.JWT_PUBLIC_KEY)); return "valid"; } catch (e) { return "unreadable"; }
+}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -54,8 +73,10 @@ export async function resolveSession(token) {
   if (!token) return { error: "Missing session token" };
   let payload;
   try {
-    payload = jwt.verify(token, (process.env.JWT_PUBLIC_KEY || "").replace(/\\n/g, "\n"), { algorithms: ["RS256"] });
+    payload = jwt.verify(token.replace(/\s+/g, ""), normalizeKey(process.env.JWT_PUBLIC_KEY), { algorithms: ["RS256"] });
   } catch (err) {
+    // The caller only ever sees the generic message; the real reason goes to the server log.
+    console.error("session token rejected:", err.message);
     return refused;
   }
   // Both become UUID-typed values in the database. A malformed claim

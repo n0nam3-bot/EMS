@@ -31,6 +31,7 @@ import pcrDetailRoutes from "./backend_routes_pcr_detail.js";
 import auditRoutes from "./backend_routes_audit.js";
 import { attachWebSocket } from "./backend_websocket.js";
 import { assertIsolationEnforced } from "./backend_db.js";
+import { publicKeyStatus } from "./backend_auth.js";
 
 // On Vercel this file runs as a serverless function: no port to listen on and
 // no long-lived WebSocket. Everywhere else (local, Docker, tests) it behaves
@@ -83,7 +84,8 @@ if (!ON_VERCEL) {
   app.set("io", io);
 }
 
-app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok" }));
+// Before the routers: they require a login, health must not.
+app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok", build: 3, jwtKey: publicKeyStatus() }));
 
 app.use("/api", incidentRoutes);
 app.use("/api", locationRoutes);
@@ -98,6 +100,7 @@ app.use("/api", auditRoutes);
 // what's already here) each need a route file of their own,
 // following the exact same withTenant pattern as these six. That's
 // real work still to do, not a placeholder — see README.md.
+
 
 // Safety net for anything a route handler didn't already turn into a
 // specific 4xx response — not a replacement for the business-logic
