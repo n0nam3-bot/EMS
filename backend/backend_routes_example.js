@@ -16,6 +16,35 @@ import { withTenant } from "./backend_db.js";
 import { requireAuth, requireRole } from "./backend_auth.js";
 import { auditView } from "./backend_audit.js";
 
+
+// Free, keyless geocoding (US Census first, OpenStreetMap Nominatim as a
+// fallback). Off unless GEOCODE_ENABLED=true so tests and local runs never
+// make outbound calls. Best effort: a failure just means no map marker.
+async function geocodeAddress(address) {
+  if (process.env.GEOCODE_ENABLED !== "true" || !address) return null;
+  try {
+    const r = await fetch(
+      "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?benchmark=Public_AR_Current&format=json&address=" + encodeURIComponent(address),
+      { signal: AbortSignal.timeout(4000) }
+    );
+    if (r.ok) {
+      const m = (await r.json()).result?.addressMatches?.[0];
+      if (m) return { lat: m.coordinates.y, lon: m.coordinates.x };
+    }
+  } catch (err) { /* fall through to the fallback */ }
+  try {
+    const r = await fetch(
+      "https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=us&q=" + encodeURIComponent(address),
+      { headers: { "User-Agent": "ems-dispatch/0.1 (dispatch geocoder)" }, signal: AbortSignal.timeout(4000) }
+    );
+    if (r.ok) {
+      const m = (await r.json())[0];
+      if (m) return { lat: Number(m.lat), lon: Number(m.lon) };
+    }
+  } catch (err) { /* no coordinates */ }
+  return null;
+}
+
 const router = express.Router();
 router.use(requireAuth);
 
@@ -97,7 +126,12 @@ router.get("/incidents/:id", async (req, res) => {
 // ignored. (The dispatch console never sent one, so "New Call" in live
 // mode failed on the NOT NULL constraint with an opaque 500.)
 router.post("/incidents", async (req, res) => {
-  const { incidentType, priority, sceneAddress, lat, lon } = req.body;
+  let { incidentType, priority, sceneAddress, lat, lon } = req.body;
+  if (lat == null || lon == null) {
+    // Before opening the transaction: no database connection is held while waiting on the network.
+    const g = await geocodeAddress(sceneAddress);
+    if (g) ({ lat, lon } = g);
+  }
   const result = await withTenant(req.user.tenantId, async (client) => {
     const active = await client.query(
       `SELECT protocol_set_id FROM protocol_sets

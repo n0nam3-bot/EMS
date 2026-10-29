@@ -90,11 +90,13 @@ export function attachWebSocket(httpServer) {
 // neither the caller nor this function needs to know which recipients
 // fall into which case.
 export function broadcastUnitStatusChange(io, { tenantId, incidentId, unit }) {
+  if (!io) return; // serverless (Vercel) runs without a live feed
   io.to(`tenant:${tenantId}`).emit("unit:status", unit);
   if (incidentId) io.to(`incident:${incidentId}`).emit("unit:status", unit);
 }
 
 export function broadcastNewIncident(io, { tenantId, incident }) {
+  if (!io) return; // serverless (Vercel) runs without a live feed
   io.to(`tenant:${tenantId}`).emit("incident:new", incident);
 }
 

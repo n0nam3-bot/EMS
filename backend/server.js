@@ -32,21 +32,56 @@ import auditRoutes from "./backend_routes_audit.js";
 import { attachWebSocket } from "./backend_websocket.js";
 import { assertIsolationEnforced } from "./backend_db.js";
 
+// On Vercel this file runs as a serverless function: no port to listen on and
+// no long-lived WebSocket. Everywhere else (local, Docker, tests) it behaves
+// exactly as before.
+const ON_VERCEL = Boolean(process.env.VERCEL);
+
 // Fail closed: see assertIsolationEnforced. Done before anything listens.
-try {
-  await assertIsolationEnforced();
-} catch (err) {
-  console.error(err.message);
-  process.exit(1);
+if (!ON_VERCEL) {
+  try {
+    await assertIsolationEnforced();
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
 }
 
 const app = express();
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN }));
 app.use(express.json());
 
-const httpServer = http.createServer(app);
-const io = attachWebSocket(httpServer);
-app.set("io", io);
+if (ON_VERCEL) {
+  // Depending on how the platform routes /api/* to this function, the
+  // "/api" prefix may or may not still be on the path. Normalize so the
+  // routes below match either way.
+  app.use((req, res, next) => {
+    if (!req.url.startsWith("/api") && !req.url.startsWith("/health")) req.url = "/api" + req.url;
+    next();
+  });
+  // Same fail-closed check, run once per function instance on first use
+  // (a serverless function has no "startup" to refuse). Retried on failure.
+  let isolationCheck;
+  app.use(async (req, res, next) => {
+    if (req.path.endsWith("/health")) return next();
+    try {
+      isolationCheck ??= assertIsolationEnforced();
+      await isolationCheck;
+      next();
+    } catch (err) {
+      isolationCheck = undefined;
+      console.error(err.message);
+      res.status(503).json({ error: err.message });
+    }
+  });
+}
+
+let httpServer = null;
+if (!ON_VERCEL) {
+  httpServer = http.createServer(app);
+  const io = attachWebSocket(httpServer);
+  app.set("io", io);
+}
 
 app.use("/api", incidentRoutes);
 app.use("/api", locationRoutes);
@@ -62,7 +97,7 @@ app.use("/api", auditRoutes);
 // following the exact same withTenant pattern as these six. That's
 // real work still to do, not a placeholder — see README.md.
 
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok" }));
 
 // Safety net for anything a route handler didn't already turn into a
 // specific 4xx response — not a replacement for the business-logic
@@ -82,7 +117,12 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-const PORT = process.env.PORT || 3000;
-httpServer.listen(PORT, () => {
-  console.log(`EMS dispatch API listening on port ${PORT}`);
-});
+if (httpServer) {
+  const PORT = process.env.PORT || 3000;
+  httpServer.listen(PORT, () => {
+    console.log(`EMS dispatch API listening on port ${PORT}`);
+  });
+}
+
+// Vercel's Express support runs the exported app.
+export default app;

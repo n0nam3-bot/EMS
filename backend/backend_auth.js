@@ -54,7 +54,7 @@ export async function resolveSession(token) {
   if (!token) return { error: "Missing session token" };
   let payload;
   try {
-    payload = jwt.verify(token, process.env.JWT_PUBLIC_KEY, { algorithms: ["RS256"] });
+    payload = jwt.verify(token, (process.env.JWT_PUBLIC_KEY || "").replace(/\\n/g, "\n"), { algorithms: ["RS256"] });
   } catch (err) {
     return refused;
   }

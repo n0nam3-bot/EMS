@@ -20,7 +20,8 @@ import { currentUserId } from "./backend_context.js";
 
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
-  max: 20,
+  // Serverless: every function instance has its own pool, so keep it small.
+  max: Number(process.env.PG_POOL_MAX) || (process.env.VERCEL ? 3 : 20),
 });
 
 /**
