@@ -1,0 +1,26 @@
+{
+  "name": "ems-dispatch-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend API for the EMS dispatch platform \u2014 see README.md for what's real here and what still isn't.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "migrate": "node migrate.js",
+    "test": "node --test --test-concurrency=1 --test-timeout=120000 tests/isolation.test.js tests/api-client.test.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-async-errors": "^3.1.1",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9",
+    "socket.io-client": "^4.8.4"
+  }
+}

@@ -1,0 +1,53 @@
+# Local development only — not a production deployment topology.
+# Brings up a real PostGIS-enabled Postgres and the API together so the
+# whole stack can actually be tested end to end, not just read.
+#
+#   docker compose up -d db      # start Postgres first
+#   npm run migrate              # applies all six files AND creates
+#                                 # the restricted ems_app_runtime role
+#                                 # (requires RUNTIME_DB_PASSWORD set)
+#   docker compose up api        # start the API
+#
+# The postgis/postgis image specifically, not plain postgres — the
+# core schema's first line is CREATE EXTENSION postgis, and that
+# extension has to already be available in the image or every
+# migration after it fails immediately.
+#
+# Two roles, not one: `db` below only creates the migration/owner role.
+# `npm run migrate` creates a second, restricted role (ems_app_runtime)
+# that the api service actually connects as — confirmed necessary by a
+# live test where using the owner role's connection let one tenant read
+# another tenant's data with zero mutual-aid grant in place, because
+# table owners bypass RLS the same way superusers do.
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ems_dispatch
+      POSTGRES_USER: ems_app
+      POSTGRES_PASSWORD: dev_only_change_me
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build: .
+    environment:
+      MIGRATION_DATABASE_URL: postgres://ems_app:dev_only_change_me@db:5432/ems_dispatch
+      DATABASE_URL: postgres://ems_app_runtime:dev_only_change_me@db:5432/ems_dispatch
+      RUNTIME_DB_PASSWORD: dev_only_change_me
+      PORT: 3000
+      ALLOWED_ORIGIN: http://localhost:5173
+      # JWT_PUBLIC_KEY intentionally not set here — same reason as
+      # .env.example. Every authenticated request will 401 until a
+      # real one is supplied; that's correct behavior, not a bug to
+      # work around for local testing.
+    ports:
+      - "3000:3000"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
