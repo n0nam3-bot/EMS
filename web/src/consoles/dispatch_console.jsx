@@ -295,7 +295,7 @@ export default function DispatchConsole() {
     setConnectionStatus("connecting");
     refreshFromApi()
       .then(() => { if (!cancelled) setConnectionStatus("live"); })
-      .catch(() => { if (!cancelled) setConnectionStatus("failed"); });
+      .catch((e) => { if (!cancelled) { setConnectionStatus("failed"); setActionError("Could not connect: " + (e.message || "network error")); } });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, apiBaseUrl, apiToken]);
@@ -411,6 +411,7 @@ export default function DispatchConsole() {
         button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid #4EA1F0; outline-offset: 1px; }
         .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #131A24; color: #E7ECF2; }
         .leaflet-container { background: #0D131B; }
+        .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9); }
       `}</style>
 
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
@@ -577,8 +578,8 @@ function LiveMap({ units, incidents }) {
     if (leafletStatus !== "ready" || !containerRef.current || mapRef.current) return;
     const L = window.L;
     const map = L.map(containerRef.current).setView([40.85, -73.89], 12);
-    const tileLayer = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-      attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
+    const tileLayer = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "&copy; OpenStreetMap contributors",
       maxZoom: 19,
       subdomains: "abcd",
     });
