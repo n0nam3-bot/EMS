@@ -1,1 +1,64 @@
+name: Set up database
 
+# Run from the Actions tab (phone browser works): builds the tables in your
+# Neon database, creates your agency, an admin user and your units.
+# Safe to run again — it only adds what's missing (e.g. new units).
+#
+# Repo secrets needed (Settings > Secrets and variables > Actions):
+#   MIGRATION_DATABASE_URL  Neon DIRECT connection string (owner role, no "-pooler" in the host)
+#   RUNTIME_DB_PASSWORD     a new password you invent for the app's restricted database login
+
+on:
+  workflow_dispatch:
+    inputs:
+      agency_name:
+        description: Agency name
+        default: Example Ambulance
+      agency_state:
+        description: State code
+        default: NY
+      protocol_authority:
+        description: Medical protocol authority
+        default: Local protocols
+      admin_email:
+        description: Your email (admin login record)
+        default: admin@example.com
+      units:
+        description: "Units as Name:Level, comma separated (BLS, ALS or CCT)"
+        default: "Medic 1:ALS,Medic 2:BLS"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        working-directory: backend
+        run: npm ci
+      - name: Create tables and the restricted app login
+        working-directory: backend
+        env:
+          MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+          RUNTIME_DB_PASSWORD: ${{ secrets.RUNTIME_DB_PASSWORD }}
+        run: |
+          # Skip if already migrated (re-runs only add units)
+          if psql "$MIGRATION_DATABASE_URL" -tAc "SELECT to_regclass('public.tenants')" | grep -q tenants; then
+            echo "Tables already exist - skipping migrations"
+          else
+            npm run migrate
+          fi
+      - name: Create agency, admin user and units
+        working-directory: backend
+        env:
+          MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+          TENANT_ID: 610d9091-2a98-444a-8822-96370b293cfc
+          USER_ID: 3fcc880e-df88-4d68-876c-2b480074649a
+          AGENCY_NAME: ${{ inputs.agency_name }}
+          AGENCY_STATE: ${{ inputs.agency_state }}
+          PROTOCOL_AUTHORITY: ${{ inputs.protocol_authority }}
+          ADMIN_EMAIL: ${{ inputs.admin_email }}
+          UNITS: ${{ inputs.units }}
+        run: node scripts/bootstrap.js
