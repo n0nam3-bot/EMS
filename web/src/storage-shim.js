@@ -3,11 +3,9 @@
 // and the dispatch console calls it on every render — without this, the
 // page is blank.
 //
-// sessionStorage, not localStorage, on purpose: the dispatch console saves
-// the API token it's given into this store (a development convenience), and
-// a token that survives closing the tab is a bigger exposure than losing a
-// little demo state. Replace the pasted-token flow with real sign-in before
-// real use; then this store holds nothing sensitive.
+// sessionStorage on purpose: this only holds the demo's scratch state and the
+// ePCR reference documents. The signed-in session is handled by App.jsx, and
+// real company data is never cached in the browser.
 if (typeof window !== "undefined" && !window.storage) {
   const P = "ems:";
   window.storage = {

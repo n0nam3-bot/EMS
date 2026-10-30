@@ -84,22 +84,34 @@ function completenessColor(score) {
   return RED;
 }
 
+// What each completeness check failing means, in plain words.
+const CHECK_TEXT = {
+  has_vitals: "No vital signs recorded",
+  has_disposition: "No disposition recorded",
+  has_crew_signature: "No crew signature",
+  transport_has_destination: "Transported, but no destination facility",
+  refusal_has_signature: "Refusal without a refusal signature",
+};
+
 async function apiGet(baseUrl, token, path) {
   const res = await fetch(`${baseUrl}${path}`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || `HTTP ${res.status}`);
   return res.json();
 }
 
-export default function ComplianceConsole() {
+// Signed in (`live`): only this company's real records, never sample data.
+// "View demo" (or no session, as in tests): the illustrative sample.
+export default function ComplianceConsole({ session }) {
+  const live = session?.mode === "live";
   const [tab, setTab] = useState("certs");
-  const [pcrs, setPcrs] = useState(demoPcrs);
+  const [pcrs, setPcrs] = useState(live ? [] : demoPcrs);
 
-  const [showSettings, setShowSettings] = useState(false);
-  const [apiBaseUrl, setApiBaseUrl] = useState("");
-  const [apiToken, setApiToken] = useState("");
-  const [connectionStatus, setConnectionStatus] = useState("demo"); // demo | connecting | live | failed
-  const [certs, setCerts] = useState(demoCerts);
-  const [vehicles, setVehicles] = useState(demoVehicles);
+  const apiBaseUrl = live ? session.apiBaseUrl : "";
+  const apiToken = live ? session.token : "";
+  const [connectionStatus, setConnectionStatus] = useState(live ? "connecting" : "demo"); // demo | connecting | live | failed
+  const [loadError, setLoadError] = useState("");
+  const [certs, setCerts] = useState(live ? [] : demoCerts);
+  const [vehicles, setVehicles] = useState(live ? [] : demoVehicles);
 
   useEffect(() => {
     if (!apiBaseUrl || !apiToken) { setConnectionStatus("demo"); return; }
@@ -108,14 +120,24 @@ export default function ComplianceConsole() {
     Promise.all([
       apiGet(apiBaseUrl, apiToken, "/certifications"),
       apiGet(apiBaseUrl, apiToken, "/vehicles"),
+      // Review queue is for reviewers only; other roles just don't get one.
+      apiGet(apiBaseUrl, apiToken, "/pcr-review").catch(() => []),
     ])
-      .then(([apiCerts, apiVehicles]) => {
+      .then(([apiCerts, apiVehicles, apiPcrs]) => {
         if (cancelled) return;
+        setPcrs(apiPcrs.map((p) => {
+          const total = Number(p.total) || 1;
+          return {
+            id: p.pcr_id, status: "pending", incidentRef: `${p.scene_address}`, crew: new Date(p.created_at).toLocaleString(),
+            completeness: Math.round((Number(p.passed) / total) * 100),
+            flags: (p.failed || []).map((f) => CHECK_TEXT[f] || f),
+          };
+        }));
         setCerts(apiCerts.map((c) => ({ id: c.certification_id, crewMember: `${c.first_name} ${c.last_name}`, certType: c.cert_type, expiresOn: new Date(c.expires_on) })));
         setVehicles(apiVehicles.map((v) => ({ id: v.vehicle_id, unit: v.unit_designation, inspectionDue: v.next_inspection_due ? new Date(v.next_inspection_due) : null })));
         setConnectionStatus("live");
       })
-      .catch(() => { if (!cancelled) setConnectionStatus("failed"); });
+      .catch((e) => { if (!cancelled) { setConnectionStatus("failed"); setLoadError(e.message || "Could not load"); } });
     return () => { cancelled = true; };
   }, [apiBaseUrl, apiToken]);
 
@@ -151,35 +173,38 @@ export default function ComplianceConsole() {
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <div>
             <div className="text-xs tracking-widest uppercase" style={{ color: TEXT_FAINT }}>Compliance Console</div>
-            <div className="text-lg font-semibold">Citywide Mobile Response</div>
+            <div className="text-lg font-semibold">{live ? session.agency : "Citywide Mobile Response"}</div>
           </div>
           <div className="flex items-center gap-2">
             <ConnectionBadge status={connectionStatus} />
-            <button onClick={() => setShowSettings(true)} className="flex items-center gap-1 text-xs px-2 py-1 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>
-              <Settings size={13} /> API
-            </button>
           </div>
         </div>
         <div className="flex gap-2 mt-3 flex-wrap">
           <StatPill label="Certs Critical" value={criticalCertCount} color={RED} />
           <StatPill label="Vehicles Critical" value={criticalVehicleCount} color={RED} />
           <StatPill label="PCRs Pending" value={pendingPcrCount} color={AMBER} />
-          <StatPill label="Open Cases" value={openCaseCount} color={BLUE} />
+          {!live && <StatPill label="Open Cases" value={openCaseCount} color={BLUE} />}
         </div>
       </div>
 
       <div className="flex gap-1 px-4 pt-3 border-b" style={{ borderColor: HAIRLINE }}>
         <TabButton active={tab === "certs"} onClick={() => setTab("certs")} icon={ShieldAlert} label="Certs & Fleet" />
         <TabButton active={tab === "pcr"} onClick={() => setTab("pcr")} icon={CheckCircle2} label="PCR Review" />
-        <TabButton active={tab === "investigations"} onClick={() => setTab("investigations")} icon={ClipboardList} label="Investigations" />
+        {!live && <TabButton active={tab === "investigations"} onClick={() => setTab("investigations")} icon={ClipboardList} label="Investigations" />}
       </div>
 
       <div className="p-4">
         {tab === "certs" && (
           <div className="flex flex-col gap-4">
-            {connectionStatus !== "live" && (
+            {!live && (
               <div className="text-xs px-3 py-2 rounded-md" style={{ color: TEXT_FAINT, backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}` }}>
-                Demo data — connect via the API button above for real certification and vehicle records.
+                Demo data. Sign in to see your own company's records.
+              </div>
+            )}
+            {live && connectionStatus === "failed" && <div className="text-xs" style={{ color: RED }}>Could not load: {loadError}</div>}
+            {live && connectionStatus === "live" && certs.length === 0 && vehicles.length === 0 && (
+              <div className="text-xs px-3 py-2 rounded-md" style={{ color: TEXT_SECONDARY, backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}` }}>
+                Nothing here yet. This screen shows what a supervisor enters under Team: each person's certifications and expiry dates, and each vehicle's inspection due date.
               </div>
             )}
             <Panel title="CERTIFICATIONS">
@@ -194,10 +219,10 @@ export default function ComplianceConsole() {
         {tab === "pcr" && (
           <div className="flex flex-col gap-3">
             <div className="text-xs px-3 py-2 rounded-md flex items-center gap-1.5" style={{ color: AMBER, backgroundColor: "rgba(245,166,35,0.08)", border: "1px solid #4A3A1E" }}>
-              <AlertTriangle size={13} /> Demo data — no backend route exists yet for PCR review. pcr_completeness_check() is real SQL (epcr_clinical_schema.sql) but isn't exposed as an API endpoint.
+              <AlertTriangle size={13} /> {live ? "Charts that crews have started and not yet finalized, checked against the completeness rules. Approve and flag aren't built yet." : "Demo data."}
             </div>
             <Panel title="PCR REVIEW QUEUE">
-              {visiblePcrs.length === 0 && <div className="px-4 py-8 text-center text-sm" style={{ color: TEXT_FAINT }}>All charts reviewed.</div>}
+              {visiblePcrs.length === 0 && <div className="px-4 py-8 text-center text-sm" style={{ color: TEXT_FAINT }}>{live ? "No open charts." : "All charts reviewed."}</div>}
               {visiblePcrs.map((p) => (
                 <div key={p.id} className="px-4 py-3 border-b" style={{ borderColor: "#1B2330" }}>
                   <div className="flex items-start justify-between gap-3">
@@ -214,8 +239,8 @@ export default function ComplianceConsole() {
                   )}
                   <div className="mt-2 flex items-center gap-2 flex-wrap">
                     {p.status === "flagged" && <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: AMBER, backgroundColor: "rgba(245,147,58,0.1)" }}>Flagged — awaiting crew correction</span>}
-                    <button onClick={() => handleApprove(p.id)} className="text-xs px-2 py-1 rounded font-medium" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>Approve</button>
-                    {p.status !== "flagged" && <button onClick={() => handleFlag(p.id)} className="text-xs px-2 py-1 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Flag for Correction</button>}
+                    {!live && <button onClick={() => handleApprove(p.id)} className="text-xs px-2 py-1 rounded font-medium" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>Approve</button>}
+                    {!live && p.status !== "flagged" && <button onClick={() => handleFlag(p.id)} className="text-xs px-2 py-1 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Flag for Correction</button>}
                   </div>
                 </div>
               ))}
@@ -249,7 +274,6 @@ export default function ComplianceConsole() {
         )}
       </div>
 
-      {showSettings && <SettingsModal apiBaseUrl={apiBaseUrl} setApiBaseUrl={setApiBaseUrl} apiToken={apiToken} setApiToken={setApiToken} onClose={() => setShowSettings(false)} />}
     </div>
   );
 }
@@ -263,36 +287,6 @@ function ConnectionBadge({ status }) {
   }[status];
   const Icon = cfg.icon;
   return <div className="flex items-center gap-1 text-xs px-2 py-1 rounded" style={{ color: cfg.color, border: `1px solid ${HAIRLINE}` }}><Icon size={12} /> {cfg.label}</div>;
-}
-
-function SettingsModal({ apiBaseUrl, setApiBaseUrl, apiToken, setApiToken, onClose }) {
-  const [draftUrl, setDraftUrl] = useState(apiBaseUrl);
-  const [draftToken, setDraftToken] = useState(apiToken);
-  return (
-    <div className="fixed inset-0 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.6)", zIndex: 50 }}>
-      <div className="w-full rounded-lg border" style={{ maxWidth: "420px", backgroundColor: PANEL, borderColor: HAIRLINE }}>
-        <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
-          <div className="text-sm font-semibold">Backend Connection</div>
-          <button onClick={onClose} style={{ color: TEXT_SECONDARY }}><X size={18} /></button>
-        </div>
-        <div className="p-4 flex flex-col gap-3">
-          <div className="text-xs" style={{ color: TEXT_FAINT }}>Only Certs & Fleet uses this connection right now — PCR Review and Investigations stay demo data regardless, see the notes on those tabs.</div>
-          <div>
-            <label className="text-xs block mb-1" style={{ color: TEXT_SECONDARY }}>API Base URL</label>
-            <input value={draftUrl} onChange={(e) => setDraftUrl(e.target.value)} placeholder="https://your-deployed-api.example.com/api" className="w-full text-sm rounded px-2 py-1.5" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }} />
-          </div>
-          <div>
-            <label className="text-xs block mb-1" style={{ color: TEXT_SECONDARY }}>Session Token (JWT)</label>
-            <textarea value={draftToken} onChange={(e) => setDraftToken(e.target.value)} rows={3} placeholder="Paste a token issued by your identity provider" className="w-full text-xs rounded px-2 py-1.5 mono" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY, resize: "vertical" }} />
-          </div>
-          <div className="flex gap-2">
-            <button onClick={() => { setDraftUrl(""); setDraftToken(""); setApiBaseUrl(""); setApiToken(""); }} className="text-xs px-3 py-2 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Use Demo Data</button>
-            <button onClick={() => { setApiBaseUrl(draftUrl.trim()); setApiToken(draftToken.trim()); }} className="flex-1 text-sm font-medium rounded px-3 py-2" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>Connect</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 function StatPill({ label, value, color }) {

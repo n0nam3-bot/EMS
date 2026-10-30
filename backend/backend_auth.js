@@ -45,6 +45,26 @@ export function publicKeyStatus() {
   try { crypto.createPublicKey(normalizeKey(process.env.JWT_PUBLIC_KEY)); return "valid"; } catch (e) { return "unreadable"; }
 }
 
+// Sessions issued by the app's own sign-in are signed with SESSION_SECRET
+// (a long random string only the server knows). Tokens signed with the older
+// RSA key pair still verify while JWT_PUBLIC_KEY is set; remove that
+// variable to turn them off.
+function sessionSecret() {
+  const s = process.env.SESSION_SECRET || "";
+  return s.length >= 32 ? s : null;
+}
+export function sessionSecretStatus() {
+  if (!process.env.SESSION_SECRET) return "missing";
+  return process.env.SESSION_SECRET.length >= 32 ? "valid" : "too_short";
+}
+export const SESSION_HOURS = 12;
+export function signSession({ userId, tenantId }) {
+  const secret = sessionSecret();
+  if (!secret) throw new Error("SESSION_SECRET is missing or shorter than 32 characters");
+  const token = jwt.sign({ sub: userId, tenant_id: tenantId }, secret, { algorithm: "HS256", expiresIn: `${SESSION_HOURS}h` });
+  return { token, expiresAt: new Date(Date.now() + SESSION_HOURS * 3600 * 1000).toISOString() };
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function lookupUser(tenantId, userId) {
@@ -73,7 +93,15 @@ export async function resolveSession(token) {
   if (!token) return { error: "Missing session token" };
   let payload;
   try {
-    payload = jwt.verify(token.replace(/\s+/g, ""), normalizeKey(process.env.JWT_PUBLIC_KEY), { algorithms: ["RS256"] });
+    const clean = token.replace(/\s+/g, "");
+    const alg = jwt.decode(clean, { complete: true })?.header?.alg;
+    if (alg === "HS256") {
+      const secret = sessionSecret();
+      if (!secret) throw new Error("SESSION_SECRET is not set");
+      payload = jwt.verify(clean, secret, { algorithms: ["HS256"] });
+    } else {
+      payload = jwt.verify(clean, normalizeKey(process.env.JWT_PUBLIC_KEY), { algorithms: ["RS256"] });
+    }
   } catch (err) {
     // The caller only ever sees the generic message; the real reason goes to the server log.
     console.error("session token rejected:", err.message);

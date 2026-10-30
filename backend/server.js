@@ -22,6 +22,8 @@ import express from "express";
 import cors from "cors";
 import http from "http";
 
+import authRoutes from "./backend_routes_auth.js";
+import adminRoutes from "./backend_routes_admin.js";
 import incidentRoutes from "./backend_routes_example.js";
 import locationRoutes from "./backend_routes_location.js";
 import unitRoutes from "./backend_routes_units.js";
@@ -31,7 +33,7 @@ import pcrDetailRoutes from "./backend_routes_pcr_detail.js";
 import auditRoutes from "./backend_routes_audit.js";
 import { attachWebSocket } from "./backend_websocket.js";
 import { assertIsolationEnforced } from "./backend_db.js";
-import { publicKeyStatus } from "./backend_auth.js";
+import { publicKeyStatus, sessionSecretStatus } from "./backend_auth.js";
 
 // On Vercel this file runs as a serverless function: no port to listen on and
 // no long-lived WebSocket. Everywhere else (local, Docker, tests) it behaves
@@ -85,9 +87,12 @@ if (!ON_VERCEL) {
 }
 
 // Before the routers: they require a login, health must not.
-app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok", build: 3, jwtKey: publicKeyStatus() }));
+app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok", build: 5, jwtKey: publicKeyStatus(), sessionSecret: sessionSecretStatus() }));
 
+// Sign-in first: every router below demands a session, login is the one thing that can't.
+app.use("/api", authRoutes);
 app.use("/api", incidentRoutes);
+app.use("/api", adminRoutes);
 app.use("/api", locationRoutes);
 app.use("/api", unitRoutes);
 app.use("/api", complianceRoutes);

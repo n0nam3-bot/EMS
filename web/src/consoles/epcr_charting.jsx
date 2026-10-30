@@ -229,7 +229,11 @@ const SECTIONS = [
   { key: "signatures", label: "Signatures", icon: PenTool, required: true },
 ];
 
-export default function EpcrCharting() {
+// One chart belongs to one call. Signed in, the crew picks the call first
+// (EpcrCharting below), then this component is created fresh for that call,
+// so two calls' charts can never mix on screen.
+function EpcrChart({ session, incidentId, incidentLabel, onBack }) {
+  const live = session?.mode === "live";
   const [tab, setTab] = useState("patient");
   const [now, setNow] = useState(() => new Date());
   const [patient, setPatientField] = useState({ name: "", dob: "", sex: "", weight: "", allergies: "", homeMeds: "", pmh: "" });
@@ -238,21 +242,19 @@ export default function EpcrCharting() {
   const [procedures, setProcedures] = useState([]);
   const [medications, setMedications] = useState([]);
   const [narrative, setNarrative] = useState("");
-  const [disposition, setDispositionField] = useState({ type: "", destinationFacility: "", transferTo: "", primaryImpression: "", mechanismOfInjury: "", dispatchedAt: "14:02", enRouteAt: "14:04", onSceneAt: "14:11", leftSceneAt: "14:24" });
+  const [disposition, setDispositionField] = useState({ type: "", destinationFacility: "", transferTo: "", primaryImpression: "", mechanismOfInjury: "", dispatchedAt: live ? "" : "14:02", enRouteAt: live ? "" : "14:04", onSceneAt: live ? "" : "14:11", leftSceneAt: live ? "" : "14:24" });
   const [signatures, setSignatures] = useState([]);
   const [showSearch, setShowSearch] = useState(false);
-  const [protocolDocs, setProtocolDocs] = useState(SAMPLE_PROTOCOLS);
+  const [protocolDocs, setProtocolDocs] = useState(live ? [] : SAMPLE_PROTOCOLS);
   const [docsLoaded, setDocsLoaded] = useState(false);
 
   // ---- Backend sync ------------------------------------------------------
-  const [showSettings, setShowSettings] = useState(false);
-  const [apiBaseUrl, setApiBaseUrl] = useState("");
-  const [apiToken, setApiToken] = useState("");
-  const [incidentId, setIncidentId] = useState("");
+  const apiBaseUrl = live ? session.apiBaseUrl : "";
+  const apiToken = live ? session.token : "";
   const [inFlight, setInFlight] = useState(0);
   const [failedSyncs, setFailedSyncs] = useState([]);
   const pcrPromiseRef = useRef(null);
-  const isConfigured = Boolean(apiBaseUrl && apiToken && incidentId);
+  const isConfigured = Boolean(live && apiBaseUrl && apiToken && incidentId);
   // Derived, not stored — and a failure can never be cleared by a later
   // success. Two syncs racing (one fails, one succeeds a moment later)
   // must not leave the badge saying "synced" while clinical data sits
@@ -330,14 +332,6 @@ export default function EpcrCharting() {
     }
   }
 
-  function handleSaveSettings(url, token, incident) {
-    pcrPromiseRef.current = null;
-    setFailedSyncs([]);
-    setApiBaseUrl(url);
-    setApiToken(token);
-    setIncidentId(incident);
-  }
-
   useEffect(() => { const t = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(t); }, []);
   useEffect(() => {
     let cancelled = false;
@@ -384,18 +378,25 @@ export default function EpcrCharting() {
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <div>
             <div className="text-xs tracking-widest uppercase" style={{ color: TEXT_FAINT }}>ePCR Charting</div>
-            <div className="text-base font-semibold">{isConfigured ? `Incident ${incidentId.slice(0, 8)}` : "Bruckner Expwy & Longwood Ave — 911 Critical"}</div>
+            <div className="text-base font-semibold">{live ? incidentLabel : "Bruckner Expwy & Longwood Ave — 911 Critical"}</div>
           </div>
           <div className="flex items-center gap-2 flex-wrap">
             <SyncBadge status={syncStatus} />
-            <button onClick={() => setShowSettings(true)} className="flex items-center gap-1 text-xs px-2 py-1 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>
-              <Settings size={13} /> API
-            </button>
+            {live && onBack && (
+              <button onClick={onBack} className="text-xs px-2 py-1 rounded" style={{ color: TEXT_SECONDARY, border: `1px solid ${HAIRLINE}` }}>← Calls</button>
+            )}
             <span className="text-xs mono" style={{ color: completeCount === requiredSections.length ? GREEN : TEXT_SECONDARY }}>{completeCount}/{requiredSections.length} required</span>
             <div className="mono text-xl">{formatClock(now)}</div>
           </div>
         </div>
       </div>
+
+      {live && (
+        <div className="mx-4 mt-3 px-3 py-2 rounded-md text-xs" style={{ color: TEXT_SECONDARY, backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}` }}>
+          <span style={{ color: GREEN }}>Saved to the server:</span> vitals, procedures, medications, narrative, disposition.{" "}
+          <span style={{ color: AMBER }}>Kept on this device only for now:</span> patient demographics (waiting on encryption), assessment and history, signatures. Those are flagged where you enter them.
+        </div>
+      )}
 
       {failedSyncs.length > 0 && (
         <div className="mx-4 mt-3 px-3 py-2 rounded-md text-xs" style={{ backgroundColor: "rgba(240,85,74,0.1)", border: "1px solid #593434", color: RED }}>
@@ -429,7 +430,6 @@ export default function EpcrCharting() {
         <Search size={22} />
       </button>
       {showSearch && <ProtocolSearchModal documents={protocolDocs} setDocuments={setProtocolDocs} onClose={() => setShowSearch(false)} />}
-      {showSettings && <SettingsModal apiBaseUrl={apiBaseUrl} apiToken={apiToken} incidentId={incidentId} onSave={handleSaveSettings} onClose={() => setShowSettings(false)} />}
     </div>
   );
 }
@@ -443,46 +443,6 @@ function SyncBadge({ status }) {
   }[status];
   const Icon = cfg.icon;
   return <div className="flex items-center gap-1 text-xs px-2 py-1 rounded" style={{ color: cfg.color, border: `1px solid ${HAIRLINE}` }}><Icon size={12} /> {cfg.label}</div>;
-}
-
-function SettingsModal({ apiBaseUrl, apiToken, incidentId, onSave, onClose }) {
-  const [draftUrl, setDraftUrl] = useState(apiBaseUrl);
-  const [draftToken, setDraftToken] = useState(apiToken);
-  const [draftIncident, setDraftIncident] = useState(incidentId);
-  return (
-    <div className="fixed inset-0 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.6)", zIndex: 50 }}>
-      <div className="w-full rounded-lg border" style={{ maxWidth: "440px", maxHeight: "90vh", overflowY: "auto", backgroundColor: PANEL, borderColor: HAIRLINE }}>
-        <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
-          <div className="text-sm font-semibold">Backend Connection</div>
-          <button onClick={onClose} style={{ color: TEXT_SECONDARY }}><X size={18} /></button>
-        </div>
-        <div className="p-4 flex flex-col gap-3">
-          <div className="text-xs rounded-md px-3 py-2" style={{ color: TEXT_SECONDARY, backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}` }}>
-            <div className="font-semibold mb-1" style={{ color: TEXT_PRIMARY }}>What actually syncs</div>
-            <div>✓ Vitals, procedures, medications, narrative, disposition type/impression/transfer-of-care</div>
-            <div>✗ Patient demographics (needs encryption first), assessment/history (no schema columns), signatures (needs object storage), destination facility and transport times (no backend home)</div>
-            <div className="mt-1" style={{ color: TEXT_FAINT }}>Anything that can't sync is flagged where you enter it, and any sync that fails stays visible until dismissed.</div>
-          </div>
-          <div>
-            <label className="text-xs block mb-1" style={{ color: TEXT_SECONDARY }}>API Base URL</label>
-            <input value={draftUrl} onChange={(e) => setDraftUrl(e.target.value)} placeholder="https://your-deployed-api.example.com/api" className="w-full text-sm rounded px-2 py-1.5" style={inputStyle()} />
-          </div>
-          <div>
-            <label className="text-xs block mb-1" style={{ color: TEXT_SECONDARY }}>Incident ID (UUID this chart belongs to)</label>
-            <input value={draftIncident} onChange={(e) => setDraftIncident(e.target.value)} placeholder="incident UUID" className="w-full text-sm rounded px-2 py-1.5 mono" style={inputStyle()} />
-          </div>
-          <div>
-            <label className="text-xs block mb-1" style={{ color: TEXT_SECONDARY }}>Session Token (JWT)</label>
-            <textarea value={draftToken} onChange={(e) => setDraftToken(e.target.value)} rows={3} placeholder="Paste a token issued by your identity provider" className="w-full text-xs rounded px-2 py-1.5 mono" style={{ ...inputStyle(), resize: "vertical" }} />
-          </div>
-          <div className="flex gap-2">
-            <button onClick={() => { setDraftUrl(""); setDraftToken(""); setDraftIncident(""); onSave("", "", ""); }} className="text-xs px-3 py-2 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Local Only</button>
-            <button onClick={() => onSave(draftUrl.trim(), draftToken.trim(), draftIncident.trim())} className="flex-1 text-sm font-medium rounded px-3 py-2" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>Save</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 function ChartTab({ active, onClick, icon: Icon, label, status }) {
@@ -949,6 +909,58 @@ function ProtocolSearchModal({ documents, setDocuments, onClose }) {
             </div>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+
+const PRIORITY_LABEL = { critical: "Critical", emergent: "Emergent", urgent: "Urgent", routine: "Routine" };
+
+export default function EpcrCharting({ session }) {
+  const live = session?.mode === "live";
+  const [picked, setPicked] = useState(null); // { id, label }
+  const [calls, setCalls] = useState(null);
+  const [mine, setMine] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!live || picked) return;
+    let cancelled = false;
+    const get = (path) => fetch(`${session.apiBaseUrl}${path}`, { headers: { Authorization: `Bearer ${session.token}` } })
+      .then(async (r) => { const j = await r.json().catch(() => null); if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`); return j; });
+    Promise.all([get("/incidents"), get("/auth/me")])
+      .then(([incidents, me]) => {
+        if (cancelled) return;
+        setCalls(incidents.filter((i) => !i.closed_at));
+        setMine(me.incident?.incident_id || null);
+      })
+      .catch((e) => { if (!cancelled) setError(e.message || "Could not load calls"); });
+    return () => { cancelled = true; };
+  }, [live, picked, session]);
+
+  if (!live) return <EpcrChart session={session} incidentId="" incidentLabel="" />;
+  if (picked) return <EpcrChart key={picked.id} session={session} incidentId={picked.id} incidentLabel={picked.label} onBack={() => setPicked(null)} />;
+
+  const ordered = (calls || []).slice().sort((a, b) => (a.incident_id === mine ? -1 : b.incident_id === mine ? 1 : 0));
+  return (
+    <div style={{ backgroundColor: VOID, color: TEXT_PRIMARY, fontFamily: "'Inter', system-ui, sans-serif" }} className="min-h-screen w-full">
+      <div className="px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
+        <div className="text-xs tracking-widest uppercase" style={{ color: TEXT_FAINT }}>ePCR Charting</div>
+        <div className="text-base font-semibold">Which call are you charting?</div>
+      </div>
+      <div className="p-4 flex flex-col gap-2" style={{ maxWidth: "640px" }}>
+        {error && <div className="text-sm" style={{ color: RED }}>{error}</div>}
+        {!error && calls === null && <div className="text-sm" style={{ color: TEXT_FAINT }}>Loading calls…</div>}
+        {calls && ordered.length === 0 && <div className="text-sm" style={{ color: TEXT_FAINT }}>No open calls. A chart is started from a call that dispatch has created.</div>}
+        {ordered.map((c) => (
+          <button key={c.incident_id} onClick={() => setPicked({ id: c.incident_id, label: `${c.scene_address} — ${PRIORITY_LABEL[c.priority] || c.priority}` })}
+            className="text-left rounded-lg border px-4 py-3" style={{ backgroundColor: PANEL, borderColor: c.incident_id === mine ? BLUE : HAIRLINE }}>
+            {c.incident_id === mine && <div className="text-xs font-semibold mb-0.5" style={{ color: BLUE }}>YOUR CURRENT CALL</div>}
+            <div className="text-sm font-medium">{c.scene_address}{c.scene_detail ? ` · ${c.scene_detail}` : ""}</div>
+            <div className="text-xs" style={{ color: TEXT_SECONDARY }}>{PRIORITY_LABEL[c.priority] || c.priority} · {c.capability_needed} · {(c.assigned_units || []).length} unit(s) assigned</div>
+          </button>
+        ))}
       </div>
     </div>
   );

@@ -64,6 +64,16 @@ router.patch("/units/:id/status", async (req, res) => {
   // history row silently doesn't, which defeats the point of having
   // unit_status_history as the response-time source of truth at all.
   const unit = await withTenant(req.user.tenantId, async (client) => {
+    // A crew member can only change the status of the unit they are on.
+    // Dispatchers and supervisors manage any unit in their company.
+    if (req.user.role === "crew") {
+      const onIt = await client.query(
+        `SELECT 1 FROM unit_crew_assignments uca JOIN crew_members cm ON cm.crew_member_id = uca.crew_member_id
+         WHERE uca.unit_id = $1 AND cm.user_id = $2 AND uca.assigned_to IS NULL`,
+        [req.params.id, req.user.userId]
+      );
+      if (onIt.rows.length === 0) return "forbidden";
+    }
     const updated = await client.query(
       "UPDATE units SET current_status = $1 WHERE unit_id = $2 RETURNING *",
       [status, req.params.id]
@@ -75,6 +85,7 @@ router.patch("/units/:id/status", async (req, res) => {
     );
     return updated.rows[0];
   });
+  if (unit === "forbidden") return res.status(403).json({ error: "You're not currently assigned to this unit" });
   if (!unit) return res.status(404).json({ error: "Unit not found" });
   broadcastUnitStatusChange(req.app.get("io"), { tenantId: req.user.tenantId, incidentId: null, unit });
   res.json(unit);

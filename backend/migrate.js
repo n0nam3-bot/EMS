@@ -19,6 +19,7 @@ import fs from "fs";
 import path from "path";
 import { pathToFileURL } from "url";
 import pg from "pg";
+import { UPGRADE_SQL } from "./scripts/upgrade.js";
 
 const MIGRATION_ORDER = [
   "ems_dispatch_core_schema.sql",
@@ -51,6 +52,17 @@ export async function applyMigrations(client, migrationsDir = "./migrations") {
       console.log(`  ${file} ... FAILED`);
       throw new Error(`${file} failed: ${err.message}`);
     }
+  }
+  // Sign-in and the richer call record. Also run on its own against existing
+  // databases (scripts/upgrade.js); every statement is safe to repeat.
+  try {
+    await client.query("BEGIN");
+    await client.query(UPGRADE_SQL);
+    await client.query("COMMIT");
+    console.log("  upgrade (sign-in, call details) ... done");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw new Error(`upgrade failed: ${err.message}`);
   }
 }
 
@@ -98,6 +110,14 @@ export async function ensureRuntimeRole(client, password) {
     "REVOKE UPDATE, DELETE ON audit_log, unit_status_history, pcr_amendments, controlled_substance_log, protocol_search_log FROM ems_app_runtime"
   );
   await client.query("REVOKE DELETE ON mutual_aid_links FROM ems_app_runtime");
+  // The two sign-in lookup functions (see scripts/upgrade.js) — the only way
+  // the app can find an account before it knows which company it belongs to.
+  await client.query(`DO $$ BEGIN
+    IF to_regprocedure('auth_find_user(text)') IS NOT NULL THEN
+      GRANT EXECUTE ON FUNCTION auth_find_user(TEXT) TO ems_app_runtime;
+      GRANT EXECUTE ON FUNCTION auth_record_login(UUID, BOOLEAN) TO ems_app_runtime;
+    END IF;
+  END $$`);
   return { created: true };
 }
 

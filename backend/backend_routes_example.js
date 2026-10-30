@@ -15,35 +15,8 @@ import express from "express";
 import { withTenant } from "./backend_db.js";
 import { requireAuth, requireRole } from "./backend_auth.js";
 import { auditView } from "./backend_audit.js";
+import { geocodeAddress } from "./backend_geocode.js";
 
-
-// Free, keyless geocoding (US Census first, OpenStreetMap Nominatim as a
-// fallback). Off unless GEOCODE_ENABLED=true so tests and local runs never
-// make outbound calls. Best effort: a failure just means no map marker.
-async function geocodeAddress(address) {
-  if (process.env.GEOCODE_ENABLED !== "true" || !address) return null;
-  try {
-    const r = await fetch(
-      "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?benchmark=Public_AR_Current&format=json&address=" + encodeURIComponent(address),
-      { signal: AbortSignal.timeout(4000) }
-    );
-    if (r.ok) {
-      const m = (await r.json()).result?.addressMatches?.[0];
-      if (m) return { lat: m.coordinates.y, lon: m.coordinates.x };
-    }
-  } catch (err) { /* fall through to the fallback */ }
-  try {
-    const r = await fetch(
-      "https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=us&q=" + encodeURIComponent(address),
-      { headers: { "User-Agent": "ems-dispatch/0.1 (dispatch geocoder)" }, signal: AbortSignal.timeout(4000) }
-    );
-    if (r.ok) {
-      const m = (await r.json())[0];
-      if (m) return { lat: Number(m.lat), lon: Number(m.lon) };
-    }
-  } catch (err) { /* no coordinates */ }
-  return null;
-}
 
 const router = express.Router();
 router.use(requireAuth);
@@ -78,6 +51,8 @@ const INCIDENT_SELECT = `
   SELECT i.*,
     ST_Y(i.scene_location::geometry) AS lat,
     ST_X(i.scene_location::geometry) AS lon,
+    ST_Y(i.destination_location::geometry) AS dest_lat,
+    ST_X(i.destination_location::geometry) AS dest_lon,
     COALESCE(
       json_agg(json_build_object('unitId', iua.unit_id, 'role', iua.role) ORDER BY iua.assigned_at)
         FILTER (WHERE iua.unit_id IS NOT NULL),
@@ -85,6 +60,14 @@ const INCIDENT_SELECT = `
     ) AS assigned_units
   FROM incidents i
   LEFT JOIN incident_unit_assignments iua ON iua.incident_id = i.incident_id AND iua.unassigned_at IS NULL`;
+
+// A call shared with another agency through mutual aid shows them where and
+// what, not who: the patient's and caller's identity stays with the agency
+// that took the call.
+function redact(row, tenantId) {
+  if (row.tenant_id === tenantId) return row;
+  return { ...row, patient_name: null, contact_name: null, contact_phone: null };
+}
 
 // Another agency's incidents reach this list only through a mutual-aid
 // grant, and the owner is entitled to know when they're looked at, so
@@ -97,7 +80,7 @@ router.get("/incidents", async (req, res) => {
     for (const r of result.rows.filter((row) => row.tenant_id !== req.user.tenantId)) {
       await auditView(client, req.user, "incidents", r.incident_id, { via: "mutual_aid", list: true });
     }
-    return result.rows;
+    return result.rows.map((r) => redact(r, req.user.tenantId));
   });
   res.json(rows);
 });
@@ -113,7 +96,7 @@ router.get("/incidents/:id", async (req, res) => {
     if (result.rows.length === 0) return null;
     const found = result.rows[0];
     await auditView(client, req.user, "incidents", found.incident_id, found.tenant_id !== req.user.tenantId ? { via: "mutual_aid" } : {});
-    return found;
+    return redact(found, req.user.tenantId);
   });
   if (!row) return res.status(404).json({ error: "Not found" });
   res.json(row);
@@ -125,12 +108,45 @@ router.get("/incidents/:id", async (req, res) => {
 // choosing it would defeat that. Any protocolSetId in the body is
 // ignored. (The dispatch console never sent one, so "New Call" in live
 // mode failed on the NOT NULL constraint with an opaque 500.)
+const INCIDENT_TYPES = ["emergency_911", "ift_scheduled", "ift_on_demand", "mutual_aid"];
+const PRIORITIES = ["critical", "emergent", "urgent", "routine"];
+const LEVELS = ["BLS", "ALS", "CCT"];
+const text = (v, max = 500) => (v == null ? null : String(v).trim().slice(0, max) || null);
+const coord = (lat, lon) => Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+
+// Returns a plain-English problem, or null if the fields are fine.
+// `partial` (editing) only checks what was actually sent.
+function incidentProblem(b, partial) {
+  const has = (k) => b[k] !== undefined;
+  if (!partial || has("incidentType")) if (!INCIDENT_TYPES.includes(b.incidentType)) return `Call type must be one of: ${INCIDENT_TYPES.join(", ")}`;
+  if (!partial || has("priority")) if (!PRIORITIES.includes(b.priority)) return `Priority must be one of: ${PRIORITIES.join(", ")}`;
+  if (has("capabilityNeeded") && !LEVELS.includes(b.capabilityNeeded)) return "Level of care must be BLS, ALS or CCT";
+  if (!partial || has("sceneAddress")) if (!text(b.sceneAddress) || text(b.sceneAddress).length < 3) return "Enter the pickup address or facility";
+  for (const [lat, lon] of [[b.lat, b.lon], [b.destLat, b.destLon]]) {
+    if ((lat != null || lon != null) && !coord(lat, lon)) return "Map coordinates are not valid";
+  }
+  return null;
+}
+
+// The SERVER stamps the protocol version, never the client. The schema
+// says protocol_set_id is set once at intake so a chart can always show
+// which version was in force on the date of care — a stale client
+// choosing it would defeat that. Any protocolSetId in the body is
+// ignored. (The dispatch console never sent one, so "New Call" in live
+// mode failed on the NOT NULL constraint with an opaque 500.)
 router.post("/incidents", async (req, res) => {
-  let { incidentType, priority, sceneAddress, lat, lon } = req.body;
+  const b = req.body || {};
+  const problem = incidentProblem(b, false);
+  if (problem) return res.status(400).json({ error: problem });
+  let { lat, lon, destLat, destLon } = b;
   if (lat == null || lon == null) {
     // Before opening the transaction: no database connection is held while waiting on the network.
-    const g = await geocodeAddress(sceneAddress);
+    const g = await geocodeAddress(b.sceneAddress);
     if (g) ({ lat, lon } = g);
+  }
+  if ((destLat == null || destLon == null) && text(b.destinationText)) {
+    const g = await geocodeAddress(b.destinationText);
+    if (g) ({ lat: destLat, lon: destLon } = g);
   }
   const result = await withTenant(req.user.tenantId, async (client) => {
     const active = await client.query(
@@ -140,16 +156,104 @@ router.post("/incidents", async (req, res) => {
     );
     if (active.rows.length === 0) return null;
     return client.query(
-      `INSERT INTO incidents (tenant_id, incident_type, priority, protocol_set_id, scene_address, scene_location)
-       VALUES ($1, $2, $3, $4, $5, CASE WHEN $6::double precision IS NULL THEN NULL ELSE ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography END)
+      `INSERT INTO incidents (tenant_id, incident_type, priority, protocol_set_id, scene_address, scene_location,
+                              capability_needed, scene_detail, destination_text, destination_location,
+                              contact_name, contact_phone, patient_name, notes)
+       VALUES ($1, $2, $3, $4, $5,
+               CASE WHEN $6::double precision IS NULL THEN NULL ELSE ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography END,
+               $8, $9, $10,
+               CASE WHEN $11::double precision IS NULL THEN NULL ELSE ST_SetSRID(ST_MakePoint($11, $12), 4326)::geography END,
+               $13, $14, $15, $16)
        RETURNING *, $7::double precision AS lat, $6::double precision AS lon`,
-      [req.user.tenantId, incidentType, priority, active.rows[0].protocol_set_id, sceneAddress, lon ?? null, lat ?? null]
+      [req.user.tenantId, b.incidentType, b.priority, active.rows[0].protocol_set_id, text(b.sceneAddress),
+       lon ?? null, lat ?? null,
+       b.capabilityNeeded || "BLS", text(b.sceneDetail), text(b.destinationText), destLon ?? null, destLat ?? null,
+       text(b.contactName, 200), text(b.contactPhone, 50), text(b.patientName, 200), text(b.notes, 2000)]
     );
   });
   if (!result) {
     return res.status(409).json({ error: "No active protocol set is configured for this agency — an incident can't be created without one" });
   }
   res.status(201).json(result.rows[0]);
+});
+
+// Fixing a mistake. Only what was sent changes; the database audit trigger
+// records which fields changed, by whom, and when. A call that has been
+// closed or cancelled is a finished record and can't be edited.
+router.patch("/incidents/:id", async (req, res) => {
+  const b = req.body || {};
+  const problem = incidentProblem(b, true);
+  if (problem) return res.status(400).json({ error: problem });
+  const has = (k) => b[k] !== undefined;
+
+  // Location: an explicit pin wins; a changed address with no pin is
+  // re-looked-up; failing that the old pin is cleared rather than left
+  // pointing at the wrong place.
+  const loc = {};
+  if (has("lat") || has("lon")) loc.scene = coord(b.lat, b.lon) ? { lat: b.lat, lon: b.lon } : "clear";
+  else if (has("sceneAddress")) loc.scene = (await geocodeAddress(b.sceneAddress)) || "clear";
+  if (has("destLat") || has("destLon")) loc.dest = coord(b.destLat, b.destLon) ? { lat: b.destLat, lon: b.destLon } : "clear";
+  else if (has("destinationText")) loc.dest = text(b.destinationText) ? ((await geocodeAddress(b.destinationText)) || "clear") : "clear";
+
+  const sets = [], vals = [];
+  const add = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+  const point = (col, v) => {
+    if (v === "clear") return sets.push(`${col} = NULL`);
+    vals.push(v.lon, v.lat);
+    sets.push(`${col} = ST_SetSRID(ST_MakePoint($${vals.length - 1}, $${vals.length}), 4326)::geography`);
+  };
+  if (has("incidentType")) add("incident_type", b.incidentType);
+  if (has("priority")) add("priority", b.priority);
+  if (has("capabilityNeeded")) add("capability_needed", b.capabilityNeeded);
+  if (has("sceneAddress")) add("scene_address", text(b.sceneAddress));
+  if (has("sceneDetail")) add("scene_detail", text(b.sceneDetail));
+  if (has("destinationText")) add("destination_text", text(b.destinationText));
+  if (has("contactName")) add("contact_name", text(b.contactName, 200));
+  if (has("contactPhone")) add("contact_phone", text(b.contactPhone, 50));
+  if (has("patientName")) add("patient_name", text(b.patientName, 200));
+  if (has("notes")) add("notes", text(b.notes, 2000));
+  if (loc.scene) point("scene_location", loc.scene);
+  if (loc.dest) point("destination_location", loc.dest);
+  if (!sets.length) return res.status(400).json({ error: "Nothing to change" });
+
+  const row = await withTenant(req.user.tenantId, async (client) => {
+    const cur = (await client.query("SELECT closed_at FROM incidents WHERE incident_id = $1 AND tenant_id = $2", [req.params.id, req.user.tenantId])).rows[0];
+    if (!cur) return { status: 404 };
+    if (cur.closed_at) return { status: 409 };
+    vals.push(req.params.id);
+    await client.query(`UPDATE incidents SET ${sets.join(", ")} WHERE incident_id = $${vals.length}`, vals);
+    const out = await client.query(`${INCIDENT_SELECT} WHERE i.incident_id = $1 GROUP BY i.incident_id`, [req.params.id]);
+    return { row: out.rows[0] };
+  });
+  if (row.status === 404) return res.status(404).json({ error: "Call not found" });
+  if (row.status === 409) return res.status(409).json({ error: "This call is already closed and can't be edited" });
+  res.json(row.row);
+});
+
+// Cancelling is not deleting: the call stays on record, marked cancelled
+// with who and why (the audit log keeps the who), and every unit on it is
+// released in the same transaction.
+router.post("/incidents/:id/cancel", async (req, res) => {
+  const reason = text(req.body?.reason, 500);
+  if (!reason || reason.length < 3) return res.status(400).json({ error: "Say why the call is being cancelled" });
+  const result = await withTenant(req.user.tenantId, async (client) => {
+    const cur = (await client.query("SELECT closed_at FROM incidents WHERE incident_id = $1 AND tenant_id = $2", [req.params.id, req.user.tenantId])).rows[0];
+    if (!cur) return { status: 404 };
+    if (cur.closed_at) return { status: 409 };
+    const active = await client.query("SELECT unit_id FROM incident_unit_assignments WHERE incident_id = $1 AND unassigned_at IS NULL", [req.params.id]);
+    for (const r of active.rows) {
+      await client.query("UPDATE incident_unit_assignments SET unassigned_at = now() WHERE incident_id = $1 AND unit_id = $2 AND unassigned_at IS NULL", [req.params.id, r.unit_id]);
+      await setUnitStatus(client, req.user.tenantId, r.unit_id, "available", req.params.id);
+    }
+    const out = await client.query(
+      "UPDATE incidents SET closed_at = now(), cancelled_at = now(), cancel_reason = $2 WHERE incident_id = $1 RETURNING *",
+      [req.params.id, reason]
+    );
+    return { row: out.rows[0] };
+  });
+  if (result.status === 404) return res.status(404).json({ error: "Call not found" });
+  if (result.status === 409) return res.status(409).json({ error: "This call is already closed" });
+  res.json(result.row);
 });
 
 // One unit per call is the common case, not the only case — this

@@ -13,7 +13,8 @@
 
 import express from "express";
 import { withTenant } from "./backend_db.js";
-import { requireAuth } from "./backend_auth.js";
+import { requireAuth, requireRole } from "./backend_auth.js";
+import { auditView } from "./backend_audit.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -44,6 +45,26 @@ router.get("/vehicles", async (req, res) => {
     `)
   );
   res.json(result.rows);
+});
+
+// Charts still open (not yet finalized), each with how many completeness
+// checks it passes and which ones it fails. Reading charts is itself logged.
+// Approving or flagging a chart is not built yet; this is the read side.
+const REVIEWERS = requireRole("compliance_officer", "supervisor", "it_admin", "read_only_auditor");
+router.get("/pcr-review", REVIEWERS, async (req, res) => {
+  const rows = await withTenant(req.user.tenantId, async (client) => {
+    const r = await client.query(`
+      SELECT p.pcr_id, p.created_at, i.scene_address, i.priority,
+             (SELECT count(*) FROM pcr_completeness_check(p.pcr_id) WHERE passed) AS passed,
+             (SELECT count(*) FROM pcr_completeness_check(p.pcr_id)) AS total,
+             COALESCE((SELECT array_agg(check_name) FROM pcr_completeness_check(p.pcr_id) WHERE NOT passed), '{}') AS failed
+      FROM patient_care_records p JOIN incidents i ON i.incident_id = p.incident_id
+      WHERE p.finalized_at IS NULL
+      ORDER BY p.created_at DESC LIMIT 100`);
+    await auditView(client, req.user, "patient_care_records", null, { list: true });
+    return r.rows;
+  });
+  res.json(rows);
 });
 
 export default router;

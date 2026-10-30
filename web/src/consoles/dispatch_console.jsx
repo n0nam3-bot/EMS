@@ -10,7 +10,6 @@ import {
   Radio,
   Activity,
   AlertTriangle,
-  Settings,
   Wifi,
   WifiOff,
 } from "lucide-react";
@@ -173,14 +172,20 @@ function normalizeApiIncident(i) {
     type: i.incident_type,
     priority: i.priority,
     address: i.scene_address,
-    capabilityNeeded: inferCapabilityNeeded(i),
+    detail: i.scene_detail || "",
+    destination: i.destination_text || "",
+    patientName: i.patient_name || "",
+    contactName: i.contact_name || "",
+    contactPhone: i.contact_phone || "",
+    notes: i.notes || "",
+    capabilityNeeded: i.capability_needed || inferCapabilityNeeded(i),
     callReceivedAt: new Date(i.call_received_at),
-    // The API returns each incident's active assignments; this used to
-    // be [] with a comment pointing at a loadAssignments function that
-    // was never written, which broke the live loop after the first Assign.
+    // The API returns each incident's active assignments.
     assignedUnits: (i.assigned_units || []).map((a) => ({ unitId: a.unitId, role: a.role })),
     lat: i.lat,
     lon: i.lon,
+    destLat: i.dest_lat,
+    destLon: i.dest_lon,
   };
 }
 
@@ -207,43 +212,76 @@ function makeInitialIncidents(nowMs) {
   ];
 }
 
-function getRecommendation(incident, units) {
-  const available = units.filter((u) => u.status === "available");
-  if (available.length === 0) return null;
-  const exact = incident.capabilityNeeded === "ALS" ? available.filter((u) => u.capability === "ALS") : available;
-  const pool = exact.length > 0 ? exact : available;
+// Does this unit's level of care satisfy what the call needs?
+const meetsLevel = (u, need) => need === "BLS" || (need === "ALS" && (u.capability === "ALS" || u.capability === "CCT")) || (need === "CCT" && u.capability === "CCT");
+const hasFix = (o) => o && o.lat != null && o.lon != null;
+
+function nearestOf(pool, incident) {
+  if (pool.length === 0) return null;
   // Live data can lack coordinates: a unit that hasn't reported a GPS
-  // fix, an incident that was never geocoded. Don't rank on NaN.
-  const located = (o) => o.lat != null && o.lon != null;
-  const ranked = located(incident) ? pool.filter(located) : [];
-  const best = ranked.length > 0
+  // fix, an incident that was never pinned. Don't rank on NaN.
+  const ranked = hasFix(incident) ? pool.filter(hasFix) : [];
+  const unit = ranked.length > 0
     ? ranked.reduce((b, u) => (haversineMiles(u, incident) < haversineMiles(b, incident) ? u : b))
     : pool[0];
-  const miles = located(incident) && located(best) ? haversineMiles(best, incident) : null;
+  const miles = hasFix(incident) && hasFix(unit) ? haversineMiles(unit, incident) : null;
+  return { unit, miles, etaMin: miles == null ? null : estimateEtaMinutes(miles) };
+}
+
+// A SUGGESTION, never an assignment. `best` is the nearest crewed unit that is
+// free right now. `soon` is a unit that is finishing a call (at the
+// destination) and is meaningfully closer, worth knowing about before
+// sending something farther away.
+function getRecommendation(incident, units) {
+  const crewed = units.filter((u) => u.crew.length > 0);
+  const free = crewed.filter((u) => u.status === "available");
+  const exact = free.filter((u) => meetsLevel(u, incident.capabilityNeeded));
+  const pool = exact.length > 0 ? exact : free;
+  const best = nearestOf(pool, incident);
+  const finishing = nearestOf(crewed.filter((u) => u.status === "at_destination" && meetsLevel(u, incident.capabilityNeeded)), incident);
+  const soon = finishing && (!best || (finishing.miles != null && best.miles != null && finishing.miles + 0.5 < best.miles)) ? finishing : null;
+  if (!best && !soon) return null;
   const hasPrimary = incident.assignedUnits.some((a) => a.role === "primary");
   let role = "support";
   if (!hasPrimary) {
     role = "primary";
-  } else if (incident.capabilityNeeded === "ALS" && best.capability === "ALS") {
+  } else if (best && incident.capabilityNeeded === "ALS" && best.unit.capability === "ALS") {
     const primaryAssignment = incident.assignedUnits.find((a) => a.role === "primary");
     const primaryUnit = units.find((u) => u.id === primaryAssignment?.unitId);
     if (primaryUnit && primaryUnit.capability === "BLS") role = "als_intercept";
   }
-  return { unit: best, miles, etaMin: miles == null ? null : estimateEtaMinutes(miles), isMismatch: pool !== exact, role };
+  return { best, soon, isMismatch: Boolean(best) && pool !== exact, role };
 }
 
-export default function DispatchConsole() {
-  const [loaded, setLoaded] = useState(false);
-  const [units, setUnits] = useState(makeInitialUnits);
-  const [now, setNow] = useState(() => new Date());
-  const [incidents, setIncidents] = useState(() => makeInitialIncidents(Date.now()));
-  const [showNewCall, setShowNewCall] = useState(false);
-  const [form, setForm] = useState({ type: "emergency_911", priority: "emergent", address: "", capabilityNeeded: "BLS" });
+const blankForm = () => ({ type: "emergency_911", priority: "emergent", capabilityNeeded: "BLS", address: "", lat: null, lon: null, detail: "", destination: "", destLat: null, destLon: null, patientName: "", contactName: "", contactPhone: "", notes: "" });
+const formFromIncident = (i) => ({ type: i.type, priority: i.priority, capabilityNeeded: i.capabilityNeeded, address: i.address || "", lat: i.lat ?? null, lon: i.lon ?? null, detail: i.detail || "", destination: i.destination || "", destLat: i.destLat ?? null, destLon: i.destLon ?? null, patientName: i.patientName || "", contactName: i.contactName || "", contactPhone: i.contactPhone || "", notes: i.notes || "" });
+function formToApi(f) {
+  const body = {
+    incidentType: f.type, priority: f.priority, capabilityNeeded: f.capabilityNeeded,
+    sceneAddress: f.address.trim(), sceneDetail: f.detail.trim() || null, destinationText: f.destination.trim() || null,
+    patientName: f.patientName.trim() || null, contactName: f.contactName.trim() || null, contactPhone: f.contactPhone.trim() || null, notes: f.notes.trim() || null,
+  };
+  if (f.lat != null && f.lon != null) { body.lat = f.lat; body.lon = f.lon; }
+  if (f.destLat != null && f.destLon != null) { body.destLat = f.destLat; body.destLon = f.destLon; }
+  return body;
+}
+const shortLabel = (label) => label.split(",").slice(0, 3).join(",").trim();
 
-  const [showSettings, setShowSettings] = useState(false);
-  const [apiBaseUrl, setApiBaseUrl] = useState(`${window.location.origin}/api`);
-  const [apiToken, setApiToken] = useState("");
-  const [connectionStatus, setConnectionStatus] = useState("demo"); // demo | connecting | live | failed
+// `session` comes from the sign-in screen. Signed in: `live`, real data only,
+// never a demo fallback. "View demo": sample data that is never saved anywhere.
+// With no session at all (tests) it behaves as the demo.
+export default function DispatchConsole({ session }) {
+  const live = session?.mode === "live";
+  const apiBaseUrl = live ? session.apiBaseUrl : "";
+  const apiToken = live ? session.token : "";
+  const [loaded, setLoaded] = useState(false);
+  const [units, setUnits] = useState(() => (live ? [] : makeInitialUnits()));
+  const [now, setNow] = useState(() => new Date());
+  const [incidents, setIncidents] = useState(() => (live ? [] : makeInitialIncidents(Date.now())));
+  const [showNewCall, setShowNewCall] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(blankForm);
+  const [connectionStatus, setConnectionStatus] = useState(live ? "connecting" : "demo"); // demo | connecting | live | failed
   const [actionError, setActionError] = useState("");
   const [selIncidentId, setSelIncidentId] = useState(null);
   const [selUnitId, setSelUnitId] = useState(null);
@@ -254,6 +292,7 @@ export default function DispatchConsole() {
   }, []);
 
   useEffect(() => {
+    if (live) { setLoaded(true); return; } // real data is never cached in the browser
     let cancelled = false;
     (async () => {
       try {
@@ -264,8 +303,6 @@ export default function DispatchConsole() {
           if (parsed.incidents) {
             setIncidents(parsed.incidents.map((i) => ({ ...i, callReceivedAt: new Date(i.callReceivedAt), assignedUnits: i.assignedUnits || [] })));
           }
-          if (parsed.apiBaseUrl) setApiBaseUrl(parsed.apiBaseUrl);
-          if (parsed.apiToken) setApiToken(parsed.apiToken);
         }
       } catch (err) {
         // No saved session yet, or storage unavailable — keep defaults.
@@ -277,9 +314,9 @@ export default function DispatchConsole() {
   }, []);
 
   useEffect(() => {
-    if (!loaded) return;
-    window.storage.set("dispatch-console-state", JSON.stringify({ units, incidents, apiBaseUrl, apiToken }), false).catch(() => {});
-  }, [units, incidents, apiBaseUrl, apiToken, loaded]);
+    if (!loaded || live) return;
+    window.storage.set("dispatch-console-state", JSON.stringify({ units, incidents }), false).catch(() => {});
+  }, [units, incidents, loaded, live]);
 
   const apiRequest = useMemo(() => (apiBaseUrl ? makeApiRequest(apiBaseUrl, apiToken) : null), [apiBaseUrl, apiToken]);
 
@@ -305,22 +342,35 @@ export default function DispatchConsole() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, apiBaseUrl, apiToken]);
 
+  // A dispatch board has to move on its own: crews change status and send
+  // GPS from other devices. Refresh every 10 seconds while the tab is open.
+  useEffect(() => {
+    if (connectionStatus !== "live" || !apiRequest) return;
+    const t = setInterval(() => {
+      if (document.visibilityState === "visible") refreshFromApi().catch(() => {});
+    }, 10000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionStatus, apiRequest]);
+
   // The shared seam every write action goes through: call the real API
   // and reload canonical state on success, or fall back to a purely
   // local update when there's nothing to connect to. Deliberately does
   // NOT fall back silently on a failed API call while "live" — that
   // would make a failed action look like it succeeded.
   async function performAction(apiCall, localUpdate) {
-    if (connectionStatus === "live" && apiRequest) {
+    if (live) {
+      // Signed in: only the real API. A local fake update here would make
+      // a failed action look like it worked.
       try {
         await apiCall();
         await refreshFromApi();
       } catch (e) {
         setActionError(e.message || "Action failed");
       }
-    } else {
-      localUpdate();
+      return;
     }
+    localUpdate();
   }
 
   const availableCount = units.filter((u) => u.status === "available").length;
@@ -380,28 +430,56 @@ export default function DispatchConsole() {
       }
     );
   }
-  function handleCreateIncident(e) {
+  function openNewCall() { setEditingId(null); setForm(blankForm()); setShowNewCall(true); }
+  function openEdit(incident) { setEditingId(incident.id); setForm(formFromIncident(incident)); setShowNewCall(true); }
+  function closeCallForm() { setShowNewCall(false); setEditingId(null); }
+
+  // Where to bias address search: wherever this agency's units already are.
+  const searchNear = useMemo(() => {
+    const o = units.find(hasFix) || incidents.find(hasFix);
+    return o ? { lat: o.lat, lon: o.lon } : null;
+  }, [units, incidents]);
+  async function searchPlaces(q) {
+    const near = searchNear ? `&lat=${searchNear.lat}&lon=${searchNear.lon}` : "";
+    return apiRequest("GET", `/geocode?q=${encodeURIComponent(q)}${near}`);
+  }
+
+  function handleSubmitCall(e) {
     e.preventDefault();
-    if (!form.address.trim()) return;
+    if (form.address.trim().length < 3) return;
+    const f = form;
+    if (editingId) {
+      const id = editingId;
+      performAction(
+        () => apiRequest("PATCH", `/incidents/${id}`, formToApi(f)),
+        () => setIncidents((prev) => prev.map((i) => (i.id === id ? { ...i, type: f.type, priority: f.priority, capabilityNeeded: f.capabilityNeeded, address: f.address.trim(), detail: f.detail, destination: f.destination, patientName: f.patientName, contactName: f.contactName, contactPhone: f.contactPhone, notes: f.notes } : i)))
+      );
+    } else {
+      performAction(
+        () => apiRequest("POST", "/incidents", formToApi(f)),
+        () => {
+          // Demo only: a random spot in the service area so the map has something to draw.
+          const lat = MAP_BOUNDS.latMin + Math.random() * (MAP_BOUNDS.latMax - MAP_BOUNDS.latMin);
+          const lon = MAP_BOUNDS.lonMin + Math.random() * (MAP_BOUNDS.lonMax - MAP_BOUNDS.lonMin);
+          setIncidents((prev) => [...prev, { id: `i${Date.now()}`, type: f.type, priority: f.priority, address: f.address.trim(), detail: f.detail, destination: f.destination, patientName: f.patientName, contactName: f.contactName, contactPhone: f.contactPhone, notes: f.notes, capabilityNeeded: f.capabilityNeeded, callReceivedAt: new Date(), assignedUnits: [], lat, lon }]);
+        }
+      );
+    }
+    closeCallForm();
+  }
+  function handleCancelCall(incidentId, reason) {
     performAction(
-      // No coordinates sent in live mode: there is no geocoder, and
-      // inventing a position for a real call would put fabricated data
-      // in a real database. The call appears in the queue without a map
-      // marker until real geocoding exists.
-      () => apiRequest("POST", "/incidents", { incidentType: form.type, priority: form.priority, sceneAddress: form.address.trim() }),
+      () => apiRequest("POST", `/incidents/${incidentId}/cancel`, { reason }),
       () => {
-        // Demo mode only: a random spot in the service area so the map
-        // has something to draw.
-        const lat = MAP_BOUNDS.latMin + Math.random() * (MAP_BOUNDS.latMax - MAP_BOUNDS.latMin);
-        const lon = MAP_BOUNDS.lonMin + Math.random() * (MAP_BOUNDS.lonMax - MAP_BOUNDS.lonMin);
-        setIncidents((prev) => [
-          ...prev,
-          { id: `i${Date.now()}`, type: form.type, priority: form.priority, address: form.address.trim(), capabilityNeeded: form.capabilityNeeded, callReceivedAt: new Date(), assignedUnits: [], lat, lon },
-        ]);
+        const incident = incidents.find((i) => i.id === incidentId);
+        if (incident) {
+          const unitIds = incident.assignedUnits.map((a) => a.unitId);
+          setUnits((prev) => prev.map((u) => (unitIds.includes(u.id) ? { ...u, status: "available" } : u)));
+        }
+        setIncidents((prev) => prev.filter((i) => i.id !== incidentId));
       }
     );
-    setForm({ type: "emergency_911", priority: "emergent", address: "", capabilityNeeded: "BLS" });
-    setShowNewCall(false);
+    if (selIncidentId === incidentId) setSelIncidentId(null);
   }
   function handleReset() {
     setUnits(makeInitialUnits());
@@ -426,7 +504,8 @@ export default function DispatchConsole() {
         button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid #4EA1F0; outline-offset: 1px; }
         .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #131A24; color: #E7ECF2; }
         .leaflet-container { background: #0D131B; }
-        .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9); }
+        .map-dark .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9); }
+        .map-standard .leaflet-container { background: #E8E8E8; }
         .dispatch-root .text-xs { font-size: 13px; line-height: 1.4; }
         .dispatch-root .text-sm { font-size: 15px; }
         .ems-icon { background: none; border: none; }
@@ -442,7 +521,7 @@ export default function DispatchConsole() {
 
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
         <div>
-          <div className="text-xs tracking-widest uppercase" style={{ color: TEXT_FAINT }}>Ops Console</div>
+          <div className="text-xs tracking-widest uppercase" style={{ color: TEXT_FAINT }}>{live ? session.agency : "Ops Console · demo"}</div>
           <div className="text-lg font-semibold">Citywide Dispatch</div>
         </div>
         <div className="flex items-center gap-3 flex-wrap">
@@ -452,12 +531,11 @@ export default function DispatchConsole() {
             <StatPill label="Active" value={activeIncidents.length} color="#F5A623" />
           </div>
           <ConnectionBadge status={connectionStatus} />
-          <button onClick={() => setShowSettings(true)} className="flex items-center gap-1 text-xs px-2 py-1 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>
-            <Settings size={13} /> API
-          </button>
-          <button onClick={handleReset} className="text-xs px-2 py-1 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>
-            Reset Demo
-          </button>
+          {!live && (
+            <button onClick={handleReset} className="text-xs px-2 py-1 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>
+              Reset Demo
+            </button>
+          )}
         </div>
       </div>
 
@@ -485,16 +563,19 @@ export default function DispatchConsole() {
         <div className="rounded-lg border" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
           <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
             <div className="text-sm font-semibold tracking-wide">TRANSPORT QUEUE</div>
-            <button onClick={() => setShowNewCall(true)} className="flex items-center gap-1 text-xs font-medium px-3 py-1.5 rounded-md" style={{ backgroundColor: SUNKEN, color: TEXT_PRIMARY, border: `1px solid ${HAIRLINE}` }}>
+            <button onClick={openNewCall} className="flex items-center gap-1 text-xs font-medium px-3 py-1.5 rounded-md" style={{ backgroundColor: SUNKEN, color: TEXT_PRIMARY, border: `1px solid ${HAIRLINE}` }}>
               <Plus size={14} /> New Call
             </button>
           </div>
           <div>
-            {activeIncidents.length === 0 && (
-              <div className="px-4 py-8 text-center text-sm" style={{ color: TEXT_FAINT }}>Queue clear. No active transports.</div>
+            {live && connectionStatus === "connecting" && (
+              <div className="px-4 py-8 text-center text-sm" style={{ color: TEXT_FAINT }}>Loading your calls and units…</div>
+            )}
+            {activeIncidents.length === 0 && !(live && connectionStatus === "connecting") && (
+              <div className="px-4 py-8 text-center text-sm" style={{ color: TEXT_FAINT }}>Queue clear. No active calls.</div>
             )}
             {activeIncidents.map((incident) => (
-              <IncidentRow key={incident.id} incident={incident} now={now} units={units} onAssign={handleAssign} onRelease={handleRelease} onComplete={handleComplete} selected={incident.id === selIncidentId} onSelect={toggleIncident} />
+              <IncidentRow key={incident.id} incident={incident} now={now} units={units} onAssign={handleAssign} onRelease={handleRelease} onComplete={handleComplete} onEdit={openEdit} onCancel={handleCancelCall} selected={incident.id === selIncidentId} onSelect={toggleIncident} />
             ))}
           </div>
         </div>
@@ -502,6 +583,9 @@ export default function DispatchConsole() {
         <div className="rounded-lg border" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
           <div className="px-4 py-3 border-b text-sm font-semibold tracking-wide" style={{ borderColor: HAIRLINE }}>UNIT BOARD</div>
           <div className="p-3 flex flex-col gap-2">
+            {live && units.length === 0 && connectionStatus !== "connecting" && (
+              <div className="px-1 py-4 text-sm" style={{ color: TEXT_FAINT }}>No units yet. A supervisor adds them under Team.</div>
+            )}
             {units.map((unit) => (
               <UnitCard key={unit.id} unit={unit} onStatusChange={handleStatusChange} selected={unit.id === selUnitId} onSelect={toggleUnit} />
             ))}
@@ -510,13 +594,11 @@ export default function DispatchConsole() {
         </div>
       </div>
 
-      {showNewCall && <NewCallModal form={form} setForm={setForm} onSubmit={handleCreateIncident} onClose={() => setShowNewCall(false)} />}
-      {showSettings && (
-        <SettingsModal
-          apiBaseUrl={apiBaseUrl} setApiBaseUrl={setApiBaseUrl}
-          apiToken={apiToken} setApiToken={setApiToken}
-          connectionStatus={connectionStatus}
-          onClose={() => setShowSettings(false)}
+      {showNewCall && (
+        <CallFormModal
+          form={form} setForm={setForm} onSubmit={handleSubmitCall} onClose={closeCallForm}
+          title={editingId ? "Edit call" : "New call intake"} submitLabel={editingId ? "Save changes" : "Add to queue"}
+          onSearch={live ? searchPlaces : null}
         />
       )}
     </div>
@@ -534,42 +616,6 @@ function ConnectionBadge({ status }) {
   return (
     <div className="flex items-center gap-1 text-xs px-2 py-1 rounded" style={{ color: cfg.color, border: `1px solid ${HAIRLINE}` }}>
       <Icon size={12} /> {cfg.label}
-    </div>
-  );
-}
-
-function SettingsModal({ apiBaseUrl, setApiBaseUrl, apiToken, setApiToken, connectionStatus, onClose }) {
-  const [draftUrl, setDraftUrl] = useState(apiBaseUrl);
-  const [draftToken, setDraftToken] = useState(apiToken);
-  return (
-    <div className="fixed inset-0 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.6)", zIndex: 50 }}>
-      <div className="w-full rounded-lg border" style={{ maxWidth: "420px", backgroundColor: PANEL, borderColor: HAIRLINE }}>
-        <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
-          <div className="text-sm font-semibold">Backend Connection</div>
-          <button onClick={onClose} style={{ color: TEXT_SECONDARY }}><X size={18} /></button>
-        </div>
-        <div className="p-4 flex flex-col gap-3">
-          <div className="text-xs" style={{ color: TEXT_FAINT }}>
-            Leave blank to keep using local demo data. Set both to connect to a real deployed backend — see backend_db.js / server.js for what "real" means here.
-          </div>
-          <div>
-            <label className="text-xs block mb-1" style={{ color: TEXT_SECONDARY }}>API Base URL</label>
-            <input value={draftUrl} onChange={(e) => setDraftUrl(e.target.value)} placeholder="https://your-deployed-api.example.com/api" className="w-full text-sm rounded px-2 py-1.5" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }} />
-          </div>
-          <div>
-            <label className="text-xs block mb-1" style={{ color: TEXT_SECONDARY }}>Session Token (JWT)</label>
-            <textarea value={draftToken} onChange={(e) => setDraftToken(e.target.value)} rows={3} placeholder="Paste a token issued by your identity provider" className="w-full text-xs rounded px-2 py-1.5 mono" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY, resize: "vertical" }} />
-          </div>
-          <div className="flex gap-2">
-            <button onClick={() => { setDraftUrl(""); setDraftToken(""); setApiBaseUrl(""); setApiToken(""); }} className="text-xs px-3 py-2 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>
-              Use Demo Data
-            </button>
-            <button onClick={() => { setApiBaseUrl(draftUrl.trim()); setApiToken(draftToken.trim()); }} className="flex-1 text-sm font-medium rounded px-3 py-2" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>
-              Connect
-            </button>
-          </div>
-        </div>
-      </div>
     </div>
   );
 }
@@ -606,6 +652,10 @@ function LiveMap({ units, incidents, selUnitId, selIncidentId, onSelectUnit, onS
   const leafletStatus = useLeafletLoader();
   const [tilesWorking, setTilesWorking] = useState(null);
   const [trafficOn, setTrafficOn] = useState(true);
+  const [mapStyle, setMapStyle] = useState(() => {
+    try { return localStorage.getItem("ems:mapstyle") === "dark" ? "dark" : "standard"; } catch (e) { return "standard"; }
+  });
+  const pickStyle = (v) => { setMapStyle(v); try { localStorage.setItem("ems:mapstyle", v); } catch (e) { /* not saved */ } };
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const layerRef = useRef(null);
@@ -716,6 +766,11 @@ function LiveMap({ units, incidents, selUnitId, selIncidentId, onSelectUnit, onS
       <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
         <div className="text-xs tracking-wide font-semibold" style={{ color: TEXT_SECONDARY }}>LIVE MAP — tap a unit or a call to select it</div>
         <div className="flex items-center gap-2 text-xs">
+          <div className="flex rounded-md overflow-hidden" style={{ border: `1px solid ${HAIRLINE}` }}>
+            {[["standard", "Standard"], ["dark", "Dark"]].map(([key, label]) => (
+              <button key={key} onClick={() => pickStyle(key)} className="px-2.5 py-1.5" style={{ backgroundColor: mapStyle === key ? BLUE : SUNKEN, color: mapStyle === key ? "#06090D" : TEXT_PRIMARY, fontWeight: mapStyle === key ? 600 : 400 }}>{label}</button>
+            ))}
+          </div>
           <button onClick={fitAll} className="px-2.5 py-1.5 rounded-md" style={chip}>Fit all</button>
           {TOMTOM_KEY ? (
             <button onClick={() => setTrafficOn((v) => !v)} className="px-2.5 py-1.5 rounded-md" style={{ ...chip, borderColor: trafficOn ? GREEN : HAIRLINE, color: trafficOn ? GREEN : TEXT_PRIMARY }}>
@@ -727,7 +782,9 @@ function LiveMap({ units, incidents, selUnitId, selIncidentId, onSelectUnit, onS
           <span style={{ color: tilesWorking === true ? GREEN : TEXT_FAINT }}>{tilesWorking === true ? "Map live" : "Loading map…"}</span>
         </div>
       </div>
-      <div ref={containerRef} style={{ height: "clamp(340px, calc(100vh - 330px), 900px)", borderRadius: "6px", backgroundColor: SUNKEN }} />
+      <div className={mapStyle === "dark" ? "map-dark" : "map-standard"}>
+        <div ref={containerRef} style={{ height: "clamp(340px, calc(100vh - 330px), 900px)", borderRadius: "6px", backgroundColor: SUNKEN }} />
+      </div>
     </div>
   );
 }
@@ -799,17 +856,28 @@ function ZoneMap({ units, incidents }) {
   );
 }
 
-function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, selected, onSelect }) {
+function EtaText({ miles, etaMin, routed, status }) {
+  if (miles == null) return <span className="text-xs mono" style={{ color: TEXT_FAINT }}>no GPS fix, distance unknown</span>;
+  if (status === "live" && routed) {
+    return <span className="text-xs mono" style={{ color: TEXT_SECONDARY }}>~{Math.round(routed.etaMin)} min · {routed.miles.toFixed(1)} mi <span style={{ color: BLUE }} title="Road route; does not account for live traffic">· by road</span></span>;
+  }
+  return <span className="text-xs mono" style={{ color: TEXT_SECONDARY }}>~{Math.round(etaMin)} min · {miles.toFixed(1)} mi <span style={{ color: TEXT_FAINT }}>{status === "loading" ? "· checking road route…" : "· straight-line estimate"}</span></span>;
+}
+
+function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, onEdit, onCancel, selected, onSelect }) {
   const [confirming, setConfirming] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [reason, setReason] = useState("");
   const elapsedMs = now - incident.callReceivedAt;
   const target = PRIORITY_CONFIG[incident.priority].targetMin * 60 * 1000;
   const ratio = elapsedMs / target;
   const timerColor = ratio > 1 ? "#F0554A" : ratio > 0.7 ? "#F5A623" : TEXT_SECONDARY;
   const assignedUnits = incident.assignedUnits.map((a) => ({ ...a, unit: units.find((u) => u.id === a.unitId) })).filter((a) => a.unit);
   const rec = getRecommendation(incident, units);
-  // Restored: the live-route attempt (with an honest fallback label) was
-  // silently dropped when this console was rewired to the API.
-  const { routed, status: routeStatus } = useRoutedEta(rec?.unit, incident);
+  const { routed, status: routeStatus } = useRoutedEta(rec?.best?.unit, incident);
+  const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
+  const small = { backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY };
+  const noCrewAtAll = units.length > 0 && units.every((u) => u.crew.length === 0);
 
   return (
     <div className="px-4 py-3 border-b" onClick={() => onSelect && onSelect(incident.id)} style={{ borderColor: "#1B2330", cursor: "pointer", backgroundColor: selected ? "rgba(78,161,240,0.10)" : undefined, boxShadow: selected ? `inset 4px 0 0 ${BLUE}` : undefined }}>
@@ -821,8 +889,18 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, se
             </span>
             <span className="text-xs" style={{ color: TEXT_FAINT }}>{TYPE_LABELS[incident.type] || incident.type}</span>
             <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: TEXT_SECONDARY, backgroundColor: SUNKEN }}>{incident.capabilityNeeded}</span>
+            {incident.lat == null && <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: AMBER, backgroundColor: "rgba(245,147,74,0.1)" }} title="Edit the call and use Find to pin it on the map">no map pin</span>}
           </div>
-          <div className="text-sm mt-1 truncate">{incident.address}</div>
+          <div className="text-sm mt-1">{incident.address}{incident.detail ? <span style={{ color: TEXT_SECONDARY }}> · {incident.detail}</span> : null}</div>
+          {incident.destination && <div className="text-sm" style={{ color: TEXT_SECONDARY }}>→ {incident.destination}</div>}
+          {(incident.patientName || incident.contactName || incident.contactPhone) && (
+            <div className="text-xs mt-0.5" style={{ color: TEXT_FAINT }}>
+              {incident.patientName && <>Patient: {incident.patientName}</>}
+              {incident.patientName && (incident.contactName || incident.contactPhone) && " · "}
+              {(incident.contactName || incident.contactPhone) && <>Contact: {[incident.contactName, incident.contactPhone].filter(Boolean).join(" ")}</>}
+            </div>
+          )}
+          {incident.notes && <div className="text-xs mt-0.5" style={{ color: TEXT_FAINT }}>Note: {incident.notes}</div>}
         </div>
         <div className="mono text-sm shrink-0" style={{ color: timerColor }}>{formatElapsed(elapsedMs)}</div>
       </div>
@@ -831,50 +909,60 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, se
         <div className="mt-2 flex flex-col gap-1">
           {assignedUnits.map((a) => (
             <div key={a.unitId} className="flex items-center gap-2 flex-wrap text-xs">
-              <span style={{ color: TEXT_SECONDARY }}>{ROLE_LABELS[a.role]}:</span>
+              <span style={{ color: TEXT_SECONDARY }}>Assigned ({ROLE_LABELS[a.role] || a.role}):</span>
               <span className="font-medium mono">{a.unit.designation}</span>
-              <button onClick={() => onRelease(incident.id, a.unitId)} className="px-1.5 py-0.5 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_FAINT }}>Release</button>
+              <button onClick={stop(() => onRelease(incident.id, a.unitId))} className="px-1.5 py-0.5 rounded" style={small}>Release</button>
             </div>
           ))}
         </div>
       )}
 
-      <div className="mt-2 flex items-center gap-2 flex-wrap">
-        {rec ? (
-          <>
-            <span className="text-xs" style={{ color: TEXT_SECONDARY }}>{ROLE_LABELS[rec.role]}:</span>
-            <span className="text-xs font-medium mono">{rec.unit.designation}</span>
-            {rec.miles == null ? (
-              <span className="text-xs mono" style={{ color: TEXT_FAINT }}>no GPS fix — distance unknown</span>
-            ) : routeStatus === "live" && routed ? (
-              <span className="text-xs mono" style={{ color: TEXT_FAINT }}>~{Math.round(routed.etaMin)} min · {routed.miles.toFixed(1)} mi <span style={{ color: BLUE }}>· live route</span></span>
-            ) : routeStatus === "loading" ? (
-              <span className="text-xs mono" style={{ color: TEXT_FAINT }}>~{Math.round(rec.etaMin)} min est. · checking live route…</span>
-            ) : (
-              <span className="text-xs mono" style={{ color: TEXT_FAINT }}>~{Math.round(rec.etaMin)} min · {rec.miles.toFixed(1)} mi straight-line <span style={{ color: AMBER }}>· routing unavailable</span></span>
-            )}
-            {rec.isMismatch && <span className="text-xs flex items-center gap-1" style={{ color: AMBER }}><AlertTriangle size={12} /> capability mismatch — consider intercept</span>}
-            <button onClick={() => onAssign(incident.id, rec.unit.id, rec.role)} className="text-xs px-2 py-1 rounded font-medium" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>
-              {assignedUnits.length === 0 ? "Assign" : "Add Unit"}
+      <div className="mt-2 flex flex-col gap-1">
+        {rec?.best ? (
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs" style={{ color: TEXT_SECONDARY }}>{assignedUnits.length === 0 ? "Nearest available:" : "Nearest additional unit:"}</span>
+            <span className="text-xs font-medium mono">{rec.best.unit.designation} <span style={{ color: TEXT_FAINT }}>({rec.best.unit.capability})</span></span>
+            <EtaText miles={rec.best.miles} etaMin={rec.best.etaMin} routed={routed} status={routeStatus} />
+            {rec.isMismatch && <span className="text-xs flex items-center gap-1" style={{ color: AMBER }}><AlertTriangle size={12} /> not {incident.capabilityNeeded}, consider an intercept</span>}
+            <button onClick={stop(() => onAssign(incident.id, rec.best.unit.id, rec.role))} className="text-xs px-2 py-1 rounded font-medium" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>
+              Assign {rec.best.unit.designation}
             </button>
-          </>
+          </div>
         ) : (
-          <div className="flex items-center gap-1 text-xs" style={{ color: RED }}><AlertTriangle size={12} /> No units available — mutual aid may be needed</div>
+          <div className="flex items-center gap-1 text-xs" style={{ color: rec?.soon ? TEXT_SECONDARY : RED }}>
+            <AlertTriangle size={12} />
+            {noCrewAtAll ? "No unit has a crew yet. Put people on units under Team." : rec?.soon ? "No unit is free right now." : "No unit available. Mutual aid may be needed."}
+          </div>
+        )}
+        {rec?.soon && (
+          <div className="flex items-center gap-2 flex-wrap text-xs" style={{ color: TEXT_SECONDARY }}>
+            <span>{rec.best ? "Closer, but finishing a call:" : "Soonest to clear:"}</span>
+            <span className="font-medium mono">{rec.soon.unit.designation}</span>
+            <span style={{ color: TEXT_FAINT }}>(at destination)</span>
+            <EtaText miles={rec.soon.miles} etaMin={rec.soon.etaMin} routed={null} status="fallback" />
+          </div>
         )}
       </div>
 
-      {assignedUnits.length > 0 && (
-        <div className="mt-2">
-          {confirming ? (
-            <div className="flex items-center gap-2">
-              <button onClick={() => onComplete(incident.id)} className="text-xs px-2 py-1 rounded font-medium" style={{ backgroundColor: "#3A1E1E", border: "1px solid #593434", color: "#F0857D" }}>Confirm complete</button>
-              <button onClick={() => setConfirming(false)} className="text-xs px-2 py-1 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Cancel</button>
-            </div>
-          ) : (
-            <button onClick={() => setConfirming(true)} className="text-xs px-2 py-1 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Complete (release all)</button>
-          )}
-        </div>
-      )}
+      <div className="mt-2 flex items-center gap-2 flex-wrap" onClick={(e) => e.stopPropagation()}>
+        {assignedUnits.length > 0 && !cancelling && (confirming ? (
+          <>
+            <button onClick={() => onComplete(incident.id)} className="text-xs px-2 py-1 rounded font-medium" style={{ backgroundColor: "#3A1E1E", border: "1px solid #593434", color: "#F0857D" }}>Confirm complete</button>
+            <button onClick={() => setConfirming(false)} className="text-xs px-2 py-1 rounded" style={small}>Back</button>
+          </>
+        ) : (
+          <button onClick={() => setConfirming(true)} className="text-xs px-2 py-1 rounded" style={small}>Complete (release all)</button>
+        ))}
+        {!confirming && !cancelling && <button onClick={() => onEdit(incident)} className="text-xs px-2 py-1 rounded" style={small}>Edit</button>}
+        {!confirming && !cancelling && <button onClick={() => setCancelling(true)} className="text-xs px-2 py-1 rounded" style={{ ...small, color: "#F0857D" }}>Cancel call</button>}
+        {cancelling && (
+          <div className="flex items-center gap-2 flex-wrap w-full">
+            <input autoFocus value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why is it being cancelled?" className="text-xs rounded px-2 py-1.5 flex-1" style={{ minWidth: "160px", backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }} />
+            <button disabled={reason.trim().length < 3} onClick={() => onCancel(incident.id, reason.trim())} className="text-xs px-2 py-1.5 rounded font-medium" style={{ backgroundColor: "#3A1E1E", border: "1px solid #593434", color: reason.trim().length < 3 ? TEXT_FAINT : "#F0857D" }}>Confirm cancel</button>
+            <button onClick={() => { setCancelling(false); setReason(""); }} className="text-xs px-2 py-1.5 rounded" style={small}>Keep call</button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -907,32 +995,83 @@ function UnitCard({ unit, onStatusChange, selected, onSelect }) {
   );
 }
 
-function NewCallModal({ form, setForm, onSubmit, onClose }) {
+function CallFormModal({ form, setForm, onSubmit, onClose, title, submitLabel, onSearch }) {
+  const [results, setResults] = useState(null); // { field, items }
+  const [searching, setSearching] = useState(null);
+  const [searchNote, setSearchNote] = useState("");
+  const input = { backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY };
+  const set = (patch) => setForm({ ...form, ...patch });
+
+  async function find(field) {
+    const q = (field === "pickup" ? form.address : form.destination).trim();
+    if (q.length < 3) { setSearchNote("Type at least 3 characters first."); return; }
+    setSearching(field); setSearchNote(""); setResults(null);
+    try {
+      const items = await onSearch(q);
+      if (items.length === 0) setSearchNote("No matches. Try adding the street, borough or ZIP code.");
+      else setResults({ field, items });
+    } catch (e) {
+      setSearchNote(e.message || "Search failed");
+    } finally {
+      setSearching(null);
+    }
+  }
+  function choose(field, item) {
+    set(field === "pickup" ? { address: shortLabel(item.label), lat: item.lat, lon: item.lon } : { destination: shortLabel(item.label), destLat: item.lat, destLon: item.lon });
+    setResults(null);
+  }
+  const place = (field, label, value, pinned, placeholder) => (
+    <Field label={label}>
+      <div className="flex gap-2">
+        <input type="text" value={value} placeholder={placeholder} className="flex-1 min-w-0 text-sm rounded px-2 py-2" style={input}
+          onChange={(e) => set(field === "pickup" ? { address: e.target.value, lat: null, lon: null } : { destination: e.target.value, destLat: null, destLon: null })} />
+        {onSearch && (
+          <button type="button" onClick={() => find(field)} disabled={searching !== null} className="text-sm px-3 rounded shrink-0" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: BLUE }}>
+            {searching === field ? "…" : "Find"}
+          </button>
+        )}
+      </div>
+      {value.trim() && (
+        <span className="text-xs" style={{ color: pinned ? GREEN : AMBER }}>
+          {pinned ? "Pinned on the map" : onSearch ? "Not pinned. Tap Find and pick the exact place so units can be matched by distance." : "Demo: placed at a random spot"}
+        </span>
+      )}
+      {results && results.field === field && (
+        <div className="flex flex-col rounded border mt-1" style={{ borderColor: HAIRLINE }}>
+          {results.items.map((item, idx) => (
+            <button type="button" key={idx} onClick={() => choose(field, item)} className="text-left text-xs px-2 py-2 border-b" style={{ borderColor: "#1B2330", color: TEXT_PRIMARY, backgroundColor: PANEL }}>
+              {item.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </Field>
+  );
+
   return (
-    <div className="fixed inset-0 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.6)" }}>
-      <div className="w-full rounded-lg border" style={{ maxWidth: "400px", backgroundColor: PANEL, borderColor: HAIRLINE }}>
+    <div className="fixed inset-0 flex items-start sm:items-center justify-center p-3 overflow-y-auto" style={{ backgroundColor: "rgba(0,0,0,0.6)", zIndex: 50 }}>
+      <div className="w-full rounded-lg border my-4" style={{ maxWidth: "480px", backgroundColor: PANEL, borderColor: HAIRLINE }}>
         <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
-          <div className="text-sm font-semibold">New Call Intake</div>
+          <div className="text-sm font-semibold">{title}</div>
           <button onClick={onClose} style={{ color: TEXT_SECONDARY }}><X size={18} /></button>
         </div>
         <form onSubmit={onSubmit} className="p-4 flex flex-col gap-3">
-          <Field label="Type">
-            <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })} className="w-full text-sm rounded px-2 py-1.5" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }}>
-              {Object.entries(TYPE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-            </select>
-          </Field>
-          <Field label="Priority">
-            <select value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="w-full text-sm rounded px-2 py-1.5" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }}>
-              {Object.entries(PRIORITY_CONFIG).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-            </select>
-          </Field>
-          <Field label="Address / Location">
-            <input type="text" value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} placeholder="e.g. Southern Blvd & 149th St" className="w-full text-sm rounded px-2 py-1.5" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }} />
-          </Field>
-          <Field label="Capability Needed">
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Type">
+              <select value={form.type} onChange={(e) => set({ type: e.target.value })} className="w-full text-sm rounded px-2 py-2" style={input}>
+                {Object.entries(TYPE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+              </select>
+            </Field>
+            <Field label="Priority">
+              <select value={form.priority} onChange={(e) => set({ priority: e.target.value })} className="w-full text-sm rounded px-2 py-2" style={input}>
+                {Object.entries(PRIORITY_CONFIG).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+              </select>
+            </Field>
+          </div>
+          <Field label="Level of care needed">
             <div className="flex gap-2">
-              {["BLS", "ALS"].map((cap) => (
-                <button type="button" key={cap} onClick={() => setForm({ ...form, capabilityNeeded: cap })} className="flex-1 text-sm rounded px-2 py-1.5" style={{
+              {["BLS", "ALS", "CCT"].map((cap) => (
+                <button type="button" key={cap} onClick={() => set({ capabilityNeeded: cap })} className="flex-1 text-sm rounded px-2 py-2" style={{
                   backgroundColor: form.capabilityNeeded === cap ? "#1E3A2E" : SUNKEN,
                   border: form.capabilityNeeded === cap ? "1px solid #2E5943" : `1px solid ${HAIRLINE}`,
                   color: form.capabilityNeeded === cap ? GREEN : TEXT_SECONDARY,
@@ -940,7 +1079,27 @@ function NewCallModal({ form, setForm, onSubmit, onClose }) {
               ))}
             </div>
           </Field>
-          <button type="submit" className="mt-1 text-sm font-medium rounded px-3 py-2" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>Add to Queue</button>
+          {place("pickup", "Pickup address or facility *", form.address, form.lat != null, "e.g. BronxCare Hospital Center, Bronx")}
+          <Field label="Room, floor, unit or cross street">
+            <input type="text" value={form.detail} onChange={(e) => set({ detail: e.target.value })} placeholder="e.g. 4th floor, room 412, main lobby" className="w-full text-sm rounded px-2 py-2" style={input} />
+          </Field>
+          {place("dest", "Destination (for transfers)", form.destination, form.destLat != null, "e.g. Montefiore Moses, 111 E 210th St")}
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Patient name (optional)">
+              <input type="text" value={form.patientName} onChange={(e) => set({ patientName: e.target.value })} className="w-full text-sm rounded px-2 py-2" style={input} />
+            </Field>
+            <Field label="Contact name">
+              <input type="text" value={form.contactName} onChange={(e) => set({ contactName: e.target.value })} placeholder="Nurse, caller…" className="w-full text-sm rounded px-2 py-2" style={input} />
+            </Field>
+          </div>
+          <Field label="Contact phone">
+            <input type="tel" value={form.contactPhone} onChange={(e) => set({ contactPhone: e.target.value })} className="w-full text-sm rounded px-2 py-2" style={input} />
+          </Field>
+          <Field label="Notes for the crew">
+            <textarea rows={2} value={form.notes} onChange={(e) => set({ notes: e.target.value })} placeholder="Oxygen, stairs, bariatric, isolation…" className="w-full text-sm rounded px-2 py-2" style={{ ...input, resize: "vertical" }} />
+          </Field>
+          {searchNote && <div className="text-xs" style={{ color: AMBER }}>{searchNote}</div>}
+          <button type="submit" disabled={form.address.trim().length < 3} className="mt-1 text-sm font-medium rounded px-3 py-2.5" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN, opacity: form.address.trim().length < 3 ? 0.5 : 1 }}>{submitLabel}</button>
         </form>
       </div>
     </div>
