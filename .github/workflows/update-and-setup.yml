@@ -1,0 +1,111 @@
+name: Update and set up
+
+# The one workflow you need from your phone.
+#
+# UPDATE: upload a file named ems-update.zip to the main page of the repo
+# (Add file > Upload files), then run this workflow. It unpacks the zip into
+# the repo, deletes it, and commits; Vercel then redeploys by itself.
+#
+# DATABASE: with "Set up database" ticked it also builds/upgrades the Neon
+# database and creates or resets the owner login. Safe to repeat.
+#
+# Repo secrets (Settings > Secrets and variables > Actions):
+#   MIGRATION_DATABASE_URL  Neon DIRECT connection string (owner role, no "-pooler")
+#   RUNTIME_DB_PASSWORD     password of the app's restricted database login
+#   ADMIN_PASSWORD          the owner's sign-in password (10+ characters)
+
+on:
+  workflow_dispatch:
+    inputs:
+      setup_database:
+        description: Set up / upgrade the database too
+        type: boolean
+        default: true
+      agency_name:
+        description: Company name (database setup only)
+        default: Example Ambulance
+      agency_state:
+        description: State code (database setup only)
+        default: NY
+      protocol_authority:
+        description: Medical protocol authority (database setup only)
+        default: Local protocols
+      admin_name:
+        description: Your full name (database setup only)
+        default: ""
+      admin_email:
+        description: Your email, your sign-in name (database setup only)
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply ems-update.zip if present
+        run: |
+          shopt -s nullglob
+          zips=(ems-update*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No ems-update.zip in the repo - nothing to unpack."
+            exit 0
+          fi
+          for z in "${zips[@]}"; do
+            echo "Unpacking $z"
+            unzip -o "$z"
+            rm "$z"
+          done
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -m "Apply update" || echo "Nothing changed"
+          git push
+
+      - uses: actions/setup-node@v4
+        if: ${{ inputs.setup_database }}
+        with:
+          node-version: 20
+
+      - name: Install
+        if: ${{ inputs.setup_database }}
+        working-directory: backend
+        run: npm ci
+
+      - name: Create tables and the restricted app login (first run only)
+        if: ${{ inputs.setup_database }}
+        working-directory: backend
+        env:
+          MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+          RUNTIME_DB_PASSWORD: ${{ secrets.RUNTIME_DB_PASSWORD }}
+        run: |
+          if psql "$MIGRATION_DATABASE_URL" -tAc "SELECT to_regclass('public.tenants')" | grep -q tenants; then
+            echo "Tables already exist - skipping migrations"
+          else
+            npm run migrate
+          fi
+
+      - name: Apply database upgrades
+        if: ${{ inputs.setup_database }}
+        working-directory: backend
+        env:
+          MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+        run: node scripts/upgrade.js
+
+      - name: Create company and owner login
+        if: ${{ inputs.setup_database }}
+        working-directory: backend
+        env:
+          MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+          TENANT_ID: 610d9091-2a98-444a-8822-96370b293cfc
+          USER_ID: 3fcc880e-df88-4d68-876c-2b480074649a
+          AGENCY_NAME: ${{ inputs.agency_name }}
+          AGENCY_STATE: ${{ inputs.agency_state }}
+          PROTOCOL_AUTHORITY: ${{ inputs.protocol_authority }}
+          ADMIN_NAME: ${{ inputs.admin_name }}
+          ADMIN_EMAIL: ${{ inputs.admin_email }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: node scripts/bootstrap.js
