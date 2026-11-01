@@ -86,6 +86,19 @@ export default function FieldUnitConsole({ session }) {
     return () => clearInterval(t);
   }, [live, refresh]);
 
+  // The three numbers on this person's profile, and the unit's check status.
+  const [stats, setStats] = useState(null);
+  const [checkStatus, setCheckStatus] = useState(null);
+  const unitIdForLoads = me?.unit?.unit_id;
+  const loadExtras = useCallback(async () => {
+    try {
+      const [st, all] = await Promise.all([api(session, "GET", "/me/stats"), api(session, "GET", "/unit-checks/status")]);
+      setStats(st);
+      setCheckStatus(all.find((u) => u.unit_id === unitIdForLoads) || null);
+    } catch (e) { /* the main load reports problems */ }
+  }, [session, unitIdForLoads]);
+  useEffect(() => { if (live && unitIdForLoads) loadExtras(); }, [live, unitIdForLoads, loadExtras]);
+
   useEffect(() => () => { if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current); }, []);
 
   const unit = me?.unit || null;
@@ -237,6 +250,25 @@ export default function FieldUnitConsole({ session }) {
           </div>
         )}
 
+        {/* Profile */}
+        {live && stats && (
+          <div className="rounded-lg border p-4" style={card}>
+            <div className="text-xs tracking-wide font-semibold mb-2" style={{ color: TEXT_SECONDARY }}>MY CALLS</div>
+            <div className="flex gap-2">
+              {[["Assigned", stats.assigned, TEXT_PRIMARY], ...(stats.canChart ? [["Completed ePCRs", stats.completed, GREEN], ["Pending ePCRs", stats.pending, stats.pending ? AMBER : TEXT_PRIMARY]] : [])].map(([label, value, color]) => (
+                <div key={label} className="flex-1 rounded-md px-3 py-2" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}` }}>
+                  <div className="text-xs" style={{ color: TEXT_FAINT }}>{label}</div><div className="text-xl font-semibold" style={{ color }}>{value}</div>
+                </div>
+              ))}
+            </div>
+            {stats.canChart && stats.awaitingCorrection > 0 && <div className="mt-2 text-xs" style={{ color: AMBER }}>{stats.awaitingCorrection} chart{stats.awaitingCorrection > 1 ? "s were" : " was"} sent back by QA/QI for you to correct (ePCR screen).</div>}
+            {!stats.canChart && <div className="mt-2 text-xs" style={{ color: TEXT_FAINT }}>MVOs don't write patient charts.</div>}
+          </div>
+        )}
+
+        {/* Start-of-shift unit check */}
+        {live && unit && <UnitCheck session={session} unit={unit} status={checkStatus} onDone={loadExtras} />}
+
         {/* GPS */}
         {(!live || unit) && (
           <div className="rounded-lg border p-4" style={card}>
@@ -266,6 +298,75 @@ export default function FieldUnitConsole({ session }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function UnitCheck({ session, unit, status, onDone }) {
+  const [open, setOpen] = useState(false);
+  const [items, setItems] = useState(null);
+  const [answers, setAnswers] = useState({});   // itemId -> { ok, note }
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState("");
+
+  useEffect(() => {
+    if (!open || items) return;
+    api(session, "GET", `/checklist?unitId=${unit.unit_id}`).then(setItems).catch((e) => setError(e.message));
+  }, [open, items, session, unit.unit_id]);
+
+  const set = (id, patch) => setAnswers((a) => ({ ...a, [id]: { ...a[id], ...patch } }));
+  const ready = items && items.length > 0 && items.every((i) => typeof answers[i.item_id]?.ok === "boolean" && (answers[i.item_id].ok || (answers[i.item_id].note || "").trim()));
+  const lastText = !status?.last_check_at ? "No check recorded yet" : `Last check ${new Date(status.last_check_at).toLocaleString()} by ${status.last_check_by}: ${status.last_check_result === "pass" ? "passed" : "FAILED"}`;
+  const byCategory = (items || []).reduce((m, i) => { (m[i.category] ||= []).push(i); return m; }, {});
+
+  async function submit() {
+    setBusy(true); setError("");
+    try {
+      const r = await api(session, "POST", "/unit-checks", { unitId: unit.unit_id, items: items.map((i) => ({ itemId: i.item_id, ok: answers[i.item_id].ok, note: answers[i.item_id].note || undefined })) });
+      setDone(r.result === "pass" ? "Check recorded: everything OK." : `Check recorded. ${r.failedItems.length} item(s) flagged for your supervisor.`);
+      setOpen(false); setItems(null); setAnswers({});
+      onDone?.();
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="rounded-lg border p-4" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs tracking-wide font-semibold" style={{ color: TEXT_SECONDARY }}>UNIT CHECK</div>
+        {!open && <button onClick={() => { setOpen(true); setDone(""); }} className="text-sm rounded-md px-3" style={{ minHeight: "40px", backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: BLUE }}>Do the check</button>}
+      </div>
+      <div className="text-xs mt-1" style={{ color: status?.last_check_result === "fail" ? RED : TEXT_FAINT }}>{lastText}</div>
+      {done && <div className="text-xs mt-1" style={{ color: GREEN }}>{done}</div>}
+      {open && (
+        <div className="mt-3 flex flex-col gap-3">
+          {!items && !error && <div className="text-sm" style={{ color: TEXT_FAINT }}>Loading…</div>}
+          {items && items.length === 0 && <div className="text-sm" style={{ color: TEXT_FAINT }}>No checklist has been set up. Ask your supervisor.</div>}
+          {Object.entries(byCategory).map(([cat, list]) => (
+            <div key={cat} className="flex flex-col gap-2">
+              <div className="text-xs font-semibold" style={{ color: TEXT_FAINT }}>{cat.toUpperCase()}</div>
+              {list.map((i) => {
+                const a = answers[i.item_id] || {};
+                return (
+                  <div key={i.item_id} className="flex flex-col gap-1">
+                    <div className="text-sm">{i.label}{i.min_quantity != null ? <span className="text-xs" style={{ color: TEXT_FAINT }}> (at least {i.min_quantity})</span> : null}</div>
+                    <div className="flex gap-2">
+                      <button onClick={() => set(i.item_id, { ok: true })} className="flex-1 rounded-md text-sm" style={{ minHeight: "44px", backgroundColor: a.ok === true ? "#1E3A2E" : SUNKEN, border: `1px solid ${a.ok === true ? "#2E5943" : HAIRLINE}`, color: a.ok === true ? GREEN : TEXT_PRIMARY }}>OK</button>
+                      <button onClick={() => set(i.item_id, { ok: false })} className="flex-1 rounded-md text-sm" style={{ minHeight: "44px", backgroundColor: a.ok === false ? "#3A1E1E" : SUNKEN, border: `1px solid ${a.ok === false ? "#593434" : HAIRLINE}`, color: a.ok === false ? "#F0857D" : TEXT_PRIMARY }}>Not OK</button>
+                    </div>
+                    {a.ok === false && <input value={a.note || ""} onChange={(e) => set(i.item_id, { note: e.target.value })} placeholder="What's wrong?" className="text-sm rounded px-2 py-2" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }} />}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+          {error && <div className="text-xs" style={{ color: RED }}>{error}</div>}
+          <div className="flex gap-2">
+            <button disabled={!ready || busy} onClick={submit} className="flex-1 rounded-md text-sm font-medium" style={{ minHeight: "48px", backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN, opacity: ready ? 1 : 0.5 }}>{busy ? "Saving…" : "Submit check"}</button>
+            <button onClick={() => { setOpen(false); setError(""); }} className="rounded-md text-sm px-4" style={{ minHeight: "48px", backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Cancel</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

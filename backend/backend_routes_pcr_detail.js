@@ -15,11 +15,12 @@
 import express from "express";
 import { withTenant } from "./backend_db.js";
 import { requireAuth } from "./backend_auth.js";
+import { chartAccess } from "./backend_pcr_access.js";
 
 const router = express.Router();
 router.use(requireAuth);
 
-router.post("/pcr/:id/procedures", async (req, res) => {
+router.post("/pcr/:id/procedures", chartAccess("edit"), async (req, res) => {
   const { procedureName, performedByCrewMemberId, outcome, notes } = req.body;
   const result = await withTenant(req.user.tenantId, (client) =>
     client.query(
@@ -31,7 +32,7 @@ router.post("/pcr/:id/procedures", async (req, res) => {
   res.status(201).json(result.rows[0]);
 });
 
-router.post("/pcr/:id/medications", async (req, res) => {
+router.post("/pcr/:id/medications", chartAccess("edit"), async (req, res) => {
   const { drugName, dose, route, administeredByCrewMemberId, controlledSubstanceLogId, patientResponse } = req.body;
   const result = await withTenant(req.user.tenantId, (client) =>
     client.query(
@@ -46,7 +47,7 @@ router.post("/pcr/:id/medications", async (req, res) => {
 // pcr_disposition's primary key IS pcr_id (one row per chart, not one
 // row per update) — this is a real upsert via ON CONFLICT, not an
 // INSERT that happens to work the first time and breaks the second.
-router.put("/pcr/:id/disposition", async (req, res) => {
+router.put("/pcr/:id/disposition", chartAccess("edit"), async (req, res) => {
   const { dispositionType, destinationFacilityId, transferOfCareTo, primaryImpression, secondaryImpressions, mechanismOfInjury } = req.body;
   const result = await withTenant(req.user.tenantId, (client) =>
     client.query(

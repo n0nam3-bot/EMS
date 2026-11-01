@@ -232,7 +232,7 @@ const SECTIONS = [
 // One chart belongs to one call. Signed in, the crew picks the call first
 // (EpcrCharting below), then this component is created fresh for that call,
 // so two calls' charts can never mix on screen.
-function EpcrChart({ session, incidentId, incidentLabel, onBack }) {
+function EpcrChart({ session, incidentId, incidentLabel, onBack, onSubmitted }) {
   const live = session?.mode === "live";
   const [tab, setTab] = useState("patient");
   const [now, setNow] = useState(() => new Date());
@@ -268,7 +268,11 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack }) {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     const data = await res.json().catch(() => null);
-    if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+    if (!res.ok) {
+      const err = new Error(data?.error || `HTTP ${res.status}`);
+      err.missing = data?.missing; err.status = res.status;
+      throw err;
+    }
     return data;
   }
 
@@ -291,6 +295,8 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack }) {
     try {
       const id = await ensurePcr();
       await apiRequest(method, `/pcr/${id}${subPath}`, body);
+      // Re-read the saved entries so each one has its server ID (what lets a mistake be removed).
+      if (["/vitals", "/procedures", "/medications"].includes(subPath)) await loadFromServer({ everything: false }).catch(() => {});
     } catch (e) {
       setFailedSyncs((prev) => [...prev, `${label}: ${e.message}`]);
     } finally {
@@ -300,6 +306,55 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack }) {
 
   function noteUnsynced(message) {
     if (isConfigured) setFailedSyncs((prev) => [...prev, message]);
+  }
+
+  // ---- Saved entries come back from the server, so a chart that was reopened for
+  // correction opens with what was already recorded, and a mistaken entry can be removed.
+  const [serverState, setServerState] = useState({ status: "draft", reopenNote: "" });
+  const [hydrated, setHydrated] = useState(!live);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitProblem, setSubmitProblem] = useState(null); // { message, missing }
+  const pretty = { has_vitals: "No vital signs recorded", has_disposition: "No disposition recorded" };
+
+  async function loadFromServer({ everything }) {
+    const id = await ensurePcr();
+    const c = await apiRequest("GET", `/pcr/${id}`);
+    setServerState({ status: c.status, reopenNote: c.reopen_note || "" });
+    const n = (v) => (v === null || v === undefined ? "" : String(v));
+    setVitals(c.vitals.map((v) => ({ id: v.vital_id, serverId: v.vital_id, recordedAt: new Date(v.recorded_at), bpSys: n(v.bp_systolic), bpDia: n(v.bp_diastolic), hr: n(v.heart_rate), rr: n(v.respiratory_rate), spo2: n(v.spo2_percent), gcs: n(v.gcs_total), pain: n(v.pain_scale), glucose: n(v.blood_glucose), temp: n(v.temperature_f) })));
+    setProcedures(c.procedures.slice().reverse().map((p) => ({ id: p.procedure_id, serverId: p.procedure_id, name: p.procedure_name, performedAt: new Date(p.performed_at), outcome: p.outcome || "", notes: p.notes || "" })));
+    setMedications(c.medications.slice().reverse().map((m) => ({ id: m.medication_id, serverId: m.medication_id, name: m.drug_name, dose: m.dose, route: m.route, administeredAt: new Date(m.administered_at), controlled: false })));
+    if (everything) {
+      if (c.clinical_narrative) setNarrative(c.clinical_narrative);
+      if (c.disposition) setDispositionField((d) => ({ ...d, type: c.disposition.disposition_type || "", transferTo: c.disposition.transfer_of_care_to || "", primaryImpression: c.disposition.primary_impression || "", mechanismOfInjury: c.disposition.mechanism_of_injury || "" }));
+    }
+  }
+  useEffect(() => {
+    if (!live) return;
+    let cancelled = false;
+    loadFromServer({ everything: true }).catch((e) => { if (!cancelled) setFailedSyncs((prev) => [...prev, `Opening this chart: ${e.message}`]); }).finally(() => { if (!cancelled) setHydrated(true); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function removeSaved(kind, entry) {
+    if (!entry.serverId) return;
+    try {
+      const id = await ensurePcr();
+      await apiRequest("DELETE", `/pcr/${id}/${kind}/${entry.serverId}`);
+      await loadFromServer({ everything: false });
+    } catch (e) { setFailedSyncs((prev) => [...prev, `Removing entry: ${e.message}`]); }
+  }
+
+  async function submitChart(acknowledgeMissing) {
+    setSubmitting(true); setSubmitProblem(null);
+    try {
+      const id = await ensurePcr();
+      await apiRequest("POST", `/pcr/${id}/submit`, { acknowledgeMissing });
+      onSubmitted?.();
+    } catch (e) {
+      setSubmitProblem({ message: e.message, missing: e.missing || null });
+    } finally { setSubmitting(false); }
   }
 
   function commitVitals(e) {
@@ -398,6 +453,13 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack }) {
         </div>
       )}
 
+      {live && serverState.status === "reopened" && (
+        <div className="mx-4 mt-3 px-3 py-2 rounded-md text-xs" style={{ color: AMBER, backgroundColor: "rgba(245,147,74,0.08)", border: "1px solid #4A3A1E" }}>
+          <b>QA/QI sent this chart back to you for correction:</b> {serverState.reopenNote} Fix it, then submit it again. Only you can open it right now.
+        </div>
+      )}
+      {live && !hydrated && <div className="mx-4 mt-3 text-xs" style={{ color: TEXT_FAINT }}>Loading what's already saved…</div>}
+
       {failedSyncs.length > 0 && (
         <div className="mx-4 mt-3 px-3 py-2 rounded-md text-xs" style={{ backgroundColor: "rgba(240,85,74,0.1)", border: "1px solid #593434", color: RED }}>
           <div className="flex items-center justify-between gap-2">
@@ -412,12 +474,12 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack }) {
         {SECTIONS.map((s) => <ChartTab key={s.key} active={tab === s.key} onClick={() => setTab(s.key)} icon={s.icon} label={s.label} status={status(s.key)} />)}
       </div>
 
-      <div className="p-4">
+      <div className="p-4 pb-28">
         {tab === "patient" && <PatientTab patient={patient} set={setPatientField} localOnly={isConfigured ? "Not synced: patient name, DOB and SSN are encrypted-at-rest fields, and no app-layer encryption exists yet — sending them unencrypted would defeat the schema's point. Allergies, home meds and history have no backend columns at all." : null} />}
         {tab === "assessment" && <AssessmentTab assessment={assessment} set={setAssessmentField} localOnly={isConfigured ? "Not synced: the schema has no columns for chief complaint, HPI/OPQRST, mental status or survey findings." : null} />}
-        {tab === "vitals" && <VitalsTab vitals={vitals} setVitals={setVitals} now={now} onCommit={commitVitals} />}
-        {tab === "procedures" && <ProceduresTab procedures={procedures} setProcedures={setProcedures} onCommit={commitProcedure} />}
-        {tab === "medications" && <MedicationsTab medications={medications} setMedications={setMedications} allergies={patient.allergies} onCommit={commitMedication} />}
+        {tab === "vitals" && <VitalsTab vitals={vitals} setVitals={setVitals} now={now} onCommit={commitVitals} onRemove={(e) => removeSaved("vitals", e)} />}
+        {tab === "procedures" && <ProceduresTab procedures={procedures} setProcedures={setProcedures} onCommit={commitProcedure} onRemove={(e) => removeSaved("procedures", e)} />}
+        {tab === "medications" && <MedicationsTab medications={medications} setMedications={setMedications} allergies={patient.allergies} onCommit={commitMedication} onRemove={(e) => removeSaved("medications", e)} />}
         {tab === "narrative" && <NarrativeTab narrative={narrative} setNarrative={setNarrative} chartData={chartData} onCommit={commitNarrative} />}
         {tab === "disposition" && <DispositionTab disposition={disposition} set={setDispositionField} canSave={isConfigured} onSave={() => commitDisposition(disposition)} />}
         {tab === "signatures" && <SignaturesTab signatures={signatures} setSignatures={setSignatures} chartData={chartData} narrative={narrative} localOnly={isConfigured ? "Not synced: signatures need object storage (the schema stores a pointer to an uploaded image, not the image) and nothing in this backend has that yet." : null} />}
@@ -425,6 +487,26 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack }) {
           <button onClick={() => setTab(nextSection.key)} className="mt-4 w-full text-sm font-medium rounded px-3 py-2.5" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Continue to {nextSection.label} →</button>
         )}
       </div>
+
+      {live && (
+        <div className="fixed left-0 right-0 bottom-0 px-4 py-3 border-t flex flex-col gap-2" style={{ backgroundColor: "#0D131B", borderColor: HAIRLINE, zIndex: 30 }}>
+          {submitProblem && (
+            <div className="text-xs" style={{ color: submitProblem.missing ? AMBER : RED }}>
+              {submitProblem.message}
+              {submitProblem.missing && <> {submitProblem.missing.map((m) => pretty[m] || m).join("; ")}.</>}
+            </div>
+          )}
+          <div className="flex gap-2 pr-16">
+            {submitProblem?.missing
+              ? <>
+                  <button disabled={submitting} onClick={() => submitChart(true)} className="flex-1 text-sm font-medium rounded px-3" style={{ minHeight: "44px", backgroundColor: "#3A2A1E", border: "1px solid #593E34", color: AMBER }}>Submit anyway</button>
+                  <button onClick={() => setSubmitProblem(null)} className="text-sm rounded px-3" style={{ minHeight: "44px", backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Go back</button>
+                </>
+              : <button disabled={submitting || !hydrated} onClick={() => submitChart(false)} className="flex-1 text-sm font-medium rounded px-3" style={{ minHeight: "44px", backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>{submitting ? "Submitting…" : serverState.status === "reopened" ? "Resubmit ePCR" : "Submit ePCR"}</button>}
+          </div>
+          <div className="text-xs" style={{ color: TEXT_FAINT }}>Submitting locks the chart. Only QA/QI can open it again.</div>
+        </div>
+      )}
 
       <button onClick={() => setShowSearch(true)} aria-label="Search protocol reference" className="flex items-center justify-center rounded-full" style={{ position: "fixed", bottom: "20px", right: "20px", width: "56px", height: "56px", backgroundColor: BLUE, color: "#fff", border: "none", boxShadow: "0 4px 14px rgba(0,0,0,0.4)", zIndex: 40 }}>
         <Search size={22} />
@@ -574,7 +656,7 @@ function AssessmentTab({ assessment, set, localOnly }) {
   );
 }
 
-function VitalsTab({ vitals, setVitals, now, onCommit }) {
+function VitalsTab({ vitals, setVitals, now, onCommit, onRemove }) {
   const emptyDraft = { bpSys: "", bpDia: "", hr: "", rr: "", spo2: "", gcs: "", pain: "", glucose: "", temp: "" };
   const [draft, setDraft] = useState(emptyDraft);
   const last = vitals[0];
@@ -618,7 +700,7 @@ function VitalsTab({ vitals, setVitals, now, onCommit }) {
           {vitals.map((v, i) => {
             const prev = vitals[i + 1];
             const gap = prev ? Math.floor(minutesSince(prev.recordedAt, v.recordedAt)) : null;
-            return <div key={v.id} className="text-xs mono flex items-center justify-between border-b pb-2" style={{ borderColor: "#1B2330", color: TEXT_SECONDARY }}><span>{formatClock(v.recordedAt)} — BP {v.bpSys || "—"}/{v.bpDia || "—"} · HR {v.hr || "—"} · RR {v.rr || "—"} · SpO2 {v.spo2 || "—"}%</span>{gap !== null && <span style={{ color: gap > VITALS_INTERVAL_MIN ? RED : TEXT_FAINT }}>+{gap}m</span>}</div>;
+            return <div key={v.id} className="text-xs mono flex items-center justify-between border-b pb-2" style={{ borderColor: "#1B2330", color: TEXT_SECONDARY }}><span>{formatClock(v.recordedAt)} — BP {v.bpSys || "—"}/{v.bpDia || "—"} · HR {v.hr || "—"} · RR {v.rr || "—"} · SpO2 {v.spo2 || "—"}%</span>{gap !== null && <span style={{ color: gap > VITALS_INTERVAL_MIN ? RED : TEXT_FAINT }}>+{gap}m</span>}{v.serverId && onRemove && <button onClick={() => onRemove(v)} className="ml-2 px-1.5 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>Remove</button>}</div>;
           })}
         </div>
       </Card>
@@ -626,7 +708,7 @@ function VitalsTab({ vitals, setVitals, now, onCommit }) {
   );
 }
 
-function ProceduresTab({ procedures, setProcedures, onCommit }) {
+function ProceduresTab({ procedures, setProcedures, onCommit, onRemove }) {
   const [selected, setSelected] = useState(null);
   const [outcome, setOutcome] = useState("");
   const [notes, setNotes] = useState("");
@@ -657,14 +739,14 @@ function ProceduresTab({ procedures, setProcedures, onCommit }) {
         <div className="text-xs font-semibold tracking-wide mb-2" style={{ color: TEXT_FAINT }}>LOG ({procedures.length})</div>
         {procedures.length === 0 && <div className="text-sm" style={{ color: TEXT_FAINT }}>No procedures logged.</div>}
         <div className="flex flex-col gap-2">
-          {procedures.map((p) => <div key={p.id} className="text-xs border-b pb-2" style={{ borderColor: "#1B2330" }}><span className="mono" style={{ color: TEXT_FAINT }}>{formatClock(p.performedAt)}</span> <span style={{ color: TEXT_PRIMARY }}>{p.name}</span> {p.outcome && <span style={{ color: TEXT_SECONDARY }}>— {p.outcome}</span>}</div>)}
+          {procedures.map((p) => <div key={p.id} className="text-xs border-b pb-2" style={{ borderColor: "#1B2330" }}><span className="mono" style={{ color: TEXT_FAINT }}>{formatClock(p.performedAt)}</span> <span style={{ color: TEXT_PRIMARY }}>{p.name}</span> {p.outcome && <span style={{ color: TEXT_SECONDARY }}>— {p.outcome}</span>}{p.serverId && onRemove && <button onClick={() => onRemove(p)} className="ml-2 px-1.5 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>Remove</button>}</div>)}
         </div>
       </Card>
     </div>
   );
 }
 
-function MedicationsTab({ medications, setMedications, allergies, onCommit }) {
+function MedicationsTab({ medications, setMedications, allergies, onCommit, onRemove }) {
   const [selected, setSelected] = useState(null);
   const [dose, setDose] = useState("");
   const [route, setRoute] = useState(ROUTES[0]);
@@ -711,7 +793,7 @@ function MedicationsTab({ medications, setMedications, allergies, onCommit }) {
         <div className="text-xs font-semibold tracking-wide mb-2" style={{ color: TEXT_FAINT }}>LOG ({medications.length})</div>
         {medications.length === 0 && <div className="text-sm" style={{ color: TEXT_FAINT }}>No medications logged.</div>}
         <div className="flex flex-col gap-2">
-          {medications.map((m) => <div key={m.id} className="text-xs border-b pb-2" style={{ borderColor: "#1B2330" }}><span className="mono" style={{ color: TEXT_FAINT }}>{formatClock(m.administeredAt)}</span> <span style={{ color: TEXT_PRIMARY }}>{m.name} {m.dose} {m.route}</span>{m.controlled && <span className="ml-1" style={{ color: AMBER }}>⚠ controlled substance</span>}{m.allergyOverride && <span className="ml-1" style={{ color: RED }}>⚠ given despite allergy flag</span>}</div>)}
+          {medications.map((m) => <div key={m.id} className="text-xs border-b pb-2" style={{ borderColor: "#1B2330" }}><span className="mono" style={{ color: TEXT_FAINT }}>{formatClock(m.administeredAt)}</span> <span style={{ color: TEXT_PRIMARY }}>{m.name} {m.dose} {m.route}</span>{m.controlled && <span className="ml-1" style={{ color: AMBER }}>⚠ controlled substance</span>}{m.allergyOverride && <span className="ml-1" style={{ color: RED }}>⚠ given despite allergy flag</span>}{m.serverId && onRemove && <button onClick={() => onRemove(m)} className="ml-2 px-1.5 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>Remove</button>}</div>)}
         </div>
       </Card>
     </div>
@@ -917,50 +999,80 @@ function ProtocolSearchModal({ documents, setDocuments, onClose }) {
 
 const PRIORITY_LABEL = { critical: "Critical", emergent: "Emergent", urgent: "Urgent", routine: "Routine" };
 
+// Signed in, a crew member sees their own work: charts QA/QI sent back to them, charts they've
+// started, and calls their unit ran that still need one. A submitted chart is not in this list on
+// purpose: once submitted, only QA/QI can open it. Demo / no session: the sample chart directly.
 export default function EpcrCharting({ session }) {
   const live = session?.mode === "live";
   const [picked, setPicked] = useState(null); // { id, label }
-  const [calls, setCalls] = useState(null);
   const [mine, setMine] = useState(null);
+  const [stats, setStats] = useState(null);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [tick, setTick] = useState(0);
 
   useEffect(() => {
     if (!live || picked) return;
     let cancelled = false;
     const get = (path) => fetch(`${session.apiBaseUrl}${path}`, { headers: { Authorization: `Bearer ${session.token}` } })
       .then(async (r) => { const j = await r.json().catch(() => null); if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`); return j; });
-    Promise.all([get("/incidents"), get("/auth/me")])
-      .then(([incidents, me]) => {
-        if (cancelled) return;
-        setCalls(incidents.filter((i) => !i.closed_at));
-        setMine(me.incident?.incident_id || null);
-      })
-      .catch((e) => { if (!cancelled) setError(e.message || "Could not load calls"); });
+    Promise.all([get("/pcr/mine"), get("/me/stats")])
+      .then(([m, st]) => { if (!cancelled) { setMine(m); setStats(st); setError(""); } })
+      .catch((e) => { if (!cancelled) setError(e.message || "Could not load your charts"); });
     return () => { cancelled = true; };
-  }, [live, picked, session]);
+  }, [live, picked, session, tick]);
 
   if (!live) return <EpcrChart session={session} incidentId="" incidentLabel="" />;
-  if (picked) return <EpcrChart key={picked.id} session={session} incidentId={picked.id} incidentLabel={picked.label} onBack={() => setPicked(null)} />;
+  if (picked) {
+    return <EpcrChart key={picked.id} session={session} incidentId={picked.id} incidentLabel={picked.label} onBack={() => { setPicked(null); setTick((t) => t + 1); }}
+      onSubmitted={() => { setPicked(null); setNotice("Chart submitted and locked. QA/QI will review it."); setTick((t) => t + 1); }} />;
+  }
 
-  const ordered = (calls || []).slice().sort((a, b) => (a.incident_id === mine ? -1 : b.incident_id === mine ? 1 : 0));
+  const open = (id, address, priority) => { setNotice(""); setPicked({ id, label: `${address} — ${PRIORITY_LABEL[priority] || priority}` }); };
+  const sent = (mine?.charts || []).filter((c) => c.status === "reopened");
+  const drafts = (mine?.charts || []).filter((c) => c.status === "draft");
+  const card = { backgroundColor: PANEL, borderColor: HAIRLINE };
+  const Stat = ({ label, value, color }) => <div className="flex-1 rounded-lg border px-3 py-2" style={card}><div className="text-xs" style={{ color: TEXT_FAINT }}>{label}</div><div className="text-2xl font-semibold" style={{ color }}>{value}</div></div>;
   return (
     <div style={{ backgroundColor: VOID, color: TEXT_PRIMARY, fontFamily: "'Inter', system-ui, sans-serif" }} className="min-h-screen w-full">
       <div className="px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
         <div className="text-xs tracking-widest uppercase" style={{ color: TEXT_FAINT }}>ePCR Charting</div>
-        <div className="text-base font-semibold">Which call are you charting?</div>
+        <div className="text-base font-semibold">{session.user.name}</div>
       </div>
-      <div className="p-4 flex flex-col gap-2" style={{ maxWidth: "640px" }}>
+      <div className="p-4 flex flex-col gap-3" style={{ maxWidth: "640px" }}>
+        {stats && (
+          <div className="flex gap-2">
+            <Stat label="Calls assigned" value={stats.assigned} color={TEXT_PRIMARY} />
+            <Stat label="Completed ePCRs" value={stats.completed} color={GREEN} />
+            <Stat label="Pending to submit" value={stats.pending} color={stats.pending ? AMBER : TEXT_PRIMARY} />
+          </div>
+        )}
+        {notice && <div className="text-sm px-3 py-2 rounded-md" style={{ color: GREEN, backgroundColor: "rgba(52,211,153,0.08)", border: "1px solid #2E5943" }}>{notice}</div>}
         {error && <div className="text-sm" style={{ color: RED }}>{error}</div>}
-        {!error && calls === null && <div className="text-sm" style={{ color: TEXT_FAINT }}>Loading calls…</div>}
-        {calls && ordered.length === 0 && <div className="text-sm" style={{ color: TEXT_FAINT }}>No open calls. A chart is started from a call that dispatch has created.</div>}
-        {ordered.map((c) => (
-          <button key={c.incident_id} onClick={() => setPicked({ id: c.incident_id, label: `${c.scene_address} — ${PRIORITY_LABEL[c.priority] || c.priority}` })}
-            className="text-left rounded-lg border px-4 py-3" style={{ backgroundColor: PANEL, borderColor: c.incident_id === mine ? BLUE : HAIRLINE }}>
-            {c.incident_id === mine && <div className="text-xs font-semibold mb-0.5" style={{ color: BLUE }}>YOUR CURRENT CALL</div>}
-            <div className="text-sm font-medium">{c.scene_address}{c.scene_detail ? ` · ${c.scene_detail}` : ""}</div>
-            <div className="text-xs" style={{ color: TEXT_SECONDARY }}>{PRIORITY_LABEL[c.priority] || c.priority} · {c.capability_needed} · {(c.assigned_units || []).length} unit(s) assigned</div>
+        {!error && mine === null && <div className="text-sm" style={{ color: TEXT_FAINT }}>Loading…</div>}
+
+        {sent.length > 0 && <div className="text-xs font-semibold tracking-wide" style={{ color: AMBER }}>SENT BACK FOR CORRECTION</div>}
+        {sent.map((c) => (
+          <button key={c.pcr_id} onClick={() => open(c.incident_id, c.scene_address, c.priority)} className="text-left rounded-lg border px-4 py-3" style={{ ...card, borderColor: "#4A3A1E" }}>
+            <div className="text-sm font-medium">{c.scene_address}</div>
+            <div className="text-xs mt-0.5" style={{ color: AMBER }}>{c.reopen_note}</div>
           </button>
         ))}
+        {drafts.length > 0 && <div className="text-xs font-semibold tracking-wide mt-1" style={{ color: TEXT_SECONDARY }}>CHARTS IN PROGRESS</div>}
+        {drafts.map((c) => (
+          <button key={c.pcr_id} onClick={() => open(c.incident_id, c.scene_address, c.priority)} className="text-left rounded-lg border px-4 py-3" style={card}>
+            <div className="text-sm font-medium">{c.scene_address}</div>
+            <div className="text-xs" style={{ color: TEXT_SECONDARY }}>{c.unit_designation} · {PRIORITY_LABEL[c.priority] || c.priority} · not submitted</div>
+          </button>
+        ))}
+        {(mine?.calls || []).length > 0 && <div className="text-xs font-semibold tracking-wide mt-1" style={{ color: TEXT_SECONDARY }}>CALLS THAT NEED A CHART</div>}
+        {(mine?.calls || []).map((c) => (
+          <button key={`${c.incident_id}-${c.unit_id}`} onClick={() => open(c.incident_id, c.scene_address, c.priority)} className="text-left rounded-lg border px-4 py-3" style={card}>
+            <div className="text-sm font-medium">{c.scene_address}{c.scene_detail ? ` · ${c.scene_detail}` : ""}</div>
+            <div className="text-xs" style={{ color: TEXT_SECONDARY }}>{c.unit_designation} · {PRIORITY_LABEL[c.priority] || c.priority} · start chart</div>
+          </button>
+        ))}
+        {mine && !sent.length && !drafts.length && !(mine.calls || []).length && <div className="text-sm" style={{ color: TEXT_FAINT }}>Nothing to chart right now. Charts you've submitted are locked and only QA/QI can open them.</div>}
       </div>
     </div>
   );

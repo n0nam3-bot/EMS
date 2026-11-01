@@ -112,6 +112,7 @@ export default function ComplianceConsole({ session }) {
   const [loadError, setLoadError] = useState("");
   const [certs, setCerts] = useState(live ? [] : demoCerts);
   const [vehicles, setVehicles] = useState(live ? [] : demoVehicles);
+  const [unitChecks, setUnitChecks] = useState([]);
 
   useEffect(() => {
     if (!apiBaseUrl || !apiToken) { setConnectionStatus("demo"); return; }
@@ -122,9 +123,11 @@ export default function ComplianceConsole({ session }) {
       apiGet(apiBaseUrl, apiToken, "/vehicles"),
       // Review queue is for reviewers only; other roles just don't get one.
       apiGet(apiBaseUrl, apiToken, "/pcr-review").catch(() => []),
+      apiGet(apiBaseUrl, apiToken, "/unit-checks/status").catch(() => []),
     ])
-      .then(([apiCerts, apiVehicles, apiPcrs]) => {
+      .then(([apiCerts, apiVehicles, apiPcrs, apiChecks]) => {
         if (cancelled) return;
+        setUnitChecks(apiChecks);
         setPcrs(apiPcrs.map((p) => {
           const total = Number(p.total) || 1;
           return {
@@ -213,13 +216,33 @@ export default function ComplianceConsole({ session }) {
             <Panel title="VEHICLE INSPECTIONS">
               {vehicleAlerts.map((v) => <UrgencyRow key={v.id} left={v.unit} urgency={v.urgency} right={formatDays(v.days)} />)}
             </Panel>
+            {live && (
+              <Panel title="UNIT CHECKS (start of shift)">
+                {unitChecks.length === 0 && <div className="px-4 py-4 text-sm" style={{ color: TEXT_FAINT }}>No units yet.</div>}
+                {unitChecks.map((u) => {
+                  const hours = u.last_check_at ? (Date.now() - new Date(u.last_check_at)) / 3600000 : null;
+                  const failed = u.last_check_result === "fail";
+                  const color = failed ? RED : hours === null || hours > 24 ? AMBER : GREEN;
+                  return (
+                    <div key={u.unit_id} className="px-4 py-2 border-b text-sm" style={{ borderColor: "#1B2330" }}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span>{u.unit_designation} <span className="text-xs" style={{ color: TEXT_FAINT }}>{u.capability_level}</span></span>
+                        <span className="text-xs" style={{ color }}>{hours === null ? "no check on record" : failed ? `FAILED ${Math.round(hours)} h ago` : hours > 24 ? `last check ${Math.round(hours / 24)} days ago` : `passed ${Math.round(hours)} h ago`}</span>
+                      </div>
+                      {failed && <div className="text-xs mt-0.5" style={{ color: RED }}>{u.failed_items.join("; ")}</div>}
+                      {(u.periodic || []).map((p) => <div key={p.kind} className="text-xs mt-0.5" style={{ color: TEXT_SECONDARY }}>{{ dmv_inspection: "DMV inspection", mechanical: "Mechanical", doh_inspection: "DOH inspection", other: "Other" }[p.kind]}: {p.result === "pass" ? "passed" : "FAILED"} {new Date(p.performedAt).toLocaleDateString()}{p.nextDue ? `, next due ${new Date(p.nextDue).toLocaleDateString()}` : ""}</div>)}
+                    </div>
+                  );
+                })}
+              </Panel>
+            )}
           </div>
         )}
 
         {tab === "pcr" && (
           <div className="flex flex-col gap-3">
             <div className="text-xs px-3 py-2 rounded-md flex items-center gap-1.5" style={{ color: AMBER, backgroundColor: "rgba(245,166,35,0.08)", border: "1px solid #4A3A1E" }}>
-              <AlertTriangle size={13} /> {live ? "Charts that crews have started and not yet finalized, checked against the completeness rules. Approve and flag aren't built yet." : "Demo data."}
+              <AlertTriangle size={13} /> {live ? "Charts crews have submitted, checked against the completeness rules. Opening and approving charts is done by QA/QI on the QA/QI screen; this list shows only the call address and what's missing." : "Demo data."}
             </div>
             <Panel title="PCR REVIEW QUEUE">
               {visiblePcrs.length === 0 && <div className="px-4 py-8 text-center text-sm" style={{ color: TEXT_FAINT }}>{live ? "No open charts." : "All charts reviewed."}</div>}

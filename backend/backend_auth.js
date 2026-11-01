@@ -61,8 +61,41 @@ export const SESSION_HOURS = 12;
 export function signSession({ userId, tenantId }) {
   const secret = sessionSecret();
   if (!secret) throw new Error("SESSION_SECRET is missing or shorter than 32 characters");
-  const token = jwt.sign({ sub: userId, tenant_id: tenantId }, secret, { algorithm: "HS256", expiresIn: `${SESSION_HOURS}h` });
+  const token = jwt.sign({ typ: "session", sub: userId, tenant_id: tenantId }, secret, { algorithm: "HS256", expiresIn: `${SESSION_HOURS}h` });
   return { token, expiresAt: new Date(Date.now() + SESSION_HOURS * 3600 * 1000).toISOString() };
+}
+
+// A short-lived pass between the two sign-in steps. It proves the password was
+// right and nothing else: it can't be used as a session.
+export function signChallenge(kind, { sub, tenantId }, minutes) {
+  const secret = sessionSecret();
+  if (!secret) throw new Error("SESSION_SECRET is missing or shorter than 32 characters");
+  return jwt.sign({ typ: kind, sub, ...(tenantId ? { tenant_id: tenantId } : {}) }, secret, { algorithm: "HS256", expiresIn: `${minutes}m` });
+}
+export function verifyChallenge(token, kind) {
+  const secret = sessionSecret();
+  if (!secret || !token) return null;
+  try {
+    const p = jwt.verify(String(token).replace(/\s+/g, ""), secret, { algorithms: ["HS256"] });
+    return p.typ === kind ? p : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Platform administrators: a separate kind of session, shorter-lived, that
+// only the /platform routes accept (and that the company routes refuse).
+export const PLATFORM_SESSION_HOURS = 2;
+export function signPlatformSession(adminId) {
+  const secret = sessionSecret();
+  if (!secret) throw new Error("SESSION_SECRET is missing or shorter than 32 characters");
+  const token = jwt.sign({ typ: "platform", sub: adminId }, secret, { algorithm: "HS256", expiresIn: `${PLATFORM_SESSION_HOURS}h` });
+  return { token, expiresAt: new Date(Date.now() + PLATFORM_SESSION_HOURS * 3600 * 1000).toISOString() };
+}
+
+// Platform routes call this; company routes never accept the token it checks.
+export function verifyPlatformToken(token) {
+  return verifyChallenge(String(token ?? "").replace(/^Bearer /, ""), "platform");
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -73,7 +106,9 @@ export function lookupUser(tenantId, userId) {
   // users that aren't theirs.
   return withTenant(tenantId, async (client) =>
     (await client.query(
-      `SELECT u.role, u.is_active AS user_active, t.is_active AS tenant_active
+      `SELECT u.role, u.extra_roles::text[] AS extra_roles, u.is_active AS user_active, t.is_active AS tenant_active,
+              (SELECT cm.field_level FROM crew_members cm WHERE cm.user_id = u.user_id
+                 ORDER BY (cm.field_level IS NULL) LIMIT 1) AS field_level
        FROM users u JOIN tenants t ON t.tenant_id = u.tenant_id
        WHERE u.user_id = $1 AND u.tenant_id = $2`,
       [userId, tenantId]
@@ -99,6 +134,9 @@ export async function resolveSession(token) {
       const secret = sessionSecret();
       if (!secret) throw new Error("SESSION_SECRET is not set");
       payload = jwt.verify(clean, secret, { algorithms: ["HS256"] });
+      // Only a finished sign-in is a session. A password-step pass or a
+      // platform token must never open a company's data.
+      if (payload.typ !== "session") throw new Error("not a session token");
     } else {
       payload = jwt.verify(clean, normalizeKey(process.env.JWT_PUBLIC_KEY), { algorithms: ["RS256"] });
     }
@@ -118,7 +156,7 @@ export async function resolveSession(token) {
   if (!row) return deny("no such user in this agency");
   if (!row.tenant_active) return deny("agency suspended");
   if (!row.user_active) return deny("user deactivated");
-  return { user: { ...who, role: row.role } };
+  return { user: { ...who, role: row.role, roles: [row.role, ...(row.extra_roles || [])], fieldLevel: row.field_level || null } };
 }
 
 export async function requireAuth(req, res, next) {
@@ -151,13 +189,15 @@ export async function requireAuth(req, res, next) {
 // knowing about.
 export function requireRole(...allowedRoles) {
   return async (req, res, next) => {
-    if (allowedRoles.includes(req.user.role)) return next();
+    // A person can hold several roles; any one of them is enough.
+    if ((req.user.roles || [req.user.role]).some((r) => allowedRoles.includes(r))) return next();
     try {
       await auditDenied(req.user, {
         method: req.method,
         path: req.originalUrl,
         requiredRoles: allowedRoles,
         actualRole: req.user.role,
+        actualRoles: req.user.roles,
       });
     } catch (err) {
       // The caller is being refused either way — don't let a logging

@@ -19,7 +19,28 @@ const router = express.Router();
 router.use(requireAuth);
 
 const ADMIN = requireRole("supervisor", "it_admin");
-const ROLES = ["dispatcher", "crew", "supervisor", "compliance_officer", "biller", "it_admin", "read_only_auditor"];
+const ROLES = ["dispatcher", "crew", "supervisor", "qa_qi", "compliance_officer", "biller", "it_admin", "read_only_auditor"];
+const FIELD_LEVELS = ["mvo", "emt", "aemt", "paramedic"];
+// A person can hold several roles. One is stored as their main role (shown first),
+// the rest alongside it. Office responsibilities outrank "crew" for that purpose.
+const ROLE_PRIORITY = ["supervisor", "it_admin", "qa_qi", "compliance_officer", "dispatcher", "biller", "read_only_auditor", "crew"];
+function splitRoles(list) {
+  const uniq = ROLE_PRIORITY.filter((r) => list.includes(r));
+  return { role: uniq[0], extra: uniq.slice(1) };
+}
+// Turns what the form sent into a clean set of roles and a field level, or a plain-English problem.
+function readRoles(body, { current } = {}) {
+  let roles = Array.isArray(body.roles) ? body.roles : body.role !== undefined ? [body.role] : current?.roles;
+  let level = body.fieldLevel !== undefined ? body.fieldLevel : current?.fieldLevel ?? null;
+  if (!Array.isArray(roles) || roles.length === 0) fail(400, "Pick at least one role");
+  for (const r of roles) if (!ROLES.includes(r)) fail(400, `Unknown role "${r}"`);
+  if (level !== null && !FIELD_LEVELS.includes(level)) fail(400, "Field level must be MVO, EMT, AEMT or Paramedic");
+  if (level && !roles.includes("crew")) roles = [...roles, "crew"];        // anyone with a field level works on a unit
+  if (roles.includes("crew") && !level) fail(400, "Pick a field level (MVO, EMT, AEMT or Paramedic) for anyone who works on a unit");
+  if (!roles.includes("crew")) level = null;
+  return { roles, level, ...splitRoles(roles) };
+}
+
 const LEVELS = ["BLS", "ALS", "CCT"];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -52,11 +73,11 @@ router.get("/geocode", handle(async (req, res) => {
   res.json(await searchPlaces(q, near));
 }));
 
-// ---- People -------------------------------------------------------------
+// ---- People ---------------------------------------------------------------
 router.get("/users", ADMIN, handle(async (req, res) => {
   const rows = await withTenant(req.user.tenantId, async (c) => (await c.query(
-    `SELECT u.user_id, u.email, u.display_name, u.role, u.is_active,
-            cm.crew_member_id, cm.employee_number,
+    `SELECT u.user_id, u.email, u.display_name, u.role, u.extra_roles::text[] AS extra_roles, u.is_active, (u.mfa_enabled_at IS NOT NULL) AS mfa_enabled,
+            cm.crew_member_id, cm.employee_number, cm.field_level,
             uca.unit_id, v.unit_designation, uca.seat_role
      FROM users u
      LEFT JOIN crew_members cm ON cm.user_id = u.user_id
@@ -65,36 +86,37 @@ router.get("/users", ADMIN, handle(async (req, res) => {
      LEFT JOIN vehicles v ON v.vehicle_id = un.vehicle_id
      ORDER BY u.display_name`
   )).rows);
-  res.json(rows);
+  res.json(rows.map((r) => ({ ...r, roles: [r.role, ...r.extra_roles] })));
 }));
 
 router.post("/users", ADMIN, handle(async (req, res) => {
-  const { email, displayName, role, password, employeeNumber } = req.body || {};
+  const { email, displayName, password, employeeNumber } = req.body || {};
   const cleanEmail = String(email ?? "").trim().toLowerCase();
   const name = String(displayName ?? "").trim();
   if (!EMAIL_RE.test(cleanEmail)) fail(400, "Enter a valid email address");
   if (name.length < 2) fail(400, "Enter the person's full name");
-  if (!ROLES.includes(role)) fail(400, `Role must be one of: ${ROLES.join(", ")}`);
+  const { roles, level, role, extra } = readRoles(req.body || {});
   const problem = passwordProblem(password);
   if (problem) fail(400, problem);
   const [first, ...rest] = name.split(/\s+/);
   const hash = await hashPassword(password);
   try {
     const created = await withTenant(req.user.tenantId, async (c) => {
+      const clash = await c.query("SELECT 1 FROM users WHERE lower(email) = $1", [cleanEmail]);
+      if (clash.rows.length) fail(409, "That email is already used by an account");
       const u = (await c.query(
-        `INSERT INTO users (tenant_id, email, display_name, role, password_hash)
-         VALUES ($1, $2, $3, $4, $5) RETURNING user_id, email, display_name, role, is_active`,
-        [req.user.tenantId, cleanEmail, name, role, hash]
+        `INSERT INTO users (tenant_id, email, display_name, role, extra_roles, password_hash)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING user_id, email, display_name, role, extra_roles::text[] AS extra_roles, is_active`,
+        [req.user.tenantId, cleanEmail, name, role, extra, hash]
       )).rows[0];
-      // Every person is also a crew-member record, so anyone can be put on a
-      // unit and hold certifications. Their name and ID on the unit board
-      // come from here.
+      // Every person is also a crew-member record so they can hold certifications
+      // and, if they work on a unit, be put on one.
       const cm = (await c.query(
-        `INSERT INTO crew_members (tenant_id, user_id, first_name, last_name, employee_number)
-         VALUES ($1, $2, $3, $4, $5) RETURNING crew_member_id`,
-        [req.user.tenantId, u.user_id, first, rest.join(" ") || "-", employeeNumber ? String(employeeNumber).trim() : null]
+        `INSERT INTO crew_members (tenant_id, user_id, first_name, last_name, employee_number, field_level)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING crew_member_id`,
+        [req.user.tenantId, u.user_id, first, rest.join(" ") || "-", employeeNumber ? String(employeeNumber).trim() : null, level]
       )).rows[0];
-      return { ...u, crew_member_id: cm.crew_member_id };
+      return { ...u, roles, field_level: level, crew_member_id: cm.crew_member_id };
     });
     res.status(201).json(created);
   } catch (err) {
@@ -105,44 +127,57 @@ router.post("/users", ADMIN, handle(async (req, res) => {
 
 router.patch("/users/:id", ADMIN, handle(async (req, res) => {
   if (!UUID_RE.test(req.params.id)) fail(400, "Bad user id");
-  const { displayName, role, isActive, password, employeeNumber } = req.body || {};
-  if (role !== undefined && !ROLES.includes(role)) fail(400, `Role must be one of: ${ROLES.join(", ")}`);
-  if (req.params.id === req.user.userId && (isActive === false || (role !== undefined && role !== req.user.role))) {
-    fail(400, "You can't deactivate or change the role of your own account");
+  const b = req.body || {};
+  const touchesRoles = b.roles !== undefined || b.role !== undefined || b.fieldLevel !== undefined;
+  if (req.params.id === req.user.userId && (b.isActive === false || touchesRoles)) {
+    fail(400, "You can't deactivate or change the roles of your own account");
   }
   let hash;
-  if (password !== undefined) {
-    const problem = passwordProblem(password);
+  if (b.password !== undefined) {
+    const problem = passwordProblem(b.password);
     if (problem) fail(400, problem);
-    hash = await hashPassword(password);
+    hash = await hashPassword(b.password);
   }
   const out = await withTenant(req.user.tenantId, async (c) => {
-    const cur = (await c.query("SELECT user_id FROM users WHERE user_id = $1", [req.params.id])).rows[0];
+    const cur = (await c.query(
+      `SELECT u.user_id, u.role, u.extra_roles::text[] AS extra_roles, cm.field_level FROM users u LEFT JOIN crew_members cm ON cm.user_id = u.user_id WHERE u.user_id = $1`,
+      [req.params.id])).rows[0];
     if (!cur) return null;
     const sets = [], vals = [];
     const add = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
-    if (displayName !== undefined) { if (String(displayName).trim().length < 2) fail(400, "Enter the person's full name"); add("display_name", String(displayName).trim()); }
-    if (role !== undefined) add("role", role);
-    if (isActive !== undefined) add("is_active", Boolean(isActive));
+    if (b.displayName !== undefined) { if (String(b.displayName).trim().length < 2) fail(400, "Enter the person's full name"); add("display_name", String(b.displayName).trim()); }
+    let newLevel;
+    if (touchesRoles) {
+      const r = readRoles(b, { current: { roles: [cur.role, ...cur.extra_roles], fieldLevel: cur.field_level } });
+      add("role", r.role); add("extra_roles", r.extra);
+      newLevel = r.level;
+      // Taking someone off the field takes them off their unit.
+      if (!r.level) {
+        await c.query("UPDATE unit_crew_assignments SET assigned_to = now() WHERE assigned_to IS NULL AND crew_member_id IN (SELECT crew_member_id FROM crew_members WHERE user_id = $1)", [req.params.id]);
+      }
+    }
+    if (b.isActive !== undefined) add("is_active", Boolean(b.isActive));
     if (hash) { add("password_hash", hash); sets.push("failed_logins = 0", "locked_until = NULL"); }
+    if (b.resetMfa) sets.push("totp_secret_enc = NULL", "mfa_enabled_at = NULL", "mfa_last_step = 0", "recovery_hashes = '{}'");
     if (sets.length) { vals.push(req.params.id); await c.query(`UPDATE users SET ${sets.join(", ")} WHERE user_id = $${vals.length}`, vals); }
-    if (displayName !== undefined) {
-      const [first, ...rest] = String(displayName).trim().split(/\s+/);
+    if (newLevel !== undefined) await c.query("UPDATE crew_members SET field_level = $1 WHERE user_id = $2", [newLevel, req.params.id]);
+    if (b.displayName !== undefined) {
+      const [first, ...rest] = String(b.displayName).trim().split(/\s+/);
       await c.query("UPDATE crew_members SET first_name = $1, last_name = $2 WHERE user_id = $3", [first, rest.join(" ") || "-", req.params.id]);
     }
-    if (employeeNumber !== undefined) await c.query("UPDATE crew_members SET employee_number = $1 WHERE user_id = $2", [String(employeeNumber).trim() || null, req.params.id]);
-    if (isActive === false) {
-      // Someone who can no longer sign in shouldn't stay on a unit's crew.
+    if (b.employeeNumber !== undefined) await c.query("UPDATE crew_members SET employee_number = $1 WHERE user_id = $2", [String(b.employeeNumber).trim() || null, req.params.id]);
+    if (b.isActive === false) {
       await c.query(
         `UPDATE unit_crew_assignments SET assigned_to = now()
-         WHERE assigned_to IS NULL AND crew_member_id IN (SELECT crew_member_id FROM crew_members WHERE user_id = $1)`,
-        [req.params.id]
-      );
+         WHERE assigned_to IS NULL AND crew_member_id IN (SELECT crew_member_id FROM crew_members WHERE user_id = $1)`, [req.params.id]);
       await c.query("UPDATE crew_members SET is_active = FALSE WHERE user_id = $1", [req.params.id]);
-    } else if (isActive === true) {
+    } else if (b.isActive === true) {
       await c.query("UPDATE crew_members SET is_active = TRUE WHERE user_id = $1", [req.params.id]);
     }
-    return (await c.query("SELECT user_id, email, display_name, role, is_active FROM users WHERE user_id = $1", [req.params.id])).rows[0];
+    const row = (await c.query(
+      `SELECT u.user_id, u.email, u.display_name, u.role, u.extra_roles::text[] AS extra_roles, u.is_active, cm.field_level
+       FROM users u LEFT JOIN crew_members cm ON cm.user_id = u.user_id WHERE u.user_id = $1`, [req.params.id])).rows[0];
+    return { ...row, roles: [row.role, ...row.extra_roles] };
   });
   if (!out) fail(404, "User not found");
   res.json(out);
@@ -171,17 +206,22 @@ router.post("/units", ADMIN, handle(async (req, res) => {
   res.status(201).json({ unit_id: unit.unit_id, unit_designation: designation, capability_level: level });
 }));
 
-// Put a person on a unit (or take them off with unitId: null). One unit at a
-// time per person. This is what tells the Field Unit screen which unit a
-// signed-in crew member is on, and what lets that person report its GPS.
+// Put a person on a unit (or take them off with unitId: null). One unit at a time
+// per person. This is what tells the Field Unit screen which unit a signed-in crew
+// member is on, and what lets that person report its GPS.
+//
+// A unit goes into service when it has a crew, and an ALS or CCT unit also needs a
+// paramedic on it. It goes back out of service when that stops being true, unless
+// it's in the middle of a call.
 router.put("/crew/:crewMemberId/unit", ADMIN, handle(async (req, res) => {
   const { unitId, seatRole } = req.body || {};
   if (!UUID_RE.test(req.params.crewMemberId)) fail(400, "Bad crew member id");
   if (unitId !== null && !UUID_RE.test(String(unitId))) fail(400, "Pick a unit");
   const seat = seatRole === "driver" ? "driver" : "non_driver";
+  let warning = null;
 
   await withTenant(req.user.tenantId, async (c) => {
-    const cm = (await c.query("SELECT first_name, last_name FROM crew_members WHERE crew_member_id = $1 AND is_active", [req.params.crewMemberId])).rows[0];
+    const cm = (await c.query("SELECT first_name, last_name, field_level FROM crew_members WHERE crew_member_id = $1 AND is_active", [req.params.crewMemberId])).rows[0];
     if (!cm) fail(404, "Person not found, or deactivated");
     const who = `${cm.first_name} ${cm.last_name}`.trim();
 
@@ -191,18 +231,19 @@ router.put("/crew/:crewMemberId/unit", ADMIN, handle(async (req, res) => {
     )).rows.map((r) => r.unit_id);
 
     if (unitId) {
+      if (!cm.field_level) fail(409, `${who} doesn't work in the field. Give them a field level (MVO, EMT, AEMT or Paramedic) first.`);
       const unit = (await c.query(
-        `SELECT un.unit_id, un.current_status, v.capability_level, v.unit_designation
+        `SELECT un.unit_id, v.capability_level, v.unit_designation
          FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1`, [unitId]
       )).rows[0];
       if (!unit) fail(404, "Unit not found");
-      if (unit.capability_level === "ALS") {
+      if (unit.capability_level === "ALS" && cm.field_level === "paramedic") {
         const cert = await c.query(
           `SELECT 1 FROM certifications ce JOIN certification_types ct ON ct.certification_type_id = ce.certification_type_id
            WHERE ce.crew_member_id = $1 AND ct.required_for_capability = 'ALS' AND ce.expires_on >= CURRENT_DATE`,
           [req.params.crewMemberId]
         );
-        if (!cert.rows.length) fail(409, `${who} has no current ALS-level certification, so can't be put on ${unit.unit_designation}. Add their certification first.`);
+        if (!cert.rows.length) fail(409, `${who} is a paramedic with no current ALS-level certification, so can't be put on ${unit.unit_designation}. Add their certification first.`);
       }
       if (seat === "driver") {
         const d = (await c.query(
@@ -215,19 +256,30 @@ router.put("/crew/:crewMemberId/unit", ADMIN, handle(async (req, res) => {
         "INSERT INTO unit_crew_assignments (tenant_id, unit_id, crew_member_id, seat_role) VALUES ($1, $2, $3, $4)",
         [req.user.tenantId, unitId, req.params.crewMemberId, seat]
       );
-      if (unit.current_status === "out_of_service") await setStatus(c, req.user.tenantId, unitId, "available");
     }
-
-    // A unit left with nobody on it, and idle, goes out of service.
-    for (const id of new Set(freed)) {
-      if (id === unitId) continue;
-      const left = (await c.query("SELECT 1 FROM unit_crew_assignments WHERE unit_id = $1 AND assigned_to IS NULL", [id])).rows.length;
-      const st = (await c.query("SELECT current_status FROM units WHERE unit_id = $1", [id])).rows[0]?.current_status;
-      if (!left && st === "available") await setStatus(c, req.user.tenantId, id, "out_of_service");
+    for (const id of new Set([...freed, ...(unitId ? [unitId] : [])])) {
+      const w = await reconcileUnit(c, req.user.tenantId, id);
+      if (w && id === unitId) warning = w;
     }
   });
-  res.json({ ok: true });
+  res.json({ ok: true, ...(warning ? { warning } : {}) });
 }));
+
+// Decides whether an idle unit should be in or out of service from who is on it.
+async function reconcileUnit(c, tenantId, unitId) {
+  const u = (await c.query(
+    `SELECT un.current_status, v.capability_level, v.unit_designation FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1`, [unitId])).rows[0];
+  if (!u || !["available", "out_of_service"].includes(u.current_status)) return null;   // mid-call: leave it alone
+  const crew = (await c.query(
+    `SELECT count(*) AS n, count(*) FILTER (WHERE cm.field_level = 'paramedic') AS medics
+     FROM unit_crew_assignments uca JOIN crew_members cm ON cm.crew_member_id = uca.crew_member_id
+     WHERE uca.unit_id = $1 AND uca.assigned_to IS NULL`, [unitId])).rows[0];
+  const needsMedic = u.capability_level !== "BLS";
+  const ready = Number(crew.n) > 0 && (!needsMedic || Number(crew.medics) > 0);
+  const want = ready ? "available" : "out_of_service";
+  if (want !== u.current_status) await setStatus(c, tenantId, unitId, want);
+  return Number(crew.n) > 0 && !ready ? `${u.unit_designation} stays out of service until a paramedic is on it.` : null;
+}
 
 async function setStatus(c, tenantId, unitId, status) {
   await c.query("UPDATE units SET current_status = $1 WHERE unit_id = $2", [status, unitId]);

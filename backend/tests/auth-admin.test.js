@@ -1,12 +1,14 @@
-// Sign-in, accounts, staffing and the call lifecycle, through the real
-// HTTP API against a real database, plus the property that matters most:
-// one company's people can't see or change another company's records.
+// Sign-in (two steps), accounts and roles, staffing, the chart lifecycle with
+// QA/QI, unit checks, and the platform administrator, all through the real HTTP
+// API against a real database, plus the property that matters most: one
+// company's people can't see or change another company's records.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "http";
 import pg from "pg";
 import { applyMigrations, ensureRuntimeRole } from "../migrate.js";
 import { hashPassword } from "../backend_passwords.js";
+import { hotp, base32Decode, stepAt } from "../backend_mfa.js";
 
 const ADMIN_URL = process.env.TEST_DATABASE_URL || "postgres://ems_app:dev_only_change_me@localhost:5432/ems_dispatch_test";
 const RUNTIME_PASSWORD = "test_runtime_password";
@@ -14,16 +16,42 @@ const TA = "aaaaaaaa-1111-4111-8111-111111111111", TB = "bbbbbbbb-2222-4222-8222
 const UA = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", UB = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
 const PW = "correct-horse-battery";
 
-let server, base;
-const tokens = {};
+// A code works once and the server remembers the last step used, so a test that signs
+// in repeatedly moves the clock forward (for server and test alike) instead of waiting.
+const realNow = Date.now.bind(Date);
+let skewMs = 0;
+Date.now = () => realNow() + skewMs;
+const advance = () => { skewMs += 61_000; };
+const codeFor = (secret) => hotp(base32Decode(secret), stepAt(Date.now()));
+
+let server, base, admin;
+const secrets = new Map();   // email -> authenticator secret
+const sessions = new Map();  // email -> token
+
 async function call(method, path, body, token) {
   const r = await fetch(base + path, { method, headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: body ? JSON.stringify(body) : undefined });
   return { status: r.status, body: await r.json().catch(() => null) };
 }
-const login = (email, password = PW) => call("POST", "/auth/login", { email, password });
+// Full sign-in: password, then (first time) set up the authenticator, or (after) enter a code.
+async function signIn(email, password = PW) {
+  const first = await call("POST", "/auth/login", { email, password });
+  if (first.status !== 200) return first;
+  advance();
+  if (first.body.step === "mfa_setup") {
+    const setup = await call("POST", "/auth/mfa/setup", { challenge: first.body.challenge });
+    secrets.set(email, setup.body.secret);
+    return call("POST", "/auth/mfa/enable", { challenge: first.body.challenge, code: codeFor(setup.body.secret) });
+  }
+  return call("POST", "/auth/mfa/verify", { challenge: first.body.challenge, code: codeFor(secrets.get(email)) });
+}
+async function tokenFor(email) {
+  if (!sessions.has(email)) { const r = await signIn(email); assert.equal(r.status, 200, `sign-in for ${email}: ${JSON.stringify(r.body)}`); sessions.set(email, r.body.token); }
+  return sessions.get(email);
+}
+const q = async (sql, params) => (await admin.query(sql, params)).rows;
 
 before(async () => {
-  const admin = new pg.Client({ connectionString: ADMIN_URL });
+  admin = new pg.Client({ connectionString: ADMIN_URL });
   await admin.connect();
   await admin.query("DROP SCHEMA public CASCADE");
   await admin.query("CREATE SCHEMA public");
@@ -33,11 +61,11 @@ before(async () => {
   for (const [t, u, name, email] of [[TA, UA, "Company A", "boss@a.test"], [TB, UB, "Company B", "boss@b.test"]]) {
     await admin.query("INSERT INTO tenants (tenant_id, legal_name, display_name, regulatory_state, regulatory_region, encryption_key_ref) VALUES ($1,$2,$2,'NY','x','k')", [t, name]);
     await admin.query("INSERT INTO protocol_sets (tenant_id, issuing_authority, version_label, effective_from) VALUES ($1,'REMAC','v1',CURRENT_DATE)", [t]);
-    await admin.query("INSERT INTO certification_types (tenant_id, code, label, required_for_capability) VALUES ($1,'EMT-B','EMT-Basic',NULL), ($1,'PARAMEDIC','Paramedic','ALS')", [t]);
-    await admin.query("INSERT INTO users (user_id, tenant_id, email, display_name, role, password_hash) VALUES ($1,$2,$3,'Boss','supervisor',$4)", [u, t, email, hash]);
+    await admin.query("SELECT seed_tenant_defaults($1)", [t]);
+    await admin.query("INSERT INTO users (user_id, tenant_id, email, display_name, role, extra_roles, password_hash) VALUES ($1,$2,$3,'Boss','supervisor','{}',$4)", [u, t, email, hash]);
     await admin.query("INSERT INTO crew_members (tenant_id, user_id, first_name, last_name) VALUES ($1,$2,'Boss','-')", [t, u]);
   }
-  await admin.end();
+  await admin.query("INSERT INTO platform_admins (email, display_name, password_hash) VALUES ('root@platform.test', 'Root', $1)", [await hashPassword("platform-password-123")]);
 
   process.env.DATABASE_URL = ADMIN_URL.replace(/\/\/[^@]+@/, `//ems_app_runtime:${RUNTIME_PASSWORD}@`);
   process.env.SESSION_SECRET = "test-secret-test-secret-test-secret-12345";
@@ -45,94 +73,310 @@ before(async () => {
   const { default: app } = await import("../server.js");
   server = http.createServer(app).listen(0);
   base = `http://localhost:${server.address().port}/api`;
-  tokens.a = (await login("boss@a.test")).body.token;
-  tokens.b = (await login("boss@b.test")).body.token;
 });
-after(() => server?.close());
+after(async () => { server?.close(); await admin?.end(); Date.now = realNow; });
 
-test("login: right password works, wrong or unknown fails with the same words", async () => {
-  const ok = await login("BOSS@a.test");
-  assert.equal(ok.status, 200);
-  assert.equal(ok.body.agency, "Company A");
-  const wrong = await login("boss@a.test", "nope-nope-nope");
-  const unknown = await login("nobody@a.test", "nope-nope-nope");
+// ---------------------------------------------------------------------------------
+test("sign-in is two steps: the password alone never yields a session, a code is needed, and a code works once", async () => {
+  const wrong = await call("POST", "/auth/login", { email: "boss@a.test", password: "nope-nope-nope" });
+  const unknown = await call("POST", "/auth/login", { email: "nobody@a.test", password: "nope-nope-nope" });
   assert.equal(wrong.status, 401);
-  assert.deepEqual(wrong.body, unknown.body);
+  assert.deepEqual(wrong.body, unknown.body, "same words whether or not the account exists");
+
+  const first = await call("POST", "/auth/login", { email: "BOSS@a.test", password: PW });
+  assert.equal(first.body.step, "mfa_setup", "no authenticator yet: set one up, don't just let them in");
+  assert.equal(first.body.token, undefined);
+  assert.equal((await call("GET", "/units", null, first.body.challenge)).status, 401, "the password-step pass is not a session");
+
+  const setup = await call("POST", "/auth/mfa/setup", { challenge: first.body.challenge });
+  assert.match(setup.body.otpauthUrl, /^otpauth:\/\/totp\//);
+  assert.match(setup.body.secret, /^[A-Z2-7]{32}$/);
+  const stored = (await q("SELECT totp_secret_enc FROM users WHERE user_id = $1", [UA]))[0].totp_secret_enc;
+  assert.ok(stored && !stored.includes(setup.body.secret), "the authenticator secret is stored encrypted, never in the clear");
+  advance();
+  assert.equal((await call("POST", "/auth/mfa/enable", { challenge: first.body.challenge, code: "000000" })).status, 401);
+  const done = await call("POST", "/auth/mfa/enable", { challenge: first.body.challenge, code: codeFor(setup.body.secret) });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.recoveryCodes.length, 8);
+  assert.equal(done.body.agency, "Company A");
+  secrets.set("boss@a.test", setup.body.secret);
+
+  advance();
+  const again = await call("POST", "/auth/login", { email: "boss@a.test", password: PW });
+  assert.equal(again.body.step, "mfa");
+  assert.equal((await call("POST", "/auth/mfa/verify", { challenge: again.body.challenge, code: "123456" })).status, 401);
+  const code = codeFor(setup.body.secret);
+  assert.equal((await call("POST", "/auth/mfa/verify", { challenge: again.body.challenge, code })).status, 200);
+  const again2 = await call("POST", "/auth/login", { email: "boss@a.test", password: PW });
+  assert.equal((await call("POST", "/auth/mfa/verify", { challenge: again2.body.challenge, code })).status, 401, "the same code can't be used twice");
+
+  // a recovery code covers a lost phone, once
+  const viaRecovery = await call("POST", "/auth/mfa/verify", { challenge: again2.body.challenge, code: done.body.recoveryCodes[0] });
+  assert.equal(viaRecovery.status, 200);
+  const again3 = await call("POST", "/auth/login", { email: "boss@a.test", password: PW });
+  assert.equal((await call("POST", "/auth/mfa/verify", { challenge: again3.body.challenge, code: done.body.recoveryCodes[0] })).status, 401, "a recovery code is single-use");
 });
 
-test("requests without a session, or with a forged one, are refused", async () => {
-  assert.equal((await call("GET", "/incidents")).status, 401);
-  assert.equal((await call("GET", "/incidents", null, "not.a.token")).status, 401);
-});
-
-test("company A's admin sees and changes only company A's people", async () => {
-  const a = await call("GET", "/users", null, tokens.a);
-  const b = await call("GET", "/users", null, tokens.b);
-  assert.deepEqual(a.body.map((u) => u.email), ["boss@a.test"]);
-  assert.deepEqual(b.body.map((u) => u.email), ["boss@b.test"]);
-  const poke = await call("PATCH", `/users/${UB}`, { role: "crew" }, tokens.a);
-  assert.equal(poke.status, 404, "another company's user must look like it doesn't exist");
-  const inc = await call("POST", "/incidents", { incidentType: "emergency_911", priority: "critical", sceneAddress: "1 A Street" }, tokens.a);
+test("company A's admin sees and changes only company A's people, calls and checklists", async () => {
+  const a = await tokenFor("boss@a.test"), b = await tokenFor("boss@b.test");
+  assert.deepEqual((await call("GET", "/users", null, a)).body.map((u) => u.email), ["boss@a.test"]);
+  assert.deepEqual((await call("GET", "/users", null, b)).body.map((u) => u.email), ["boss@b.test"]);
+  assert.equal((await call("PATCH", `/users/${UB}`, { roles: ["dispatcher"] }, a)).status, 404, "another company's user looks like it doesn't exist");
+  const inc = await call("POST", "/incidents", { incidentType: "emergency_911", priority: "critical", sceneAddress: "1 A Street" }, a);
   assert.equal(inc.status, 201);
-  assert.equal((await call("GET", "/incidents", null, tokens.b)).body.length, 0, "B must not see A's call");
-  assert.equal((await call("PATCH", `/incidents/${inc.body.incident_id}`, { notes: "hijack" }, tokens.b)).status, 404);
-  assert.equal((await call("POST", `/incidents/${inc.body.incident_id}/cancel`, { reason: "hijack" }, tokens.b)).status, 404);
+  assert.equal((await call("GET", "/incidents", null, b)).body.length, 0);
+  assert.equal((await call("PATCH", `/incidents/${inc.body.incident_id}`, { notes: "hijack" }, b)).status, 404);
+  const itemsA = (await call("GET", "/checklist", null, a)).body, itemsB = (await call("GET", "/checklist", null, b)).body;
+  assert.ok(itemsA.length > 0 && itemsA.every((i) => i.tenant_id === TA) && itemsB.every((i) => i.tenant_id === TB));
 });
 
-test("staffing: ALS needs a certification; the crew member then knows their own unit and can report only its GPS", async () => {
-  const made = await call("POST", "/users", { email: "crew@a.test", displayName: "Casey Medic", role: "crew", password: PW, employeeNumber: "4471" }, tokens.a);
-  assert.equal(made.status, 201);
-  const als = (await call("POST", "/units", { designation: "Medic 1", capabilityLevel: "ALS" }, tokens.a)).body;
-  const bls = (await call("POST", "/units", { designation: "Ambulance 2", capabilityLevel: "BLS" }, tokens.a)).body;
-  const put = (unitId) => call("PUT", `/crew/${made.body.crew_member_id}/unit`, { unitId, seatRole: "driver" }, tokens.a);
-  assert.equal((await put(als.unit_id)).status, 409, "no ALS certification yet");
-  const type = (await call("GET", "/certification-types", null, tokens.a)).body.find((t) => t.code === "PARAMEDIC");
-  assert.equal((await call("POST", "/certifications", { crewMemberId: made.body.crew_member_id, certificationTypeId: type.certification_type_id, issuingBody: "NY DOH", issuedOn: "2025-01-01", expiresOn: "2030-01-01" }, tokens.a)).status, 201);
-  assert.equal((await put(als.unit_id)).status, 200);
-
-  const crew = (await login("crew@a.test")).body.token;
-  const me = await call("GET", "/auth/me", null, crew);
-  assert.equal(me.body.unit.unit_designation, "Medic 1");
-  assert.equal((await call("PATCH", `/units/${als.unit_id}/location`, { lat: 40.85, lon: -73.89 }, crew)).status, 200);
-  assert.equal((await call("PATCH", `/units/${bls.unit_id}/location`, { lat: 40.85, lon: -73.89 }, crew)).status, 403);
-  assert.equal((await call("GET", "/users", null, crew)).status, 403, "crew can't manage accounts");
-  assert.equal((await call("PATCH", `/units/${als.unit_id}/status`, { status: "en_route" }, crew)).status, 200, "crew can update their own unit");
-  assert.equal((await call("PATCH", `/units/${bls.unit_id}/status`, { status: "en_route" }, crew)).status, 403, "...but not another unit");
-  assert.equal((await call("PATCH", `/units/${als.unit_id}/status`, { status: "available" }, crew)).status, 200);
-  const inc = (await call("POST", "/incidents", { incidentType: "emergency_911", priority: "urgent", sceneAddress: "9 Review St" }, tokens.a)).body;
-  assert.equal((await call("POST", "/pcr", { incidentId: inc.incident_id }, crew)).status, 201);
-  assert.equal((await call("GET", "/pcr-review", null, crew)).status, 403, "crew can't open the review queue");
-  const queue = await call("GET", "/pcr-review", null, tokens.a);
-  assert.equal(queue.status, 200);
-  assert.equal(queue.body.length, 1);
-  assert.ok(queue.body[0].failed.includes("has_vitals"));
-  assert.equal((await call("GET", "/pcr-review", null, tokens.b)).body.length, 0, "B can't see A's charts");
+test("a person can hold several roles; anyone who works a unit needs a field level; office staff can be put on a unit only if they have one", async () => {
+  const a = await tokenFor("boss@a.test");
+  const make = (body) => call("POST", "/users", { password: PW, ...body }, a);
+  assert.equal((await make({ email: "x@a.test", displayName: "No Level", roles: ["crew"] })).status, 400, "crew needs a field level");
+  assert.equal((await make({ email: "x@a.test", displayName: "No Roles", roles: [] })).status, 400);
+  assert.equal((await make({ email: "x@a.test", displayName: "Bad Level", roles: ["crew"], fieldLevel: "wizard" })).status, 400);
+  const office = await make({ email: "disp@a.test", displayName: "Dana Dispatcher", roles: ["dispatcher"] });
+  assert.equal(office.status, 201);
+  assert.equal(office.body.field_level, null);
+  const both = await make({ email: "robin@a.test", displayName: "Robin Both", roles: ["dispatcher", "supervisor"], fieldLevel: "emt" });
+  assert.deepEqual([...both.body.roles].sort(), ["crew", "dispatcher", "supervisor"], "a field level adds the crew role");
+  const me = await call("GET", "/auth/me", null, await tokenFor("robin@a.test"));
+  assert.equal(me.body.user.fieldLevel, "emt");
+  assert.ok(me.body.user.roles.includes("dispatcher") && me.body.user.roles.includes("crew"));
+  const unit = (await call("POST", "/units", { designation: "Rig 9", capabilityLevel: "BLS" }, a)).body;
+  const nonField = await call("PUT", `/crew/${office.body.crew_member_id}/unit`, { unitId: unit.unit_id, seatRole: "driver" }, a);
+  assert.equal(nonField.status, 409, "a dispatcher with no field level can't be put on a unit");
+  assert.equal((await call("PATCH", `/users/${UA}`, { roles: ["dispatcher"] }, a)).status, 400, "can't change your own roles");
+  const lone = await call("PATCH", `/users/${office.body.user_id}`, { roles: ["dispatcher", "qa_qi"] }, a);
+  assert.deepEqual([...lone.body.roles].sort(), ["dispatcher", "qa_qi"]);
 });
 
-test("a call can be corrected and cancelled; cancelling frees its units", async () => {
-  const units = (await call("GET", "/units", null, tokens.a)).body;
-  const medic = units.find((u) => u.unit_designation === "Medic 1");
-  assert.equal((await call("POST", "/incidents", { incidentType: "ift_on_demand", priority: "urgent", sceneAddress: "" }, tokens.a)).status, 400);
-  const inc = (await call("POST", "/incidents", { incidentType: "ift_on_demand", priority: "urgent", capabilityNeeded: "ALS", sceneAddress: "BronxCare", sceneDetail: "Room 412", patientName: "J. Doe", lat: 40.84, lon: -73.91 }, tokens.a)).body;
-  const fixed = await call("PATCH", `/incidents/${inc.incident_id}`, { sceneAddress: "1650 Grand Concourse", sceneDetail: "Lobby", lat: 40.842, lon: -73.912 }, tokens.a);
-  assert.equal(fixed.body.scene_address, "1650 Grand Concourse");
-  assert.equal(fixed.body.patient_name, "J. Doe", "fields that weren't sent stay as they were");
-  assert.equal((await call("POST", `/incidents/${inc.incident_id}/assignments`, { unitId: medic.unit_id, role: "primary" }, tokens.a)).status, 201);
-  assert.equal((await call("POST", `/incidents/${inc.incident_id}/cancel`, { reason: "" }, tokens.a)).status, 400, "a reason is required");
-  const cancelled = await call("POST", `/incidents/${inc.incident_id}/cancel`, { reason: "Facility cancelled" }, tokens.a);
-  assert.ok(cancelled.body.cancelled_at);
-  assert.equal((await call("PATCH", `/incidents/${inc.incident_id}`, { notes: "late" }, tokens.a)).status, 409);
-  const after = (await call("GET", "/units", null, tokens.a)).body.find((u) => u.unit_designation === "Medic 1");
-  assert.equal(after.current_status, "available");
+// ---- the main flow: a crew works a call, charts it, QA reviews it -------------------------
+const ctx = {};
+test("staffing: an ALS unit needs a paramedic to go in service, an EMT or MVO may ride with them, and MVOs can drive", async () => {
+  const a = await tokenFor("boss@a.test");
+  const person = async (key, email, name, body) => {
+    const r = await call("POST", "/users", { email, displayName: name, password: PW, ...body }, a);
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    ctx[key] = r.body;
+  };
+  await person("medic", "medic@a.test", "Pat Medic", { roles: ["crew"], fieldLevel: "paramedic" });
+  await person("emt", "emt@a.test", "Eli Emt", { roles: ["crew"], fieldLevel: "emt" });
+  await person("emt2", "emt2@a.test", "Eve Emt", { roles: ["crew"], fieldLevel: "emt" });
+  await person("mvo", "mvo@a.test", "Dan Driver", { roles: ["crew"], fieldLevel: "mvo" });
+  await person("qa", "qa@a.test", "Quinn Qa", { roles: ["qa_qi"] });
+  await person("qaRider", "qarider@a.test", "Reese Both", { roles: ["qa_qi"], fieldLevel: "emt" });
+
+  ctx.als = (await call("POST", "/units", { designation: "Medic 1", capabilityLevel: "ALS" }, a)).body;
+  const put = (who, unit, seat) => call("PUT", `/crew/${ctx[who].crew_member_id}/unit`, { unitId: ctx[unit].unit_id, seatRole: seat }, a);
+  const status = async () => (await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 1").current_status;
+
+  const drv = await put("mvo", "als", "driver");
+  assert.equal(drv.status, 200);
+  assert.match(drv.body.warning, /paramedic/i);
+  assert.equal(await status(), "out_of_service", "crewed but no paramedic yet");
+  assert.equal((await put("medic", "als", "non_driver")).status, 409, "a paramedic still needs a current ALS certification");
+  const type = (await call("GET", "/certification-types", null, a)).body.find((t) => t.code === "PARAMEDIC");
+  await call("POST", "/certifications", { crewMemberId: ctx.medic.crew_member_id, certificationTypeId: type.certification_type_id, issuingBody: "NY DOH", issuedOn: "2025-01-01", expiresOn: "2030-01-01" }, a);
+  assert.equal((await put("medic", "als", "non_driver")).status, 200);
+  assert.equal(await status(), "available", "with a paramedic aboard it goes in service");
+  assert.equal((await put("emt", "als", "non_driver")).status, 200, "an EMT rides along on an ALS unit without an ALS certification");
+  assert.equal((await put("qaRider", "als", "non_driver")).status, 200);
 });
 
-test("deactivating someone ends their session at once, and 8 bad passwords lock the account", async () => {
-  const t = (await login("crew@a.test")).body.token;
-  const uid = (await call("GET", "/users", null, tokens.a)).body.find((u) => u.email === "crew@a.test").user_id;
-  assert.equal((await call("PATCH", `/users/${uid}`, { isActive: false }, tokens.a)).status, 200);
+test("charts belong to the unit's clinical crew: MVOs and office staff never get one, submitting locks it, only QA/QI can reopen it, and corrections go to one named person", async () => {
+  const a = await tokenFor("boss@a.test");
+  const tok = Object.fromEntries(await Promise.all(["medic", "emt", "emt2", "mvo", "qa", "qarider"].map(async (k) => [k, await tokenFor(`${k === "qarider" ? "qarider" : k}@a.test`)])));
+  const inc = (await call("POST", "/incidents", { incidentType: "emergency_911", priority: "urgent", sceneAddress: "5 Chart Ave" }, a)).body.incident_id;
+  assert.equal((await call("POST", `/incidents/${inc}/assignments`, { unitId: ctx.als.unit_id, role: "primary" }, a)).status, 201);
+
+  // who can start a chart
+  assert.equal((await call("POST", "/pcr", { incidentId: inc }, tok.mvo)).status, 403, "an MVO can't chart");
+  assert.equal((await call("POST", "/pcr", { incidentId: inc }, a)).status, 403, "office staff can't chart");
+  assert.equal((await call("POST", "/pcr", { incidentId: inc }, tok.emt2)).status, 403, "an EMT on some other unit can't chart this call");
+  const created = await call("POST", "/pcr", { incidentId: inc }, tok.emt);
+  assert.equal(created.status, 201);
+  const pcr = created.body.pcr_id;
+  assert.equal(created.body.unit_id, ctx.als.unit_id, "the chart is tied to the unit that treated the patient");
+  assert.equal((await call("POST", "/pcr", { incidentId: inc }, tok.emt)).body.pcr_id, pcr, "asking again returns the same chart");
+  const crewOnChart = (await q("SELECT cm.first_name FROM pcr_crew pc JOIN crew_members cm ON cm.crew_member_id = pc.crew_member_id WHERE pc.pcr_id = $1 ORDER BY 1", [pcr])).map((r) => r.first_name);
+  assert.deepEqual(crewOnChart, ["Eli", "Pat", "Reese"], "the EMT, the paramedic and the QA person who also rides; never the MVO");
+
+  // the crew can edit while it's a draft; nobody else can open it
+  assert.equal((await call("POST", `/pcr/${pcr}/vitals`, { heartRate: 88, bpSystolic: 120, bpDiastolic: 80 }, tok.medic)).status, 201);
+  assert.equal((await call("PATCH", `/pcr/${pcr}/narrative`, { clinicalNarrative: "Found patient seated." }, tok.emt)).status, 200);
+  for (const [who, t] of [["mvo", tok.mvo], ["office", a], ["qa", tok.qa], ["other emt", tok.emt2]]) {
+    assert.equal((await call("GET", `/pcr/${pcr}`, null, t)).status, 403, `${who} can't read a draft`);
+  }
+
+  // submit: missing pieces are named first, then it locks
+  const missing = await call("POST", `/pcr/${pcr}/submit`, {}, tok.emt);
+  assert.equal(missing.status, 409);
+  assert.ok(missing.body.missing.includes("has_disposition"));
+  assert.equal((await call("POST", `/pcr/${pcr}/submit`, { acknowledgeMissing: true }, tok.emt)).status, 200);
+  assert.equal((await call("GET", `/pcr/${pcr}`, null, tok.emt)).status, 403, "once submitted the crew can't open it");
+  assert.match((await call("GET", `/pcr/${pcr}`, null, tok.emt)).body.error, /locked/i);
+  assert.equal((await call("PATCH", `/pcr/${pcr}/narrative`, { clinicalNarrative: "sneaky edit" }, tok.medic)).status, 403);
+  assert.equal((await call("POST", `/pcr/${pcr}/vitals`, { heartRate: 200 }, tok.medic)).status, 403);
+  await assert.rejects(() => admin.query("UPDATE patient_care_records SET clinical_narrative = 'direct' WHERE pcr_id = $1", [pcr]), /locked/i, "the database itself refuses edits to a submitted chart");
+  assert.equal((await call("GET", "/pcr/mine", null, tok.emt)).body.charts.length, 0, "a submitted chart isn't in the crew's list");
+
+  // QA/QI: the review queue, reading, and what they can't do
+  assert.equal((await call("GET", "/qa/charts", null, a)).status, 403, "a supervisor isn't QA/QI unless given the role");
+  const queue = (await call("GET", "/qa/charts?status=submitted", null, tok.qa)).body;
+  assert.equal(queue.length, 1);
+  assert.equal(queue[0].unit_designation, "Medic 1");
+  const review = await call("GET", `/pcr/${pcr}`, null, tok.qa);
+  assert.equal(review.status, 200);
+  assert.equal(review.body.access, "review");
+  assert.equal(review.body.vitals.length, 1);
+  assert.equal((await call("PATCH", `/pcr/${pcr}/narrative`, { clinicalNarrative: "qa edit" }, tok.qa)).status, 403, "QA reviews, doesn't edit");
+  assert.equal((await call("GET", `/pcr/${pcr}`, null, tok.qarider)).status, 403, "QA/QI can't review a chart they were on");
+  assert.equal((await call("GET", "/qa/charts?status=submitted", null, tok.qarider)).body.length, 0);
+  assert.equal((await call("POST", `/pcr/${pcr}/reopen`, { assignToUserId: ctx.emt.user_id, note: "x" }, tok.qa)).status, 400, "a reason is required");
+  assert.equal((await call("POST", `/pcr/${pcr}/reopen`, { assignToUserId: ctx.mvo.user_id, note: "Add the second set of vitals" }, tok.qa)).status, 400, "only someone on the chart's clinical crew can be assigned");
+  assert.equal((await call("POST", `/pcr/${pcr}/reopen`, { assignToUserId: ctx.emt2.user_id, note: "Add the second set of vitals" }, tok.qa)).status, 400, "...and not an outsider");
+
+  // reopen for ONE member
+  assert.equal((await call("POST", `/pcr/${pcr}/reopen`, { assignToUserId: ctx.emt.user_id, note: "Add the second set of vitals" }, tok.qa)).status, 200);
+  const mine = (await call("GET", "/pcr/mine", null, tok.emt)).body;
+  assert.equal(mine.charts.length, 1);
+  assert.equal(mine.charts[0].status, "reopened");
+  assert.match(mine.charts[0].reopen_note, /second set of vitals/);
+  assert.equal((await call("GET", `/pcr/${pcr}`, null, tok.medic)).status, 403, "the partner on the same chart can't open it: it was sent to one person");
+  assert.equal((await call("GET", "/pcr/mine", null, tok.medic)).body.charts.length, 0);
+  const stats = (await call("GET", "/me/stats", null, tok.emt)).body;
+  assert.deepEqual([stats.assigned, stats.completed, stats.pending, stats.awaitingCorrection], [1, 0, 1, 1]);
+  const fixed = await call("GET", `/pcr/${pcr}`, null, tok.emt);
+  assert.equal(fixed.body.access, "edit");
+  assert.equal((await call("POST", `/pcr/${pcr}/vitals`, { heartRate: 84, bpSystolic: 118, bpDiastolic: 78 }, tok.emt)).status, 201);
+  assert.equal((await call("DELETE", `/pcr/${pcr}/vitals/${fixed.body.vitals[0].vital_id}`, null, tok.emt)).status, 200, "an entry made by mistake can be removed while it's open to you");
+  await call("PUT", `/pcr/${pcr}/disposition`, { dispositionType: "transported", primaryImpression: "Chest pain" }, tok.emt);
+  assert.equal((await call("POST", `/pcr/${pcr}/submit`, {}, tok.emt)).status, 200);
+  assert.deepEqual((await call("GET", "/pcr/mine", null, tok.emt)).body.charts, []);
+  const events = (await call("GET", `/pcr/${pcr}`, null, tok.qa)).body.events.map((e) => e.kind);
+  assert.deepEqual(events, ["created", "submitted", "reopened", "resubmitted"]);
+
+  // sign-off
+  assert.equal((await call("POST", `/pcr/${pcr}/approve`, {}, tok.qarider)).status, 403, "can't approve a chart you were on");
+  assert.equal((await call("POST", `/pcr/${pcr}/approve`, {}, tok.qa)).status, 200);
+  assert.equal((await call("GET", `/pcr/${pcr}`, null, tok.qa)).body.status, "finalized");
+  assert.equal((await call("POST", `/pcr/${pcr}/reopen`, { assignToUserId: ctx.emt.user_id, note: "too late now" }, tok.qa)).status, 409);
+  const done = (await call("GET", "/me/stats", null, tok.emt)).body;
+  assert.deepEqual([done.assigned, done.completed, done.pending], [1, 1, 0]);
+  const mvoStats = (await call("GET", "/me/stats", null, tok.mvo)).body;
+  assert.deepEqual([mvoStats.assigned, mvoStats.completed, mvoStats.pending, mvoStats.canChart], [1, 0, 0, false], "an MVO has calls but never charts");
+  assert.ok((await q("SELECT count(*) AS n FROM audit_log WHERE action = 'view' AND table_name = 'patient_care_records' AND record_id = $1", [pcr]))[0].n >= 2, "every chart open is audited");
+});
+
+test("unit checks: the checklist is the agency's own, a shift check needs every line answered, a failure needs a note and flags the unit", async () => {
+  const a = await tokenFor("boss@a.test"), emt = await tokenFor("emt@a.test"), mvo = await tokenFor("mvo@a.test");
+  const forUnit = (await call("GET", `/checklist?unitId=${ctx.als.unit_id}`, null, emt)).body;
+  assert.ok(forUnit.some((i) => i.applies_to === "ALS") && forUnit.some((i) => i.applies_to === "BLS"), "an ALS unit gets BLS and ALS items");
+  const blsUnit = (await call("POST", "/units", { designation: "Ambulance 2", capabilityLevel: "BLS" }, a)).body;
+  assert.ok((await call("GET", `/checklist?unitId=${blsUnit.unit_id}`, null, a)).body.every((i) => i.applies_to === "BLS"));
+
+  const imp = await call("POST", "/checklist/import", { text: "Pulse oximeter, 2\nSpine board\t3\tBLS\tImmobilization\nTraction splint, 1, ALS, Splints\nPulse oximeter, 2", appliesTo: "BLS", category: "Equipment" }, a);
+  assert.equal(imp.status, 201);
+  assert.deepEqual(imp.body, { added: 3, skipped: 1 }, "a pasted list is imported; duplicates are skipped");
+  assert.equal((await call("POST", "/checklist/import", { text: "x" }, emt)).status, 403, "only supervisors edit the checklist");
+
+  const items = (await call("GET", `/checklist?unitId=${ctx.als.unit_id}`, null, emt)).body;
+  const allOk = items.map((i) => ({ itemId: i.item_id, ok: true }));
+  assert.equal((await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items: allOk.slice(1) }, emt)).status, 400, "every line must be answered");
+  const oneBad = allOk.map((x, i) => (i === 0 ? { ...x, ok: false } : x));
+  assert.equal((await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items: oneBad }, emt)).status, 400, "a not-OK line needs a note");
+  assert.equal((await call("POST", "/unit-checks", { unitId: blsUnit.unit_id, items: [] }, emt)).status, 403, "only the crew on a unit records its check");
+  const statusBefore = (await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 1").current_status;
+  const failed = await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items: oneBad.map((x, i) => (i === 0 ? { ...x, note: "Strap frayed" } : x)) }, mvo);
+  assert.equal(failed.status, 201);
+  assert.equal(failed.body.result, "fail");
+  const st = (await call("GET", "/unit-checks/status", null, a)).body.find((u) => u.unit_designation === "Medic 1");
+  assert.equal(st.last_check_result, "fail");
+  assert.deepEqual(st.failed_items, [items[0].label]);
+  assert.equal((await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 1").current_status, statusBefore, "a failed check flags the unit but never changes its service status; a supervisor decides");
+  assert.equal((await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items: allOk }, emt)).body.result, "pass");
+
+  assert.equal((await call("POST", "/unit-checks/inspection", { unitId: ctx.als.unit_id, kind: "dmv_inspection", result: "pass", nextDue: "2027-06-30" }, emt)).status, 403);
+  assert.equal((await call("POST", "/unit-checks/inspection", { unitId: ctx.als.unit_id, kind: "dmv_inspection", result: "pass", nextDue: "2027-06-30" }, a)).status, 201);
+  const periodic = (await call("GET", "/unit-checks/status", null, a)).body.find((u) => u.unit_designation === "Medic 1").periodic;
+  assert.equal(periodic[0].kind, "dmv_inspection");
+  assert.equal(String((await call("GET", "/vehicles", null, a)).body.find((v) => v.unit_designation === "Medic 1").next_inspection_due).slice(0, 10), "2027-06-30");
+});
+
+test("deactivating someone ends their session at once, and 8 bad passwords lock an account", async () => {
+  const a = await tokenFor("boss@a.test");
+  const t = await tokenFor("emt2@a.test");
+  assert.equal((await call("PATCH", `/users/${ctx.emt2.user_id}`, { isActive: false }, a)).status, 200);
   assert.equal((await call("GET", "/units", null, t)).status, 401);
-  assert.equal((await login("crew@a.test")).status, 401);
-  assert.equal((await call("PATCH", `/users/${UA}`, { isActive: false }, tokens.a)).status, 400, "can't lock yourself out");
-  for (let i = 0; i < 8; i++) await login("boss@b.test", `bad-password-${i}`);
-  assert.equal((await login("boss@b.test")).status, 429);
+  assert.equal((await call("POST", "/auth/login", { email: "emt2@a.test", password: PW })).status, 401);
+  assert.equal((await call("PATCH", `/users/${UA}`, { isActive: false }, a)).status, 400, "can't lock yourself out");
+  for (let i = 0; i < 8; i++) await call("POST", "/auth/login", { email: "boss@b.test", password: `bad-password-${i}` });
+  assert.equal((await call("POST", "/auth/login", { email: "boss@b.test", password: PW })).status, 429);
+});
+
+test("a supervisor can reset a person's two-step sign-in, and they set it up again on their next login", async () => {
+  const a = await tokenFor("boss@a.test");
+  assert.equal((await call("PATCH", `/users/${ctx.emt.user_id}`, { resetMfa: true }, a)).status, 200);
+  const next = await call("POST", "/auth/login", { email: "emt@a.test", password: PW });
+  assert.equal(next.body.step, "mfa_setup");
+});
+
+// ---- the platform administrator -----------------------------------------------------------
+test("the platform admin runs companies and helps accounts, with its own session, and can't read any company's data", async () => {
+  const bad = await call("POST", "/auth/login", { email: "root@platform.test", password: "wrong-wrong-wrong" });
+  assert.equal(bad.status, 401);
+  const r = await signIn("root@platform.test", "platform-password-123");
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.kind, "platform");
+  const root = r.body.token;
+
+  const companyToken = await tokenFor("boss@a.test");
+  assert.equal((await call("GET", "/platform/tenants", null, companyToken)).status, 401, "a company session can't reach the platform");
+  assert.equal((await call("GET", "/units", null, root)).status, 401, "a platform session can't reach company data");
+  assert.equal((await call("GET", "/incidents", null, root)).status, 401);
+  assert.equal((await call("GET", "/platform/tenants", null, null)).status, 401);
+
+  assert.deepEqual((await call("GET", "/platform/tenants", null, root)).body.map((t) => t.display_name), ["Company A", "Company B"]);
+  assert.equal((await call("POST", "/platform/tenants", { name: "Company C", state: "NY", ownerEmail: "boss@a.test", ownerName: "Dup Owner", ownerPassword: PW }, root)).status, 409, "an email already in use can't start a company");
+  const made = await call("POST", "/platform/tenants", { name: "Company C", state: "ny", ownerEmail: "owner@c.test", ownerName: "Casey Owner", ownerPassword: PW }, root);
+  assert.equal(made.status, 201);
+  const owner = await signIn("owner@c.test");
+  assert.equal(owner.status, 200);
+  assert.equal(owner.body.agency, "Company C");
+  assert.ok(owner.body.user.roles.includes("supervisor") && owner.body.user.roles.includes("qa_qi"));
+  assert.ok((await call("GET", "/checklist", null, owner.body.token)).body.length > 0, "a new company starts with the starter checklist");
+
+  const users = (await call("GET", `/platform/tenants/${made.body.tenant_id}/users`, null, root)).body;
+  assert.equal(users[0].email, "owner@c.test");
+  assert.equal(users[0].mfa_enabled, true);
+  assert.equal(Object.keys(users[0]).includes("password_hash"), false);
+
+  const help = await call("PATCH", `/platform/users/${users[0].user_id}`, { password: "a-brand-new-password", resetMfa: true }, root);
+  assert.equal(help.status, 200);
+  assert.equal((await call("POST", "/auth/login", { email: "owner@c.test", password: PW })).status, 401, "old password stops working");
+  assert.equal((await call("POST", "/auth/login", { email: "owner@c.test", password: "a-brand-new-password" })).body.step, "mfa_setup");
+  const audit = await q("SELECT detail FROM audit_log WHERE tenant_id = $1 AND action = 'platform_support' ORDER BY audit_id", [made.body.tenant_id]);
+  assert.deepEqual(audit.map((x) => x.detail.what), ["company created", "password reset, two-step sign-in reset"], "each platform action is in the company's own audit log");
+  assert.equal(audit[1].detail.platform_admin.length, 36);
+
+  assert.equal((await call("PATCH", `/platform/tenants/${made.body.tenant_id}`, { isActive: false }, root)).status, 200);
+  assert.equal((await call("GET", "/units", null, owner.body.token)).status, 401, "a suspended company is locked out immediately");
+  assert.equal((await call("POST", "/auth/login", { email: "owner@c.test", password: "a-brand-new-password" })).status, 401);
+});
+
+test("the app's database login can't touch platform admin accounts directly", async () => {
+  const url = process.env.DATABASE_URL;
+  const app = new pg.Client({ connectionString: url });
+  await app.connect();
+  try {
+    await assert.rejects(() => app.query("SELECT * FROM platform_admins"), /permission denied/i);
+    await app.query("BEGIN");
+    await app.query("SELECT set_config('app.current_tenant_id', $1, true)", [TA]);
+    await assert.rejects(() => app.query("UPDATE pcr_events SET note = 'x'"), /permission denied/i, "chart history is append-only for the app");
+    await app.query("ROLLBACK");
+  } finally {
+    await app.end();
+  }
 });

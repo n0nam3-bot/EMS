@@ -110,6 +110,10 @@ export async function ensureRuntimeRole(client, password) {
     "REVOKE UPDATE, DELETE ON audit_log, unit_status_history, pcr_amendments, controlled_substance_log, protocol_search_log FROM ems_app_runtime"
   );
   await client.query("REVOKE DELETE ON mutual_aid_links FROM ems_app_runtime");
+  // Added by scripts/upgrade.js: append-only records, and the platform admin
+  // table the app may only reach through its narrow functions.
+  await client.query("REVOKE UPDATE, DELETE ON pcr_events, unit_checks, unit_check_items FROM ems_app_runtime");
+  await client.query("REVOKE ALL ON platform_admins FROM ems_app_runtime");
   // The two sign-in lookup functions (see scripts/upgrade.js) — the only way
   // the app can find an account before it knows which company it belongs to.
   await client.query(`DO $$ BEGIN

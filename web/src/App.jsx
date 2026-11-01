@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
+import QRCode from "qrcode";
 import DispatchConsole from "./consoles/dispatch_console.jsx";
 import FieldUnitConsole from "./consoles/field_unit_console.jsx";
 import ComplianceConsole from "./consoles/compliance_console.jsx";
 import EpcrCharting from "./consoles/epcr_charting.jsx";
 import TeamConsole from "./consoles/team_console.jsx";
+import QaConsole from "./consoles/qa_console.jsx";
+import PlatformConsole from "./consoles/platform_console.jsx";
 import { apiRequest } from "./api.js";
 
 const API_BASE = import.meta.env?.VITE_API_URL || `${window.location.origin}/api`;
@@ -12,30 +15,44 @@ const SESSION_KEY = "ems:session";
 const VIEWS = {
   dispatch: { label: "Dispatch", Component: DispatchConsole },
   field: { label: "Field Unit", Component: FieldUnitConsole },
-  compliance: { label: "Compliance", Component: ComplianceConsole },
   epcr: { label: "ePCR", Component: EpcrCharting },
+  qa: { label: "QA/QI", Component: QaConsole },
+  compliance: { label: "Compliance", Component: ComplianceConsole },
   team: { label: "Team", Component: TeamConsole },
+  platform: { label: "Platform", Component: PlatformConsole },
 };
+const DEMO_VIEWS = ["dispatch", "field", "epcr", "compliance"];
+const VIEW_ORDER = ["dispatch", "field", "epcr", "qa", "compliance", "team", "platform"];
 // Which screens each role is shown. This tidies the menu; what a role may
-// actually DO is enforced by the server, not here.
+// actually DO is enforced by the server, not here. A person with several
+// roles gets every screen any of them gets.
 const ROLE_VIEWS = {
-  dispatcher: ["dispatch", "field"],
-  crew: ["field", "epcr"],
-  supervisor: ["dispatch", "field", "epcr", "compliance", "team"],
-  it_admin: ["dispatch", "field", "epcr", "compliance", "team"],
-  compliance_officer: ["compliance", "epcr"],
+  dispatcher: ["dispatch"],
+  supervisor: ["dispatch", "compliance", "team"],
+  it_admin: ["team"],
+  qa_qi: ["qa"],
+  compliance_officer: ["compliance"],
   biller: ["compliance"],
   read_only_auditor: ["compliance"],
+  crew: ["field"],
 };
-const DEMO_VIEWS = ["dispatch", "field", "compliance", "epcr"];
-const ROLE_LABEL = { dispatcher: "Dispatcher", crew: "Crew", supervisor: "Supervisor", compliance_officer: "Compliance", it_admin: "IT admin", biller: "Biller", read_only_auditor: "Auditor" };
+const CLINICAL = ["emt", "aemt", "paramedic"];
+function viewsFor(session) {
+  if (session.mode === "demo") return DEMO_VIEWS;
+  if (session.kind === "platform") return ["platform"];
+  const set = new Set();
+  for (const r of session.user.roles || [session.user.role]) (ROLE_VIEWS[r] || []).forEach((v) => set.add(v));
+  if (CLINICAL.includes(session.user.fieldLevel)) set.add("epcr");   // MVOs drive; they don't chart
+  return VIEW_ORDER.filter((v) => set.has(v));
+}
+const ROLE_LABEL = { dispatcher: "Dispatcher", crew: "Field", supervisor: "Supervisor", qa_qi: "QA/QI", compliance_officer: "Compliance", it_admin: "IT admin", biller: "Biller", read_only_auditor: "Auditor" };
 
 // A signed-in session lives in this browser until it expires (12 hours, the
 // length of a shift) or the person signs out. The demo is never saved.
 function loadSession() {
   try {
     const s = JSON.parse(localStorage.getItem(SESSION_KEY));
-    if (s && s.token && new Date(s.expiresAt) > new Date()) return { ...s, mode: "live", apiBaseUrl: API_BASE };
+    if (s && s.token && s.kind && new Date(s.expiresAt) > new Date()) return { ...s, mode: "live", apiBaseUrl: API_BASE };
   } catch (e) { /* none */ }
   return null;
 }
@@ -49,7 +66,7 @@ export default function App() {
   const [view, setView] = useState(keyFromHash);
   const [showPw, setShowPw] = useState(false);
 
-  const allowed = session ? (session.mode === "demo" ? DEMO_VIEWS : ROLE_VIEWS[session.user?.role] || []) : [];
+  const allowed = session ? viewsFor(session) : [];
   const current = allowed.includes(view) ? view : allowed[0];
 
   function signOut(message = "") {
@@ -109,61 +126,124 @@ export default function App() {
             </>
           ) : (
             <>
-              <span>{session.agency} · {session.user.name} ({ROLE_LABEL[session.user.role] || session.user.role})</span>
-              <button onClick={() => setShowPw(true)} style={{ ...pill, color: C.sub, border: `1px solid ${C.line}`, background: "none", cursor: "pointer" }}>Password</button>
+              <span>{session.kind === "platform" ? "Platform admin" : session.agency} · {session.user.name}{session.kind === "platform" ? "" : ` (${(session.user.roles || [session.user.role]).map((r) => ROLE_LABEL[r] || r).join(", ")})`}</span>
+              {session.kind !== "platform" && <button onClick={() => setShowPw(true)} style={{ ...pill, color: C.sub, border: `1px solid ${C.line}`, background: "none", cursor: "pointer" }}>Password</button>}
               <button onClick={() => signOut()} style={{ ...pill, color: C.text, border: `1px solid ${C.line}`, background: "none", cursor: "pointer" }}>Sign out</button>
             </>
           )}
         </div>
       </nav>
       {Component ? <Component key={`${current}-${session.mode}`} session={session} /> : <div style={{ padding: 24, color: C.sub, fontFamily: "system-ui" }}>Your role doesn't have a screen yet.</div>}
-      {showPw && <ChangePassword session={session} onClose={() => setShowPw(false)} />}
+      {showPw && session.kind !== "platform" && <ChangePassword session={session} onClose={() => setShowPw(false)} />}
     </div>
   );
 }
 
+// Two steps. 1) email + password. 2) a 6-digit code from an authenticator app. The first
+// time, step 2 is setting that app up (scan a QR code or type a key), then the person is
+// shown recovery codes once, in case they lose their phone.
 function SignIn({ onSignedIn, onDemo, notice }) {
+  const [step, setStep] = useState("password");     // password | mfa | setup | recovery
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [challenge, setChallenge] = useState("");
+  const [setup, setSetup] = useState(null);           // { secret, otpauthUrl, qr }
+  const [pending, setPending] = useState(null);       // a finished sign-in waiting for "I saved my codes"
+  const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const input = { width: "100%", fontSize: "16px", padding: "12px", borderRadius: "8px", backgroundColor: C.sunken, border: `1px solid ${C.line}`, color: C.text, boxSizing: "border-box" };
+  const api = (path, body) => apiRequest({ apiBaseUrl: API_BASE }, "POST", path, body);
+  const input = { width: "100%", fontSize: "16px", padding: "12px", borderRadius: "8px", backgroundColor: C.sunken, border: `1px solid ${C.line}`, color: C.text, boxSizing: "border-box", marginTop: "4px" };
+  const primary = { padding: "12px", fontSize: "16px", fontWeight: 600, borderRadius: "8px", backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: C.green, cursor: "pointer" };
+  const link = { background: "none", border: "none", color: C.faint, fontSize: "13px", cursor: "pointer", textAlign: "left", padding: 0 };
+  const sessionOf = (r) => ({ kind: r.kind, token: r.token, expiresAt: r.expiresAt, user: r.user, agency: r.agency });
 
-  async function submit(e) {
-    e.preventDefault();
+  async function run(fn) {
     setBusy(true); setError("");
-    try {
-      const r = await apiRequest({ apiBaseUrl: API_BASE }, "POST", "/auth/login", { email, password });
-      onSignedIn({ token: r.token, expiresAt: r.expiresAt, user: r.user, agency: r.agency });
-    } catch (err) {
-      setError(err.message || "Could not sign in");
-    } finally {
-      setBusy(false);
-    }
+    try { await fn(); } catch (err) { setError(err.message || "Something went wrong"); } finally { setBusy(false); }
   }
+  const back = () => { setStep("password"); setCode(""); setChallenge(""); setSetup(null); setError(""); };
 
-  return (
+  const submitPassword = (e) => { e.preventDefault(); run(async () => {
+    const r = await api("/auth/login", { email, password });
+    setChallenge(r.challenge); setCode("");
+    if (r.step === "mfa") { setStep("mfa"); return; }
+    const s = await api("/auth/mfa/setup", { challenge: r.challenge });
+    setSetup({ ...s, qr: await QRCode.toDataURL(s.otpauthUrl, { margin: 1, width: 200 }) });
+    setStep("setup");
+  }); };
+  const submitCode = (e) => { e.preventDefault(); run(async () => {
+    const r = await api(step === "setup" ? "/auth/mfa/enable" : "/auth/mfa/verify", { challenge, code });
+    if (step === "setup") { setPending({ session: sessionOf(r), codes: r.recoveryCodes }); setStep("recovery"); }
+    else onSignedIn(sessionOf(r));
+  }); };
+
+  const shell = (children) => (
     <div style={{ minHeight: "100vh", backgroundColor: C.bg, color: C.text, display: "flex", alignItems: "center", justifyContent: "center", padding: "16px", fontFamily: "'Inter', system-ui, sans-serif" }}>
       <div style={{ width: "100%", maxWidth: "380px" }}>
         <div style={{ fontSize: "12px", letterSpacing: "0.12em", textTransform: "uppercase", color: C.faint }}>EMS Dispatch</div>
-        <h1 style={{ fontSize: "24px", fontWeight: 600, margin: "4px 0 20px" }}>Sign in</h1>
-        <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-          {notice && <div style={{ fontSize: "14px", color: C.amber }}>{notice}</div>}
-          <label style={{ fontSize: "13px", color: C.sub }}>Email
-            <input type="email" name="email" autoComplete="username" required value={email} onChange={(e) => setEmail(e.target.value)} style={{ ...input, marginTop: "4px" }} />
-          </label>
-          <label style={{ fontSize: "13px", color: C.sub }}>Password
-            <input type="password" name="password" autoComplete="current-password" required value={password} onChange={(e) => setPassword(e.target.value)} style={{ ...input, marginTop: "4px" }} />
-          </label>
-          {error && <div style={{ fontSize: "14px", color: C.red }}>{error}</div>}
-          <button type="submit" disabled={busy} style={{ padding: "12px", fontSize: "16px", fontWeight: 600, borderRadius: "8px", backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: C.green, cursor: "pointer" }}>{busy ? "Signing in…" : "Sign in"}</button>
-          <div style={{ fontSize: "12px", color: C.faint }}>Forgot your password? Ask your supervisor to reset it.</div>
-        </form>
-        <div style={{ margin: "28px 0 12px", borderTop: `1px solid ${C.line}` }} />
-        <button onClick={onDemo} style={{ width: "100%", padding: "12px", fontSize: "14px", borderRadius: "8px", backgroundColor: "transparent", border: `1px solid ${C.line}`, color: C.sub, cursor: "pointer" }}>View demo</button>
-        <div style={{ fontSize: "12px", color: C.faint, marginTop: "6px" }}>Sample data only. Nothing real is shown or saved.</div>
+        {children}
       </div>
     </div>
+  );
+
+  if (step === "recovery") {
+    return shell(
+      <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+        <h1 style={{ fontSize: "22px", fontWeight: 600, margin: "4px 0 0" }}>Save your recovery codes</h1>
+        <div style={{ fontSize: "14px", color: C.sub }}>If you lose your phone, each of these signs you in once. They won't be shown again. Keep them somewhere safe, not in this browser.</div>
+        <div style={{ fontFamily: "ui-monospace, monospace", fontSize: "16px", backgroundColor: C.sunken, border: `1px solid ${C.line}`, borderRadius: "8px", padding: "12px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
+          {pending.codes.map((c) => <div key={c}>{c}</div>)}
+        </div>
+        <label style={{ fontSize: "14px", color: C.sub, display: "flex", gap: "8px", alignItems: "center" }}>
+          <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.target.checked)} /> I've saved these codes
+        </label>
+        <button disabled={!saved} onClick={() => onSignedIn(pending.session)} style={{ ...primary, opacity: saved ? 1 : 0.5 }}>Continue</button>
+      </div>
+    );
+  }
+  if (step === "setup" || step === "mfa") {
+    return shell(
+      <form onSubmit={submitCode} style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+        <h1 style={{ fontSize: "22px", fontWeight: 600, margin: "4px 0 0" }}>{step === "setup" ? "Set up two-step sign-in" : "Enter your code"}</h1>
+        {step === "setup" && setup && (
+          <>
+            <div style={{ fontSize: "14px", color: C.sub }}>Add this account to an authenticator app (Google Authenticator, Authy, 1Password, Microsoft Authenticator). Then type the 6-digit code it shows.</div>
+            <img alt="QR code to scan with your authenticator app" src={setup.qr} width="200" height="200" style={{ alignSelf: "center", borderRadius: "8px", backgroundColor: "#fff" }} />
+            <a href={setup.otpauthUrl} style={{ color: C.blue, fontSize: "14px" }}>On this phone? Tap to open your authenticator app</a>
+            <div style={{ fontSize: "13px", color: C.faint }}>Or type this key in by hand:<div style={{ fontFamily: "ui-monospace, monospace", color: C.text, fontSize: "15px", wordBreak: "break-all", marginTop: "4px" }}>{setup.secret.match(/.{1,4}/g).join(" ")}</div></div>
+          </>
+        )}
+        {step === "mfa" && <div style={{ fontSize: "14px", color: C.sub }}>Open your authenticator app and enter the 6-digit code for this account. Lost your phone? Enter one of your recovery codes instead.</div>}
+        <label style={{ fontSize: "13px", color: C.sub }}>{step === "mfa" ? "Code" : "6-digit code"}
+          <input name="code" autoComplete="one-time-code" inputMode="text" required autoFocus value={code} onChange={(e) => setCode(e.target.value)} style={{ ...input, letterSpacing: "0.15em" }} />
+        </label>
+        {error && <div style={{ fontSize: "14px", color: C.red }}>{error}</div>}
+        <button type="submit" disabled={busy} style={primary}>{busy ? "Checking…" : step === "setup" ? "Turn on and sign in" : "Sign in"}</button>
+        <button type="button" onClick={back} style={link}>← Start over</button>
+      </form>
+    );
+  }
+  return shell(
+    <>
+      <h1 style={{ fontSize: "24px", fontWeight: 600, margin: "4px 0 20px" }}>Sign in</h1>
+      <form onSubmit={submitPassword} style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+        {notice && <div style={{ fontSize: "14px", color: C.amber }}>{notice}</div>}
+        <label style={{ fontSize: "13px", color: C.sub }}>Email
+          <input type="email" name="email" autoComplete="username" required value={email} onChange={(e) => setEmail(e.target.value)} style={input} />
+        </label>
+        <label style={{ fontSize: "13px", color: C.sub }}>Password
+          <input type="password" name="password" autoComplete="current-password" required value={password} onChange={(e) => setPassword(e.target.value)} style={input} />
+        </label>
+        {error && <div style={{ fontSize: "14px", color: C.red }}>{error}</div>}
+        <button type="submit" disabled={busy} style={primary}>{busy ? "Signing in…" : "Sign in"}</button>
+        <div style={{ fontSize: "12px", color: C.faint }}>Forgot your password or lost your phone? Ask your supervisor to reset it.</div>
+      </form>
+      <div style={{ margin: "28px 0 12px", borderTop: `1px solid ${C.line}` }} />
+      <button onClick={onDemo} style={{ width: "100%", padding: "12px", fontSize: "14px", borderRadius: "8px", backgroundColor: "transparent", border: `1px solid ${C.line}`, color: C.sub, cursor: "pointer" }}>View demo</button>
+      <div style={{ fontSize: "12px", color: C.faint, marginTop: "6px" }}>Sample data only. Nothing real is shown or saved.</div>
+    </>
   );
 }
 

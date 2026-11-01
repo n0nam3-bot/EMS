@@ -209,10 +209,30 @@ async function newIncidentId(label) {
   const i = await client.createIncident({ incidentType: "emergency_911", priority: "routine", protocolSetId: PROTOCOL_SET_A, sceneAddress: label });
   return i.incident_id;
 }
+// Charts belong to the crew who worked the call: an EMT / AEMT / paramedic on a unit
+// that ran it. This makes `userId` exactly that for `incidentId` (fresh unit, crewed
+// by them, assigned to the call) so a test can chart it the way a real crew would.
+async function enableCharting(userId, incidentId, level = "emt", tenantId = TENANT_A) {
+  const a = new pg.Client({ connectionString: ADMIN_URL });
+  await a.connect();
+  try {
+    let cm = (await a.query("SELECT crew_member_id FROM crew_members WHERE user_id = $1 ORDER BY (field_level IS NULL) LIMIT 1", [userId])).rows[0];
+    if (!cm) cm = (await a.query("INSERT INTO crew_members (tenant_id, user_id, first_name, last_name, field_level) VALUES ($1, $2, 'Chart', 'Crew', $3) RETURNING crew_member_id", [tenantId, userId, level])).rows[0];
+    else await a.query("UPDATE crew_members SET field_level = $2 WHERE crew_member_id = $1", [cm.crew_member_id, level]);
+    await a.query("UPDATE unit_crew_assignments SET assigned_to = now() WHERE crew_member_id = $1 AND assigned_to IS NULL", [cm.crew_member_id]);
+    const v = (await a.query("INSERT INTO vehicles (tenant_id, unit_designation, capability_level) VALUES ($1, $2, 'BLS') RETURNING vehicle_id", [tenantId, `Chart ${Math.random().toString(36).slice(2, 9)}`])).rows[0];
+    const u = (await a.query("INSERT INTO units (tenant_id, vehicle_id, current_status) VALUES ($1, $2, 'assigned') RETURNING unit_id", [tenantId, v.vehicle_id])).rows[0];
+    await a.query("INSERT INTO unit_crew_assignments (tenant_id, unit_id, crew_member_id, seat_role) VALUES ($1, $2, $3, 'non_driver')", [tenantId, u.unit_id, cm.crew_member_id]);
+    await a.query("INSERT INTO incident_unit_assignments (tenant_id, incident_id, unit_id, role) VALUES ($1, $2, $3, 'support')", [tenantId, incidentId, u.unit_id]);
+  } finally {
+    await a.end();
+  }
+}
 const NO_VITALS = { bpSystolic: null, bpDiastolic: null, heartRate: null, respiratoryRate: null, spo2Percent: null, bloodGlucose: null, gcsTotal: null, painScale: null, temperatureF: null };
 
 test("creating a PCR is idempotent — a retry returns the same chart instead of failing on the unique incident", async () => {
   const incidentId = await newIncidentId("PCR idempotency");
+  await enableCharting(USER_A_SUPERVISOR, incidentId);
   const first = await client.createPcr(incidentId);
   const second = await client.createPcr(incidentId);
   assert.ok(first.pcr_id);
@@ -220,7 +240,9 @@ test("creating a PCR is idempotent — a retry returns the same chart instead of
 });
 
 test("vitals, procedures, medications, narrative and disposition persist and read back, and disposition is a true upsert", async () => {
-  const id = (await client.createPcr(await newIncidentId("PCR sub-resources"))).pcr_id;
+  const subIncident = await newIncidentId("PCR sub-resources");
+  await enableCharting(USER_A_SUPERVISOR, subIncident);
+  const id = (await client.createPcr(subIncident)).pcr_id;
   await client.addVitals(id, { ...NO_VITALS, bpSystolic: 120, bpDiastolic: 80, heartRate: 88, spo2Percent: 98, gcsTotal: 15 });
   await client.addVitals(id, { ...NO_VITALS, bpSystolic: 130, bpDiastolic: 84, heartRate: 92, respiratoryRate: 16, spo2Percent: 97, gcsTotal: 15, painScale: 4, temperatureF: 98.6 });
   const proc = await client.addProcedure(id, { procedureName: "IV Access", outcome: "Successful, 1st attempt", notes: null });
@@ -267,16 +289,16 @@ test("GET /certifications and GET /vehicles return real rows with the day counts
   assert.equal(Number(veh.days_until_due), 5);
 });
 
-test("a finalized chart refuses every further change with a clear 409 — not just edits to the chart row itself", async () => {
-  const id = (await client.createPcr(await newIncidentId("PCR finalization"))).pcr_id;
+test("a finalized chart refuses every further change — at the API, and (separately) in the database itself", async () => {
+  const finIncident = await newIncidentId("PCR finalization");
+  await enableCharting(USER_A_SUPERVISOR, finIncident);
+  const id = (await client.createPcr(finIncident)).pcr_id;
   await client.addVitals(id, { ...NO_VITALS, bpSystolic: 118, bpDiastolic: 76, heartRate: 80 });
   const admin = new pg.Client({ connectionString: ADMIN_URL });
   await admin.connect();
   await admin.query("UPDATE patient_care_records SET finalized_at = now() WHERE pcr_id = $1", [id]);
-  await admin.end();
 
-  // Collect every outcome instead of stopping at the first, so a failure
-  // shows exactly which paths still accept changes.
+  // 1. Through the API the crew can't even reach a signed-off chart: refused before any write is tried.
   const attempts = {
     narrative: () => client.saveNarrative(id, "edited after finalization"),
     vitals: () => client.addVitals(id, { ...NO_VITALS, heartRate: 140 }),
@@ -286,11 +308,21 @@ test("a finalized chart refuses every further change with a clear 409 — not ju
   };
   const outcomes = {};
   for (const [name, attempt] of Object.entries(attempts)) {
-    try { await attempt(); outcomes[name] = "ACCEPTED"; }
-    catch (e) { outcomes[name] = /finalized/i.test(e.message) ? e.status : `${e.status}: ${e.message}`; }
+    try { await attempt(); outcomes[name] = "ACCEPTED"; } catch (e) { outcomes[name] = e.status; }
   }
-  assert.deepEqual(outcomes, { narrative: 409, vitals: 409, procedure: 409, medication: 409, disposition: 409 });
-  assert.equal((await client.getPcr(id)).vitals.length, 1, "the finalized chart must contain exactly what was signed off");
+  assert.deepEqual(outcomes, { narrative: 403, vitals: 403, procedure: 403, medication: 403, disposition: 403 });
+
+  // 2. Even a direct write that bypasses the API is refused by the database's own triggers.
+  const direct = {
+    row: "UPDATE patient_care_records SET clinical_narrative = 'x' WHERE pcr_id = $1",
+    vitals: "INSERT INTO pcr_vitals (tenant_id, pcr_id, recorded_at, heart_rate) SELECT tenant_id, pcr_id, now(), 140 FROM patient_care_records WHERE pcr_id = $1",
+    procedure: "INSERT INTO pcr_procedures (tenant_id, pcr_id, procedure_name, performed_at) SELECT tenant_id, pcr_id, 'Intubation', now() FROM patient_care_records WHERE pcr_id = $1",
+  };
+  for (const [name, sql] of Object.entries(direct)) {
+    await assert.rejects(() => admin.query(sql, [id]), /finalized/i, `${name}: the database must refuse a change to a finalized chart`);
+  }
+  assert.equal(Number((await admin.query("SELECT count(*) FROM pcr_vitals WHERE pcr_id = $1", [id])).rows[0].count), 1, "the finalized chart must contain exactly what was signed off");
+  await admin.end();
 });
 
 // MARKER-route-flow-tests
@@ -497,6 +529,7 @@ test("viewing a chart or an incident is audited, and an assisting agency's views
   await seedTenants();
   const compliance = await asUser("compliance_officer", TENANT_A, "ffffffff-0000-0000-0000-000000000001");
   const incidentId = await newIncidentId("Audit views");
+  await enableCharting(USER_A_SUPERVISOR, incidentId);
   const pcr = await client.createPcr(incidentId);
   await client.getPcr(pcr.pcr_id);
   await client.getIncident(incidentId);
@@ -528,7 +561,9 @@ test("the audit log is readable only by compliance roles, and a refused attempt 
 });
 
 test("no audit, no access — if the entry can't be written, the chart isn't served", async () => {
-  const id = (await client.createPcr(await newIncidentId("Fail closed"))).pcr_id;
+  const failIncident = await newIncidentId("Fail closed");
+  await enableCharting(USER_A_SUPERVISOR, failIncident);
+  const id = (await client.createPcr(failIncident)).pcr_id;
   const admin = new pg.Client({ connectionString: ADMIN_URL });
   await admin.connect();
   await admin.query("REVOKE INSERT ON audit_log FROM ems_app_runtime");
@@ -572,6 +607,9 @@ test("every API write to an audited table leaves an entry attributed to the pers
   const admin = new pg.Client({ connectionString: ADMIN_URL });
   await admin.connect();
   try {
+  // Set the actor up as the unit's EMT first (before the clock starts) so they may chart the call.
+  const crewRow = (await admin.query("INSERT INTO crew_members (tenant_id, user_id, first_name, last_name, field_level) VALUES ($1, $2, 'Audit', 'Crew', 'emt') RETURNING crew_member_id", [TENANT_A, actor])).rows[0];
+  await admin.query("INSERT INTO unit_crew_assignments (tenant_id, unit_id, crew_member_id, seat_role) VALUES ($1, $2, $3, 'non_driver')", [TENANT_A, unit, crewRow.crew_member_id]);
   const t0 = (await admin.query("SELECT clock_timestamp() AS t")).rows[0].t;
 
   const incidentId = (await me.createIncident({ incidentType: "emergency_911", priority: "routine", sceneAddress: "Audit coverage" })).incident_id;

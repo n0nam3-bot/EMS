@@ -53,10 +53,11 @@ try {
   // The owner account always reflects what was typed into the workflow,
   // so re-running it can fix a wrong email or a forgotten password.
   await client.query(
-    `INSERT INTO users (user_id, tenant_id, email, display_name, role, password_hash)
-     VALUES ($1, $2, lower($3), $4, 'supervisor', $5)
+    `INSERT INTO users (user_id, tenant_id, email, display_name, role, extra_roles, password_hash)
+     VALUES ($1, $2, lower($3), $4, 'supervisor', ARRAY['qa_qi']::user_role[], $5)
      ON CONFLICT (user_id) DO UPDATE SET
        email = EXCLUDED.email, display_name = EXCLUDED.display_name, password_hash = EXCLUDED.password_hash,
+       extra_roles = ARRAY(SELECT DISTINCT r FROM unnest(users.extra_roles || ARRAY['qa_qi']::user_role[]) r),
        failed_logins = 0, locked_until = NULL, is_active = TRUE`,
     [e.USER_ID, e.TENANT_ID, e.ADMIN_EMAIL.trim(), e.ADMIN_NAME || "Admin", passwordHash]
   );
@@ -66,12 +67,7 @@ try {
      SELECT $1, $2, $3, $4 WHERE NOT EXISTS (SELECT 1 FROM crew_members WHERE user_id = $2)`,
     [e.TENANT_ID, e.USER_ID, first, rest.join(" ") || "-"]
   );
-  await client.query(
-    `INSERT INTO certification_types (tenant_id, code, label, required_for_capability)
-     VALUES ($1, 'EMT-B', 'EMT-Basic', NULL), ($1, 'PARAMEDIC', 'Paramedic', 'ALS')
-     ON CONFLICT (tenant_id, code) DO NOTHING`,
-    [e.TENANT_ID]
-  );
+  await client.query("SELECT seed_tenant_defaults($1)", [e.TENANT_ID]);
   let added = 0;
   for (const u of units) {
     const have = await client.query("SELECT 1 FROM vehicles WHERE tenant_id = $1 AND unit_designation = $2", [e.TENANT_ID, u.name]);
