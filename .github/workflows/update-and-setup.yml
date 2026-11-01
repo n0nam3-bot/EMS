@@ -13,12 +13,18 @@ name: Update and set up
 #   MIGRATION_DATABASE_URL  Neon DIRECT connection string (owner role, no "-pooler")
 #   RUNTIME_DB_PASSWORD     password of the app's restricted database login
 #   ADMIN_PASSWORD          the owner's sign-in password (10+ characters)
+#   PLATFORM_ADMIN_PASSWORD password for the platform administrator (12+ characters), only
+#                           needed when you fill in the platform admin email below
 
 on:
   workflow_dispatch:
     inputs:
       setup_database:
         description: Set up / upgrade the database too
+        type: boolean
+        default: true
+      setup_company:
+        description: Create / reset the company owner login (the company boxes below)
         type: boolean
         default: true
       agency_name:
@@ -36,6 +42,12 @@ on:
       admin_email:
         description: Your email, your sign-in name (database setup only)
         default: ""
+      platform_admin_email:
+        description: Platform administrator email (leave blank to skip). Must differ from every company email.
+        default: ""
+      platform_admin_name:
+        description: Platform administrator name
+        default: "Platform admin"
 
 permissions:
   contents: write
@@ -96,7 +108,7 @@ jobs:
         run: node scripts/upgrade.js
 
       - name: Create company and owner login
-        if: ${{ inputs.setup_database }}
+        if: ${{ inputs.setup_database && inputs.setup_company }}
         working-directory: backend
         env:
           MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
@@ -109,3 +121,13 @@ jobs:
           ADMIN_EMAIL: ${{ inputs.admin_email }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
         run: node scripts/bootstrap.js
+
+      - name: Create or reset the platform administrator
+        if: ${{ inputs.setup_database && inputs.platform_admin_email != '' }}
+        working-directory: backend
+        env:
+          MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+          PLATFORM_ADMIN_EMAIL: ${{ inputs.platform_admin_email }}
+          PLATFORM_ADMIN_NAME: ${{ inputs.platform_admin_name }}
+          PLATFORM_ADMIN_PASSWORD: ${{ secrets.PLATFORM_ADMIN_PASSWORD }}
+        run: node scripts/bootstrap_platform.js
