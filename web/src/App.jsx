@@ -7,6 +7,8 @@ import EpcrCharting from "./consoles/epcr_charting.jsx";
 import TeamConsole from "./consoles/team_console.jsx";
 import QaConsole from "./consoles/qa_console.jsx";
 import PlatformConsole from "./consoles/platform_console.jsx";
+import OpsConsole from "./consoles/ops_console.jsx";
+import { CallDraftTray } from "./consoles/call_form.jsx";
 import { apiRequest } from "./api.js";
 
 const API_BASE = import.meta.env?.VITE_API_URL || `${window.location.origin}/api`;
@@ -14,6 +16,7 @@ const SESSION_KEY = "ems:session";
 
 const VIEWS = {
   dispatch: { label: "Dispatch", Component: DispatchConsole },
+  ops: { label: "OPS", Component: OpsConsole },
   field: { label: "Field Unit", Component: FieldUnitConsole },
   epcr: { label: "ePCR", Component: EpcrCharting },
   qa: { label: "QA/QI", Component: QaConsole },
@@ -22,14 +25,14 @@ const VIEWS = {
   platform: { label: "Platform", Component: PlatformConsole },
 };
 const DEMO_VIEWS = ["dispatch", "field", "epcr", "compliance"];
-const VIEW_ORDER = ["dispatch", "field", "epcr", "qa", "compliance", "team", "platform"];
+const VIEW_ORDER = ["dispatch", "ops", "field", "epcr", "qa", "compliance", "team", "platform"];
 // Which screens each role is shown. This tidies the menu; what a role may
 // actually DO is enforced by the server, not here. A person with several
 // roles gets every screen any of them gets.
 const ROLE_VIEWS = {
-  dispatcher: ["dispatch"],
-  supervisor: ["dispatch", "compliance", "team"],
-  it_admin: ["team"],
+  dispatcher: ["dispatch", "ops"],
+  supervisor: ["dispatch", "ops", "compliance", "team"],
+  it_admin: ["ops", "team"],
   qa_qi: ["qa"],
   compliance_officer: ["compliance"],
   biller: ["compliance"],
@@ -134,6 +137,7 @@ export default function App() {
         </div>
       </nav>
       {Component ? <Component key={`${current}-${session.mode}`} session={session} /> : <div style={{ padding: 24, color: C.sub, fontFamily: "system-ui" }}>Your role doesn't have a screen yet.</div>}
+      {session.mode === "demo" || (session.kind === "tenant" && (session.user.roles || []).some((r) => ["dispatcher", "supervisor", "it_admin"].includes(r))) ? <CallDraftTray session={session} /> : null}
       {showPw && session.kind !== "platform" && <ChangePassword session={session} onClose={() => setShowPw(false)} />}
     </div>
   );

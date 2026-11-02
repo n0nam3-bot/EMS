@@ -19,7 +19,9 @@ import { auditView } from "./backend_audit.js";
 const router = express.Router();
 router.use(requireAuth);
 
+// All certifications, or one person's with ?crewMemberId= (so a long roster doesn't load them all).
 router.get("/certifications", async (req, res) => {
+  const one = /^[0-9a-f-]{36}$/i.test(String(req.query.crewMemberId ?? "")) ? req.query.crewMemberId : null;
   const result = await withTenant(req.user.tenantId, (client) =>
     client.query(`
       SELECT
@@ -29,8 +31,9 @@ router.get("/certifications", async (req, res) => {
       FROM certifications c
       JOIN crew_members cm ON cm.crew_member_id = c.crew_member_id
       JOIN certification_types ct ON ct.certification_type_id = c.certification_type_id
+      WHERE ($1::uuid IS NULL OR c.crew_member_id = $1::uuid)
       ORDER BY c.expires_on ASC
-    `)
+    `, [one])
   );
   res.json(result.rows);
 });

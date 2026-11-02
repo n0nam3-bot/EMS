@@ -124,11 +124,23 @@ router.get("/pcr/:id", chartAccess("any"), async (req, res) => {
       `SELECT e.kind, e.note, e.at, a.display_name AS actor, t.display_name AS assigned_to
        FROM pcr_events e LEFT JOIN users a ON a.user_id = e.actor_user_id LEFT JOIN users t ON t.user_id = e.assigned_to_user_id
        WHERE e.pcr_id = $1 ORDER BY e.event_id`, [id])).rows;
+    // What dispatch already knows, so the crew isn't retyping it: the call's destination, and
+    // the times this unit was sent / en route / on scene / left / arrived.
+    const call = (await c.query(
+      `SELECT i.destination_text, i.destination_facility_id, f.name AS destination_facility_name FROM incidents i
+       LEFT JOIN facilities f ON f.facility_id = i.destination_facility_id WHERE i.incident_id = $1`, [pcr.incident_id])).rows[0];
+    const sent = (await c.query("SELECT min(assigned_at) AS at FROM incident_unit_assignments WHERE incident_id = $1 AND unit_id = $2", [pcr.incident_id, pcr.unit_id])).rows[0]?.at || null;
+    const hist = (await c.query(
+      `SELECT status, min(recorded_at) AS at FROM unit_status_history
+       WHERE unit_id = $1 AND recorded_at >= COALESCE($2::timestamptz, 'epoch') AND status IN ('en_route', 'on_scene', 'transporting', 'at_destination')
+       GROUP BY status`, [pcr.unit_id, sent])).rows;
+    const when = (st) => hist.find((h) => h.status === st)?.at || null;
+    const times = { dispatchedAt: sent, enRouteAt: when("en_route"), onSceneAt: when("on_scene"), leftSceneAt: when("transporting"), atDestinationAt: when("at_destination") };
     // Same transaction as the read: if this entry can't be written, the chart
     // isn't served. Opening a patient record without a trace is the one thing
     // an audit log exists to prevent.
     await auditView(c, req.user, "patient_care_records", id, { as: req.pcrLevel });
-    return { ...pcr, status: effectiveStatus(pcr), vitals, procedures, medications, disposition, crew, events, access: req.pcrLevel };
+    return { ...pcr, status: effectiveStatus(pcr), vitals, procedures, medications, disposition, crew, events, access: req.pcrLevel, call, times };
   });
   res.json(out);
 });

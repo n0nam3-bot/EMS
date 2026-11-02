@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
+import { openCallDraft, setCallNearHint, formFromIncident } from "./call_form.jsx";
 import {
   CheckCircle2,
   Navigation,
@@ -186,6 +187,7 @@ function normalizeApiIncident(i) {
     lon: i.lon,
     destLat: i.dest_lat,
     destLon: i.dest_lon,
+    destinationFacilityId: i.destination_facility_id || null,
   };
 }
 
@@ -253,20 +255,6 @@ function getRecommendation(incident, units) {
   return { best, soon, isMismatch: Boolean(best) && pool !== exact, role };
 }
 
-const blankForm = () => ({ type: "emergency_911", priority: "emergent", capabilityNeeded: "BLS", address: "", lat: null, lon: null, detail: "", destination: "", destLat: null, destLon: null, patientName: "", contactName: "", contactPhone: "", notes: "" });
-const formFromIncident = (i) => ({ type: i.type, priority: i.priority, capabilityNeeded: i.capabilityNeeded, address: i.address || "", lat: i.lat ?? null, lon: i.lon ?? null, detail: i.detail || "", destination: i.destination || "", destLat: i.destLat ?? null, destLon: i.destLon ?? null, patientName: i.patientName || "", contactName: i.contactName || "", contactPhone: i.contactPhone || "", notes: i.notes || "" });
-function formToApi(f) {
-  const body = {
-    incidentType: f.type, priority: f.priority, capabilityNeeded: f.capabilityNeeded,
-    sceneAddress: f.address.trim(), sceneDetail: f.detail.trim() || null, destinationText: f.destination.trim() || null,
-    patientName: f.patientName.trim() || null, contactName: f.contactName.trim() || null, contactPhone: f.contactPhone.trim() || null, notes: f.notes.trim() || null,
-  };
-  if (f.lat != null && f.lon != null) { body.lat = f.lat; body.lon = f.lon; }
-  if (f.destLat != null && f.destLon != null) { body.destLat = f.destLat; body.destLon = f.destLon; }
-  return body;
-}
-const shortLabel = (label) => label.split(",").slice(0, 3).join(",").trim();
-
 // `session` comes from the sign-in screen. Signed in: `live`, real data only,
 // never a demo fallback. "View demo": sample data that is never saved anywhere.
 // With no session at all (tests) it behaves as the demo.
@@ -278,9 +266,6 @@ export default function DispatchConsole({ session }) {
   const [units, setUnits] = useState(() => (live ? [] : makeInitialUnits()));
   const [now, setNow] = useState(() => new Date());
   const [incidents, setIncidents] = useState(() => (live ? [] : makeInitialIncidents(Date.now())));
-  const [showNewCall, setShowNewCall] = useState(false);
-  const [editingId, setEditingId] = useState(null);
-  const [form, setForm] = useState(blankForm);
   const [connectionStatus, setConnectionStatus] = useState(live ? "connecting" : "demo"); // demo | connecting | live | failed
   const [actionError, setActionError] = useState("");
   const [selIncidentId, setSelIncidentId] = useState(null);
@@ -430,43 +415,39 @@ export default function DispatchConsole({ session }) {
       }
     );
   }
-  function openNewCall() { setEditingId(null); setForm(blankForm()); setShowNewCall(true); }
-  function openEdit(incident) { setEditingId(incident.id); setForm(formFromIncident(incident)); setShowNewCall(true); }
-  function closeCallForm() { setShowNewCall(false); setEditingId(null); }
+  // Calls are taken in the draft tray, not a pop-up, so the board stays usable while one is open.
+  const openNewCall = () => openCallDraft({});
+  const openEdit = (incident) => openCallDraft({ editingId: incident.id, form: formFromIncident(incident) });
 
   // Where to bias address search: wherever this agency's units already are.
   const searchNear = useMemo(() => {
     const o = units.find(hasFix) || incidents.find(hasFix);
     return o ? { lat: o.lat, lon: o.lon } : null;
   }, [units, incidents]);
-  async function searchPlaces(q) {
-    const near = searchNear ? `&lat=${searchNear.lat}&lon=${searchNear.lon}` : "";
-    return apiRequest("GET", `/geocode?q=${encodeURIComponent(q)}${near}`);
-  }
+  useEffect(() => { setCallNearHint(searchNear); }, [searchNear]);
 
-  function handleSubmitCall(e) {
-    e.preventDefault();
-    if (form.address.trim().length < 3) return;
-    const f = form;
-    if (editingId) {
-      const id = editingId;
-      performAction(
-        () => apiRequest("PATCH", `/incidents/${id}`, formToApi(f)),
-        () => setIncidents((prev) => prev.map((i) => (i.id === id ? { ...i, type: f.type, priority: f.priority, capabilityNeeded: f.capabilityNeeded, address: f.address.trim(), detail: f.detail, destination: f.destination, patientName: f.patientName, contactName: f.contactName, contactPhone: f.contactPhone, notes: f.notes } : i)))
-      );
-    } else {
-      performAction(
-        () => apiRequest("POST", "/incidents", formToApi(f)),
-        () => {
-          // Demo only: a random spot in the service area so the map has something to draw.
-          const lat = MAP_BOUNDS.latMin + Math.random() * (MAP_BOUNDS.latMax - MAP_BOUNDS.latMin);
-          const lon = MAP_BOUNDS.lonMin + Math.random() * (MAP_BOUNDS.lonMax - MAP_BOUNDS.lonMin);
-          setIncidents((prev) => [...prev, { id: `i${Date.now()}`, type: f.type, priority: f.priority, address: f.address.trim(), detail: f.detail, destination: f.destination, patientName: f.patientName, contactName: f.contactName, contactPhone: f.contactPhone, notes: f.notes, capabilityNeeded: f.capabilityNeeded, callReceivedAt: new Date(), assignedUnits: [], lat, lon }]);
-        }
-      );
-    }
-    closeCallForm();
-  }
+  // The tray saves live calls itself and tells us to refresh; in the demo it hands the form to us.
+  useEffect(() => {
+    if (live) return;
+    window.__emsDemoCalls = (f, editingId) => {
+      if (editingId) {
+        setIncidents((prev) => prev.map((i) => (i.id === editingId ? { ...i, type: f.type, priority: f.priority, capabilityNeeded: f.capabilityNeeded, address: f.address.trim(), detail: f.detail, destination: f.destination, patientName: f.patientName, contactName: f.contactName, contactPhone: f.contactPhone, notes: f.notes } : i)));
+        return;
+      }
+      const lat = MAP_BOUNDS.latMin + Math.random() * (MAP_BOUNDS.latMax - MAP_BOUNDS.latMin);
+      const lon = MAP_BOUNDS.lonMin + Math.random() * (MAP_BOUNDS.lonMax - MAP_BOUNDS.lonMin);
+      setIncidents((prev) => [...prev, { id: `i${Date.now()}`, type: f.type, priority: f.priority, address: f.address.trim(), detail: f.detail, destination: f.destination, patientName: f.patientName, contactName: f.contactName, contactPhone: f.contactPhone, notes: f.notes, capabilityNeeded: f.capabilityNeeded, callReceivedAt: new Date(), assignedUnits: [], lat, lon }]);
+    };
+    return () => { delete window.__emsDemoCalls; };
+  }, [live]);
+  useEffect(() => {
+    if (!live) return;
+    const refresh = () => refreshFromApi().catch(() => {});
+    window.addEventListener("ems-calls-changed", refresh);
+    return () => window.removeEventListener("ems-calls-changed", refresh);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live, apiRequest]);
+
   function handleCancelCall(incidentId, reason) {
     performAction(
       () => apiRequest("POST", `/incidents/${incidentId}/cancel`, { reason }),
@@ -594,13 +575,6 @@ export default function DispatchConsole({ session }) {
         </div>
       </div>
 
-      {showNewCall && (
-        <CallFormModal
-          form={form} setForm={setForm} onSubmit={handleSubmitCall} onClose={closeCallForm}
-          title={editingId ? "Edit call" : "New call intake"} submitLabel={editingId ? "Save changes" : "Add to queue"}
-          onSearch={live ? searchPlaces : null}
-        />
-      )}
     </div>
   );
 }
@@ -865,6 +839,7 @@ function EtaText({ miles, etaMin, routed, status }) {
 }
 
 function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, onEdit, onCancel, selected, onSelect }) {
+  const [more, setMore] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [reason, setReason] = useState("");
@@ -877,6 +852,8 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, on
   const { routed, status: routeStatus } = useRoutedEta(rec?.best?.unit, incident);
   const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
   const small = { backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY };
+  const expanded = more || selected || confirming || cancelling;
+  const hasMore = Boolean(incident.destination || incident.patientName || incident.contactName || incident.contactPhone || incident.notes);
   const noCrewAtAll = units.length > 0 && units.every((u) => u.crew.length === 0);
 
   return (
@@ -893,16 +870,19 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, on
           </div>
           <div className="text-sm mt-1">{incident.address}{incident.detail ? <span style={{ color: TEXT_SECONDARY }}> · {incident.detail}</span> : null}</div>
           {incident.destination && <div className="text-sm" style={{ color: TEXT_SECONDARY }}>→ {incident.destination}</div>}
-          {(incident.patientName || incident.contactName || incident.contactPhone) && (
+          {expanded && (incident.patientName || incident.contactName || incident.contactPhone) && (
             <div className="text-xs mt-0.5" style={{ color: TEXT_FAINT }}>
               {incident.patientName && <>Patient: {incident.patientName}</>}
               {incident.patientName && (incident.contactName || incident.contactPhone) && " · "}
               {(incident.contactName || incident.contactPhone) && <>Contact: {[incident.contactName, incident.contactPhone].filter(Boolean).join(" ")}</>}
             </div>
           )}
-          {incident.notes && <div className="text-xs mt-0.5" style={{ color: TEXT_FAINT }}>Note: {incident.notes}</div>}
+          {expanded && incident.notes && <div className="text-xs mt-0.5" style={{ color: TEXT_FAINT }}>Note: {incident.notes}</div>}
         </div>
-        <div className="mono text-sm shrink-0" style={{ color: timerColor }}>{formatElapsed(elapsedMs)}</div>
+        <div className="flex items-center gap-2 shrink-0">
+          <div className="mono text-sm" style={{ color: timerColor }}>{formatElapsed(elapsedMs)}</div>
+          <button onClick={(e) => { e.stopPropagation(); setMore(!more); }} aria-expanded={expanded} aria-label={expanded ? "Show less" : "Show details"} className="text-xs px-1.5 py-0.5 rounded" style={small}>{expanded ? "▲" : "▼"}</button>
+        </div>
       </div>
 
       {assignedUnits.length > 0 && (
@@ -944,7 +924,7 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, on
         )}
       </div>
 
-      <div className="mt-2 flex items-center gap-2 flex-wrap" onClick={(e) => e.stopPropagation()}>
+      {expanded && <div className="mt-2 flex items-center gap-2 flex-wrap" onClick={(e) => e.stopPropagation()}>
         {assignedUnits.length > 0 && !cancelling && (confirming ? (
           <>
             <button onClick={() => onComplete(incident.id)} className="text-xs px-2 py-1 rounded font-medium" style={{ backgroundColor: "#3A1E1E", border: "1px solid #593434", color: "#F0857D" }}>Confirm complete</button>
@@ -962,7 +942,7 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, on
             <button onClick={() => { setCancelling(false); setReason(""); }} className="text-xs px-2 py-1.5 rounded" style={small}>Keep call</button>
           </div>
         )}
-      </div>
+      </div>}
     </div>
   );
 }
@@ -995,122 +975,3 @@ function UnitCard({ unit, onStatusChange, selected, onSelect }) {
   );
 }
 
-function CallFormModal({ form, setForm, onSubmit, onClose, title, submitLabel, onSearch }) {
-  const [results, setResults] = useState(null); // { field, items }
-  const [searching, setSearching] = useState(null);
-  const [searchNote, setSearchNote] = useState("");
-  const input = { backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY };
-  const set = (patch) => setForm({ ...form, ...patch });
-
-  async function find(field) {
-    const q = (field === "pickup" ? form.address : form.destination).trim();
-    if (q.length < 3) { setSearchNote("Type at least 3 characters first."); return; }
-    setSearching(field); setSearchNote(""); setResults(null);
-    try {
-      const items = await onSearch(q);
-      if (items.length === 0) setSearchNote("No matches. Try adding the street, borough or ZIP code.");
-      else setResults({ field, items });
-    } catch (e) {
-      setSearchNote(e.message || "Search failed");
-    } finally {
-      setSearching(null);
-    }
-  }
-  function choose(field, item) {
-    set(field === "pickup" ? { address: shortLabel(item.label), lat: item.lat, lon: item.lon } : { destination: shortLabel(item.label), destLat: item.lat, destLon: item.lon });
-    setResults(null);
-  }
-  const place = (field, label, value, pinned, placeholder) => (
-    <Field label={label}>
-      <div className="flex gap-2">
-        <input type="text" value={value} placeholder={placeholder} className="flex-1 min-w-0 text-sm rounded px-2 py-2" style={input}
-          onChange={(e) => set(field === "pickup" ? { address: e.target.value, lat: null, lon: null } : { destination: e.target.value, destLat: null, destLon: null })} />
-        {onSearch && (
-          <button type="button" onClick={() => find(field)} disabled={searching !== null} className="text-sm px-3 rounded shrink-0" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: BLUE }}>
-            {searching === field ? "…" : "Find"}
-          </button>
-        )}
-      </div>
-      {value.trim() && (
-        <span className="text-xs" style={{ color: pinned ? GREEN : AMBER }}>
-          {pinned ? "Pinned on the map" : onSearch ? "Not pinned. Tap Find and pick the exact place so units can be matched by distance." : "Demo: placed at a random spot"}
-        </span>
-      )}
-      {results && results.field === field && (
-        <div className="flex flex-col rounded border mt-1" style={{ borderColor: HAIRLINE }}>
-          {results.items.map((item, idx) => (
-            <button type="button" key={idx} onClick={() => choose(field, item)} className="text-left text-xs px-2 py-2 border-b" style={{ borderColor: "#1B2330", color: TEXT_PRIMARY, backgroundColor: PANEL }}>
-              {item.label}
-            </button>
-          ))}
-        </div>
-      )}
-    </Field>
-  );
-
-  return (
-    <div className="fixed inset-0 flex items-start sm:items-center justify-center p-3 overflow-y-auto" style={{ backgroundColor: "rgba(0,0,0,0.6)", zIndex: 50 }}>
-      <div className="w-full rounded-lg border my-4" style={{ maxWidth: "480px", backgroundColor: PANEL, borderColor: HAIRLINE }}>
-        <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
-          <div className="text-sm font-semibold">{title}</div>
-          <button onClick={onClose} style={{ color: TEXT_SECONDARY }}><X size={18} /></button>
-        </div>
-        <form onSubmit={onSubmit} className="p-4 flex flex-col gap-3">
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Type">
-              <select value={form.type} onChange={(e) => set({ type: e.target.value })} className="w-full text-sm rounded px-2 py-2" style={input}>
-                {Object.entries(TYPE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-              </select>
-            </Field>
-            <Field label="Priority">
-              <select value={form.priority} onChange={(e) => set({ priority: e.target.value })} className="w-full text-sm rounded px-2 py-2" style={input}>
-                {Object.entries(PRIORITY_CONFIG).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-              </select>
-            </Field>
-          </div>
-          <Field label="Level of care needed">
-            <div className="flex gap-2">
-              {["BLS", "ALS", "CCT"].map((cap) => (
-                <button type="button" key={cap} onClick={() => set({ capabilityNeeded: cap })} className="flex-1 text-sm rounded px-2 py-2" style={{
-                  backgroundColor: form.capabilityNeeded === cap ? "#1E3A2E" : SUNKEN,
-                  border: form.capabilityNeeded === cap ? "1px solid #2E5943" : `1px solid ${HAIRLINE}`,
-                  color: form.capabilityNeeded === cap ? GREEN : TEXT_SECONDARY,
-                }}>{cap}</button>
-              ))}
-            </div>
-          </Field>
-          {place("pickup", "Pickup address or facility *", form.address, form.lat != null, "e.g. BronxCare Hospital Center, Bronx")}
-          <Field label="Room, floor, unit or cross street">
-            <input type="text" value={form.detail} onChange={(e) => set({ detail: e.target.value })} placeholder="e.g. 4th floor, room 412, main lobby" className="w-full text-sm rounded px-2 py-2" style={input} />
-          </Field>
-          {place("dest", "Destination (for transfers)", form.destination, form.destLat != null, "e.g. Montefiore Moses, 111 E 210th St")}
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Patient name (optional)">
-              <input type="text" value={form.patientName} onChange={(e) => set({ patientName: e.target.value })} className="w-full text-sm rounded px-2 py-2" style={input} />
-            </Field>
-            <Field label="Contact name">
-              <input type="text" value={form.contactName} onChange={(e) => set({ contactName: e.target.value })} placeholder="Nurse, caller…" className="w-full text-sm rounded px-2 py-2" style={input} />
-            </Field>
-          </div>
-          <Field label="Contact phone">
-            <input type="tel" value={form.contactPhone} onChange={(e) => set({ contactPhone: e.target.value })} className="w-full text-sm rounded px-2 py-2" style={input} />
-          </Field>
-          <Field label="Notes for the crew">
-            <textarea rows={2} value={form.notes} onChange={(e) => set({ notes: e.target.value })} placeholder="Oxygen, stairs, bariatric, isolation…" className="w-full text-sm rounded px-2 py-2" style={{ ...input, resize: "vertical" }} />
-          </Field>
-          {searchNote && <div className="text-xs" style={{ color: AMBER }}>{searchNote}</div>}
-          <button type="submit" disabled={form.address.trim().length < 3} className="mt-1 text-sm font-medium rounded px-3 py-2.5" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN, opacity: form.address.trim().length < 3 ? 0.5 : 1 }}>{submitLabel}</button>
-        </form>
-      </div>
-    </div>
-  );
-}
-
-function Field({ label, children }) {
-  return (
-    <label className="flex flex-col gap-1">
-      <span className="text-xs" style={{ color: TEXT_SECONDARY }}>{label}</span>
-      {children}
-    </label>
-  );
-}

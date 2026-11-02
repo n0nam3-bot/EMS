@@ -178,6 +178,7 @@ router.post("/unit-checks/inspection", ADMIN, handle(async (req, res) => {
 router.get("/unit-checks/status", handle(async (req, res) => {
   const rows = await withTenant(req.user.tenantId, async (c) => (await c.query(
     `SELECT un.unit_id, v.unit_designation, v.capability_level,
+            crew.n AS crew_count, crew.since AS crew_since,
             last.check_id AS last_check_id, last.performed_at AS last_check_at, last.result AS last_check_result, lu.display_name AS last_check_by,
             COALESCE((SELECT json_agg(i.label ORDER BY i.label) FROM unit_check_items i WHERE i.check_id = last.check_id AND NOT i.ok), '[]') AS failed_items,
             COALESCE((SELECT json_agg(json_build_object('kind', p.kind, 'performedAt', p.performed_at, 'result', p.result, 'nextDue', p.next_due) ORDER BY p.kind)
@@ -186,8 +187,16 @@ router.get("/unit-checks/status", handle(async (req, res) => {
      FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id
      LEFT JOIN LATERAL (SELECT * FROM unit_checks k WHERE k.unit_id = un.unit_id AND k.kind = 'shift_check' ORDER BY k.performed_at DESC LIMIT 1) last ON TRUE
      LEFT JOIN users lu ON lu.user_id = last.performed_by_user_id
+     LEFT JOIN LATERAL (SELECT count(*) AS n, min(uca.assigned_from) AS since FROM unit_crew_assignments uca WHERE uca.unit_id = un.unit_id AND uca.assigned_to IS NULL) crew ON TRUE
      ORDER BY v.unit_designation`)).rows);
-  res.json(rows);
+  // A unit with a crew on it owes one check per crew per shift. "Due" means it has a crew and no
+  // check since that crew came on (or within the last 12 hours, whichever is more recent).
+  // The system can't see a crew walk around the truck; a check exists only when someone records it.
+  res.json(rows.map((r) => {
+    const since = r.crew_since ? new Date(r.crew_since) : null;
+    const floor = since ? new Date(Math.max(since.getTime(), Date.now() - 12 * 3600 * 1000)) : null;
+    return { ...r, check_due: Boolean(since) && (!r.last_check_at || new Date(r.last_check_at) < floor) };
+  }));
 }));
 
 export default router;

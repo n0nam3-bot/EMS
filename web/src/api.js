@@ -13,3 +13,11 @@ export async function apiRequest(session, method, path, body) {
   }
   return data;
 }
+
+// Same, for lists the server pages: also returns how many there are in total.
+export async function apiRequestPaged(session, path) {
+  const res = await fetch(`${session.apiBaseUrl}${path}`, { headers: session.token ? { Authorization: `Bearer ${session.token}` } : {} });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data?.error || `Request failed (HTTP ${res.status})`);
+  return { rows: data, total: Number(res.headers.get("X-Total-Count") ?? data.length) };
+}

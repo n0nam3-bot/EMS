@@ -11,6 +11,8 @@ import EpcrCharting from "../consoles/epcr_charting.jsx";
 import App from "../App.jsx";
 import TeamConsole from "../consoles/team_console.jsx";
 import QaConsole from "../consoles/qa_console.jsx";
+import OpsConsole from "../consoles/ops_console.jsx";
+import { CallDraftTray } from "../consoles/call_form.jsx";
 
 beforeAll(async () => {
   // The same shim main.jsx loads. NO_SHIM=1 skips it, to show what breaks without it.
@@ -86,7 +88,7 @@ function fakeServer(routes) {
   globalThis.fetch = async (url, init = {}) => {
     const path = String(url).replace(/^.*\/api/, "");
     const key = `${init.method || "GET"} ${path.split("?")[0]}`;
-    calls.push({ key, body: init.body ? JSON.parse(init.body) : null });
+    calls.push({ key, url: String(url), body: init.body ? JSON.parse(init.body) : null });
     const handler = routes[key];
     if (!handler) return new Response(JSON.stringify({ error: `no route ${key}` }), { status: 404 });
     const out = typeof handler === "function" ? handler(init.body ? JSON.parse(init.body) : null) : handler;
@@ -129,7 +131,7 @@ describe("sign-in", () => {
   });
 
   it("signing in is two steps: password, then an authenticator code; then the company's real (empty) board, never the demo, once for every tab", async () => {
-    const calls = fakeServer({ "POST /auth/login": { step: "mfa", challenge: "c.c.c" }, "POST /auth/mfa/verify": LOGIN, "GET /units": [], "GET /incidents": [], "GET /auth/me": { user: LOGIN.user, agency: "Acme Ambulance", unit: null, incident: null }, "GET /users": [], "GET /certifications": [], "GET /certification-types": [], "GET /vehicles": [], "GET /pcr-review": [], "GET /checklist": [], "GET /unit-checks/status": [], "GET /qa/charts": [] });
+    const calls = fakeServer({ "POST /auth/login": { step: "mfa", challenge: "c.c.c" }, "POST /auth/mfa/verify": LOGIN, "GET /units": [], "GET /incidents": [], "GET /auth/me": { user: LOGIN.user, agency: "Acme Ambulance", unit: null, incident: null }, "GET /users": [], "GET /certifications": [], "GET /certification-types": [], "GET /vehicles": [], "GET /pcr-review": [], "GET /checklist": [], "GET /unit-checks/status": [], "GET /qa/charts": [], "GET /ops/roster": [] });
     render(<App />);
     fireEvent.change(await screen.findByLabelText("Email"), { target: { value: "boss@a.test" } });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "correct-horse-battery" } });
@@ -145,7 +147,7 @@ describe("sign-in", () => {
     expect(screen.queryByText(/Bruckner/)).toBeNull();
     expect(screen.queryByText(/Marcus Alvarez/)).toBeNull();
     expect(screen.queryByText("API")).toBeNull();                          // no per-tab connection setting
-    for (const [hash, text] of [["#/compliance", "Compliance Console"], ["#/team", "Add field personnel"], ["#/qa", "QA/QI review"]]) {
+    for (const [hash, text] of [["#/compliance", "Compliance Console"], ["#/team", "+ Add field personnel"], ["#/qa", "QA/QI review"], ["#/ops", "OPS: units and crews"]]) {
       window.location.hash = hash;
       expect(await screen.findByText(text)).toBeTruthy();
     }
@@ -220,13 +222,16 @@ describe("sign-in", () => {
 });
 
 describe("dispatch, signed in", () => {
-  it("shows the real calls, with room, destination and contact, and edits go to the server", async () => {
+  it("shows the essentials on one line and the rest when a call is opened; edits go to the server through the draft tray", async () => {
     const calls = fakeServer({ "GET /units": [UNIT()], "GET /incidents": [INCIDENT], "PATCH /incidents/i1": { ...INCIDENT, scene_detail: "Room 500" } });
-    render(<DispatchConsole session={liveSession()} />);
+    render(<><DispatchConsole session={liveSession()} /><CallDraftTray session={liveSession()} /></>);
     expect(await screen.findByText("BronxCare Hospital Center")).toBeTruthy();
     expect(screen.getByText(/Room 412/)).toBeTruthy();
     expect(screen.getByText(/Montefiore Moses/)).toBeTruthy();
-    expect(screen.getByText(/RN Pat 718-555-0100/)).toBeTruthy();
+    expect(screen.queryByText(/RN Pat 718-555-0100/)).toBeNull();           // contact and notes wait until the call is opened
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    fireEvent.click(screen.getByText("BronxCare Hospital Center"));
+    expect(await screen.findByText(/RN Pat 718-555-0100/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     fireEvent.change(await screen.findByDisplayValue("Room 412"), { target: { value: "Room 500" } });
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
@@ -236,13 +241,37 @@ describe("dispatch, signed in", () => {
   it("cancelling needs a reason, then tells the server", async () => {
     const calls = fakeServer({ "GET /units": [UNIT()], "GET /incidents": [INCIDENT], "POST /incidents/i1/cancel": { ...INCIDENT, closed_at: "now" } });
     render(<DispatchConsole session={liveSession()} />);
-    await screen.findByText("BronxCare Hospital Center");
-    fireEvent.click(screen.getByRole("button", { name: "Cancel call" }));
+    fireEvent.click(await screen.findByText("BronxCare Hospital Center"));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel call" }));
     const confirm = screen.getByRole("button", { name: "Confirm cancel" });
     expect(confirm.disabled).toBe(true);
     fireEvent.change(screen.getByPlaceholderText("Why is it being cancelled?"), { target: { value: "Facility cancelled" } });
     fireEvent.click(screen.getByRole("button", { name: "Confirm cancel" }));
     await waitFor(() => expect(calls.some((c) => c.key === "POST /incidents/i1/cancel" && c.body.reason === "Facility cancelled")).toBe(true));
+  });
+
+  it("MULTITASKING: a new call is a draft in a tray, not a pop-up. The board stays usable, drafts can be minimized and several can be open at once", async () => {
+    const calls = fakeServer({ "GET /units": [UNIT()], "GET /incidents": [INCIDENT], "POST /incidents": { incident_id: "i9" } });
+    render(<><DispatchConsole session={liveSession()} /><CallDraftTray session={liveSession()} /></>);
+    await screen.findByText("BronxCare Hospital Center");
+    fireEvent.click(screen.getByRole("button", { name: /New Call/ }));
+    fireEvent.change(await screen.findByPlaceholderText(/e\.g\. BronxCare/), { target: { value: "100 First Call St" } });
+    // ...while the form is open, the board still responds (a modal would have blocked this)
+    fireEvent.click(screen.getByRole("button", { name: "Assign Medic 1" }));
+    await waitFor(() => expect(calls.some((c) => c.key === "POST /incidents/i1/assignments")).toBe(true));
+    // minimize it: it becomes a chip holding the address, and the form is gone
+    fireEvent.click(screen.getByRole("button", { name: "Minimize" }));
+    expect(screen.queryByPlaceholderText(/e\.g\. BronxCare/)).toBeNull();
+    expect(screen.getByRole("button", { name: "100 First Call St" })).toBeTruthy();
+    // a second call can be started in parallel
+    fireEvent.click(screen.getByRole("button", { name: "Start another call" }));
+    fireEvent.change(await screen.findByPlaceholderText(/e\.g\. BronxCare/), { target: { value: "200 Second Call Ave" } });
+    expect(screen.getByRole("button", { name: "100 First Call St" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add to queue" }));
+    await waitFor(() => expect(calls.filter((c) => c.key === "POST /incidents").map((c) => c.body.sceneAddress)).toEqual(["200 Second Call Ave"]));
+    expect(screen.getByRole("button", { name: "100 First Call St" })).toBeTruthy();       // the first draft is still waiting
+    fireEvent.click(screen.getByRole("button", { name: "100 First Call St" }));
+    expect(await screen.findByDisplayValue("100 First Call St")).toBeTruthy();
   });
 
   it("calls the nearest crewed unit a SUGGESTION, shows which one, and mentions a closer unit that is finishing a call", async () => {
@@ -308,13 +337,15 @@ const TEAM_ROUTES = (over = {}) => ({
 });
 
 describe("team admin", () => {
-  it("field personnel: creates a person with a field level and shows the temporary password once", async () => {
+  it("field personnel: one compact line each; adding is behind a button; creates a person with a field level and shows the temporary password once", async () => {
     let users = [];
     const calls = fakeServer(TEAM_ROUTES({
       "GET /users": () => users,
       "POST /users": (b) => { users = [{ user_id: "n1", email: b.email, display_name: b.displayName, role: "crew", roles: b.roles, is_active: true, crew_member_id: "c1", field_level: b.fieldLevel, mfa_enabled: false }]; return users[0]; },
     }));
     render(<TeamConsole session={liveSession()} />);
+    expect(screen.queryByLabelText("Full name")).toBeNull();                 // the form isn't cluttering the list
+    fireEvent.click(await screen.findByRole("button", { name: "+ Add field personnel" }));
     fireEvent.change(await screen.findByLabelText("Full name"), { target: { value: "Casey Medic" } });
     fireEvent.change(screen.getByLabelText("Email (their sign-in name)"), { target: { value: "casey@a.test" } });
     fireEvent.change(screen.getByLabelText("Field level"), { target: { value: "paramedic" } });
@@ -324,10 +355,35 @@ describe("team admin", () => {
     expect(await screen.findByText("Casey Medic")).toBeTruthy();
   });
 
+  it("a person's details stay hidden until you open them; name and email can be corrected", async () => {
+    const calls = fakeServer(TEAM_ROUTES({
+      "GET /users": [{ user_id: "n1", email: "casy@a.test", display_name: "Casy Medic", role: "crew", roles: ["crew"], is_active: true, crew_member_id: "c1", field_level: "emt", unit_id: null, mfa_enabled: true }],
+      "PATCH /users/n1": { user_id: "n1" },
+    }));
+    render(<TeamConsole session={liveSession()} />);
+    expect(await screen.findByText("Casy Medic")).toBeTruthy();
+    expect(screen.queryByText("Reset password")).toBeNull();                 // collapsed
+    expect(screen.queryByDisplayValue("casy@a.test")).toBeNull();
+    fireEvent.click(screen.getByText("Casy Medic"));
+    fireEvent.change(await screen.findByDisplayValue("casy@a.test"), { target: { value: "casey@a.test" } });
+    fireEvent.change(screen.getByDisplayValue("Casy Medic"), { target: { value: "Casey Medic" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save details" }));
+    await waitFor(() => expect(calls.some((c) => c.key === "PATCH /users/n1" && c.body.email === "casey@a.test" && c.body.displayName === "Casey Medic")).toBe(true));
+  });
+
+  it("long lists: searching asks the server for matches and shows the total", async () => {
+    const calls = fakeServer(TEAM_ROUTES({ "GET /users": [] }));
+    render(<TeamConsole session={liveSession()} />);
+    fireEvent.change(await screen.findByPlaceholderText(/Search name, email or employee/), { target: { value: "reyes" } });
+    await waitFor(() => expect(calls.some((c) => c.key === "GET /users" && c.url.includes("q=reyes") && c.url.includes("kind=field") && c.url.includes("limit=25"))).toBe(true));
+    expect(await screen.findByText("Nobody matches that search.")).toBeTruthy();
+  });
+
   it("office personnel: pick one or more roles, and optionally mark that they also work on a unit", async () => {
     const calls = fakeServer(TEAM_ROUTES({ "POST /users": (b) => ({ user_id: "n2", ...b }) }));
     render(<TeamConsole session={liveSession()} />);
     fireEvent.click(await screen.findByRole("button", { name: "Office personnel" }));
+    fireEvent.click(await screen.findByRole("button", { name: "+ Add office personnel" }));
     fireEvent.change(await screen.findByLabelText("Full name"), { target: { value: "Dana Dispatcher" } });
     fireEvent.change(screen.getByLabelText("Email (their sign-in name)"), { target: { value: "dana@a.test" } });
     fireEvent.click(screen.getByLabelText("QA/QI"));
@@ -342,6 +398,7 @@ describe("team admin", () => {
       "PUT /crew/c1/unit": { error: "Casey Medic is a paramedic with no current ALS-level certification, so can't be put on Medic 1. Add their certification first.", __status: 409 },
     }));
     render(<TeamConsole session={liveSession()} />);
+    fireEvent.click(await screen.findByText("Casey Medic"));
     fireEvent.change(await screen.findByDisplayValue("Not on a unit"), { target: { value: "u1" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(await screen.findByText(/no current ALS-level certification/)).toBeTruthy();
@@ -350,10 +407,13 @@ describe("team admin", () => {
   it("units & inspections: shows the last shift check, flags a failure, and warns that the starter checklist isn't the agency's real inventory", async () => {
     fakeServer(TEAM_ROUTES({
       "GET /checklist": [{ item_id: "i1", label: "Oxygen supply adequate", category: "Oxygen and airway", applies_to: "BLS", min_quantity: null, is_active: true, source: "starter" }],
-      "GET /unit-checks/status": [{ unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", last_check_at: new Date(Date.now() - 2 * 3600e3).toISOString(), last_check_result: "fail", last_check_by: "Eli Emt", failed_items: ["Suction working"], periodic: [{ kind: "dmv_inspection", performedAt: "2026-06-01T00:00:00Z", result: "pass", nextDue: "2027-06-01" }] }],
+      "GET /unit-checks/status": [{ unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", crew_count: 1, check_due: false, last_check_at: new Date(Date.now() - 2 * 3600e3).toISOString(), last_check_result: "fail", last_check_by: "Eli Emt", failed_items: ["Suction working"], periodic: [{ kind: "dmv_inspection", performedAt: "2026-06-01T00:00:00Z", result: "pass", nextDue: "2027-06-01" }] }],
     }));
     render(<TeamConsole session={liveSession()} />);
     fireEvent.click(await screen.findByRole("button", { name: "Units & inspections" }));
+    expect(await screen.findByText("Check failed")).toBeTruthy();            // the closed row shows only the headline
+    expect(screen.queryByText(/Suction working/)).toBeNull();
+    fireEvent.click(screen.getByText("Medic 1"));
     expect(await screen.findByText(/FAILED 2 h ago by Eli Emt: Suction working/)).toBeTruthy();
     expect(screen.getByText(/DMV inspection: passed/)).toBeTruthy();
     expect(screen.getByText(/not your agency's required equipment/)).toBeTruthy();
@@ -467,5 +527,102 @@ describe("field unit: profile and unit check", () => {
     fireEvent.click(submit);
     await waitFor(() => expect(calls.some((c) => c.key === "POST /unit-checks" && c.body.items.some((i) => i.ok === false && i.note === "Strap frayed"))).toBe(true));
     expect(await screen.findByText(/flagged for your supervisor/)).toBeTruthy();
+  });
+});
+
+describe("OPS: crewing units", () => {
+  const crew = (name, level, role, id) => ({ employeeId: "1", name, role, cert: null, crewMemberId: id, fieldLevel: level });
+  const U = (over) => ({ unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", current_status: "out_of_service", crew: [], ...over });
+  const dropData = (p) => ({ getData: () => JSON.stringify(p), setData() {}, effectAllowed: "" });
+
+  it("lists every unit with what it still needs, and the people who aren't on one", async () => {
+    fakeServer({
+      "GET /units": [U({ crew: [crew("Pat Medic", "paramedic", "non_driver", "c1")] }), U({ unit_id: "u2", unit_designation: "Ambulance 2", capability_level: "BLS", current_status: "available", crew: [crew("Dan Driver", "mvo", "driver", "c2"), crew("Eli Emt", "emt", "non_driver", "c3")] })],
+      "GET /ops/roster": [{ crew_member_id: "c9", name: "Una Free", field_level: "emt", employee_number: "7" }],
+      "GET /unit-checks/status": [{ unit_id: "u2", crew_count: 2, check_due: true, last_check_at: null, failed_items: [], periodic: [] }],
+    });
+    render(<OpsConsole session={liveSession()} />);
+    expect(await screen.findByText("Medic 1")).toBeTruthy();
+    expect(screen.getByText("Needs a driver to take calls.")).toBeTruthy();          // a paramedic alone: no driver yet
+    expect(screen.getByText("Check due")).toBeTruthy();                              // Ambulance 2 has a crew and no check
+    expect(screen.getByText("Una Free")).toBeTruthy();
+    expect(screen.getByText("NOT ON A UNIT (1)")).toBeTruthy();
+  });
+
+  it("dropping an MVO on a unit makes them the driver; dropping an EMT next to a paramedic on an ALS unit with no driver makes the EMT the driver; otherwise non-driver", async () => {
+    const calls = fakeServer({
+      "GET /units": [U({ crew: [crew("Pat Medic", "paramedic", "non_driver", "c1")] }), U({ unit_id: "u3", unit_designation: "Ambulance 3", capability_level: "BLS", crew: [] })],
+      "GET /ops/roster": [{ crew_member_id: "c8", name: "Dan Driver", field_level: "mvo" }, { crew_member_id: "c9", name: "Eli Emt", field_level: "emt" }],
+      "GET /unit-checks/status": [], "PUT /crew/c8/unit": {}, "PUT /crew/c9/unit": {},
+    });
+    render(<OpsConsole session={liveSession()} />);
+    await screen.findByText("Medic 1");
+    const card = (name) => screen.getByText(name).closest("div[class*='rounded-lg']");
+    fireEvent.drop(card("Medic 1"), { dataTransfer: dropData({ crewMemberId: "c8", level: "mvo", fromUnitId: null }) });
+    await waitFor(() => expect(calls.find((c) => c.key === "PUT /crew/c8/unit")?.body).toEqual({ unitId: "u1", seatRole: "driver" }));
+    fireEvent.drop(card("Medic 1"), { dataTransfer: dropData({ crewMemberId: "c9", level: "emt", fromUnitId: null }) });
+    await waitFor(() => expect(calls.find((c) => c.key === "PUT /crew/c9/unit")?.body).toEqual({ unitId: "u1", seatRole: "driver" }));   // EMT-driver paired with the paramedic
+    fireEvent.drop(card("Ambulance 3"), { dataTransfer: dropData({ crewMemberId: "c9", level: "emt", fromUnitId: null }) });
+    await waitFor(() => expect(calls.filter((c) => c.key === "PUT /crew/c9/unit").pop().body).toEqual({ unitId: "u3", seatRole: "non_driver" }));
+  });
+
+  it("on a phone there's no dragging: tap a person, then tap the unit. A server refusal is shown in words", async () => {
+    const calls = fakeServer({
+      "GET /units": [U({ unit_designation: "Medic 1", crew: [crew("Pat Medic", "paramedic", "non_driver", "c1"), crew("Dan Driver", "mvo", "driver", "c2"), crew("Eli Emt", "emt", "non_driver", "c3")] })],
+      "GET /ops/roster": [{ crew_member_id: "c9", name: "Una Free", field_level: "emt" }], "GET /unit-checks/status": [],
+      "PUT /crew/c9/unit": { error: "Medic 1 already has 3 crew. Take someone off first.", __status: 409 },
+    });
+    render(<OpsConsole session={liveSession()} />);
+    fireEvent.click(await screen.findByText("Una Free"));
+    expect(screen.getByText(/Placing/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Medic 1"));
+    expect(await screen.findByText(/already has 3 crew/)).toBeTruthy();
+    expect(calls.find((c) => c.key === "PUT /crew/c9/unit").body.unitId).toBe("u1");
+  });
+
+  it("the D badge swaps driver / non-driver, an MVO's can't be changed, and ✕ takes someone off", async () => {
+    const calls = fakeServer({
+      "GET /units": [U({ unit_designation: "Medic 1", crew: [crew("Dan Driver", "mvo", "driver", "c2"), crew("Eli Emt", "emt", "non_driver", "c3")] })],
+      "GET /ops/roster": [], "GET /unit-checks/status": [], "PATCH /crew/c3/seat": {}, "PUT /crew/c3/unit": {},
+    });
+    render(<OpsConsole session={liveSession()} />);
+    await screen.findByText("Eli Emt");
+    fireEvent.click(screen.getByTitle("An MVO always drives"));
+    fireEvent.click(screen.getByTitle("Tap to make driver"));
+    await waitFor(() => expect(calls.find((c) => c.key === "PATCH /crew/c3/seat")?.body).toEqual({ seatRole: "driver" }));
+    expect(calls.some((c) => c.key === "PATCH /crew/c2/seat")).toBe(false);
+    fireEvent.click(screen.getByLabelText("Take Eli Emt off Medic 1"));
+    await waitFor(() => expect(calls.find((c) => c.key === "PUT /crew/c3/unit")?.body).toEqual({ unitId: null }));
+  });
+});
+
+describe("field unit: due check and new-call alert", () => {
+  it("tells the crew their unit check is due", async () => {
+    fakeServer({
+      "GET /auth/me": { user: LOGIN.user, agency: "A", unit: { unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", current_status: "available", seat_role: "driver" }, incident: null },
+      "GET /me/stats": { assigned: 0, completed: 0, pending: 0, awaitingCorrection: 0, canChart: true },
+      "GET /unit-checks/status": [{ unit_id: "u1", crew_count: 2, check_due: true, last_check_at: null, failed_items: [], periodic: [] }],
+    });
+    render(<FieldUnitConsole session={liveSession("crew", { fieldLevel: "emt", roles: ["crew"] })} />);
+    expect(await screen.findByText(/Your unit check is due/)).toBeTruthy();
+  });
+});
+
+describe("ePCR starts from what dispatch knows", () => {
+  it("fills the destination from the call's saved place and the times from the unit's status history", async () => {
+    fakeServer({
+      "GET /me/stats": { assigned: 1, completed: 0, pending: 1, awaitingCorrection: 0, canChart: true },
+      "GET /pcr/mine": { canChart: true, charts: [], calls: [{ incident_id: "i3", unit_id: "u1", scene_address: "77 New Call Rd", priority: "critical", unit_designation: "Medic 1" }] },
+      "POST /pcr": { pcr_id: "p9", status: "draft" }, "GET /facilities": [{ facility_id: "f1", name: "BronxCare Hospital Center" }],
+      "GET /pcr/p9": { pcr_id: "p9", status: "draft", clinical_narrative: "", vitals: [], procedures: [], medications: [], disposition: null, events: [], crew: [],
+        call: { destination_facility_id: "f1", destination_facility_name: "BronxCare Hospital Center" }, times: { dispatchedAt: "2026-11-01T14:02:00", enRouteAt: "2026-11-01T14:04:00", onSceneAt: "2026-11-01T14:11:00", leftSceneAt: null } },
+    });
+    render(<EpcrCharting session={liveSession("crew", { fieldLevel: "emt", roles: ["crew"] })} />);
+    fireEvent.click(await screen.findByText("77 New Call Rd"));
+    fireEvent.click(await screen.findByRole("button", { name: /Disposition/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Transported" }));
+    expect(await screen.findByRole("button", { name: "BronxCare Hospital Center" })).toBeTruthy();   // their saved places are the choices
+    expect(screen.getByDisplayValue("14:02")).toBeTruthy();
+    expect(screen.getByDisplayValue("14:11")).toBeTruthy();
   });
 });

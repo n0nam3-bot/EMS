@@ -38,7 +38,9 @@ router.get("/units", async (req, res) => {
               'employeeId', ucd.employee_number,
               'name', ucd.first_name || ' ' || ucd.last_name,
               'role', ucd.seat_role,
-              'cert', ucd.cert_level
+              'cert', ucd.cert_level,
+              'crewMemberId', ucd.crew_member_id,
+              'fieldLevel', cmx.field_level
             )
           ) FILTER (WHERE ucd.crew_member_id IS NOT NULL),
           '[]'
@@ -46,6 +48,7 @@ router.get("/units", async (req, res) => {
       FROM units u
       JOIN vehicles v ON v.vehicle_id = u.vehicle_id
       LEFT JOIN unit_crew_display ucd ON ucd.unit_id = u.unit_id
+      LEFT JOIN crew_members cmx ON cmx.crew_member_id = ucd.crew_member_id
       GROUP BY u.unit_id, u.current_status, u.location_updated_at, v.unit_designation, v.capability_level
       ORDER BY v.unit_designation
     `)

@@ -103,6 +103,27 @@ export default function FieldUnitConsole({ session }) {
 
   const unit = me?.unit || null;
   const incident = me?.incident || null;
+
+  // A new call lands on the screen with a buzz and a short tone, so a crew looking at the road (or at
+  // another app) knows. Browsers only allow sound after the person has tapped the page once.
+  const lastCallRef = useRef(undefined);
+  const [newCall, setNewCall] = useState(false);
+  useEffect(() => {
+    const id = incident?.incident_id || null;
+    if (lastCallRef.current === undefined) { lastCallRef.current = id; return; }   // first load: not "new"
+    if (id && id !== lastCallRef.current) {
+      setNewCall(true);
+      try { navigator.vibrate?.([300, 120, 300]); } catch (e) { /* not supported */ }
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const o = ctx.createOscillator(); const g = ctx.createGain();
+        o.connect(g); g.connect(ctx.destination); o.frequency.value = 880; g.gain.value = 0.15;
+        o.start(); o.stop(ctx.currentTime + 0.4);
+      } catch (e) { /* sound not allowed yet */ }
+      setTimeout(() => setNewCall(false), 20000);
+    }
+    lastCallRef.current = id;
+  }, [incident?.incident_id]);
   const canReport = live && Boolean(unit);
 
   async function setStatus(status) {
@@ -176,6 +197,12 @@ export default function FieldUnitConsole({ session }) {
       </div>
 
       <div className="p-4 flex flex-col gap-3" style={{ maxWidth: "640px" }}>
+        {newCall && incident && (
+          <div role="alert" className="rounded-lg border p-3 text-sm font-semibold" style={{ color: "#06090D", backgroundColor: AMBER, borderColor: AMBER }}>New call assigned: {incident.scene_address}</div>
+        )}
+        {live && unit && checkStatus?.check_due && (
+          <div className="rounded-lg border p-3 text-sm" style={{ color: AMBER, backgroundColor: "rgba(245,147,74,0.08)", borderColor: "#4A3A1E" }}>Your unit check is due. Do it before your first call.</div>
+        )}
         {live && loadError && <div className="text-sm" style={{ color: RED }}>Could not load your unit: {loadError}</div>}
         {live && !loadError && me === null && <div className="text-sm" style={{ color: TEXT_FAINT }}>Loading…</div>}
 

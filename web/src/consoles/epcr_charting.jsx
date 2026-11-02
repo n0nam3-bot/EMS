@@ -242,7 +242,7 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack, onSubmitted }) 
   const [procedures, setProcedures] = useState([]);
   const [medications, setMedications] = useState([]);
   const [narrative, setNarrative] = useState("");
-  const [disposition, setDispositionField] = useState({ type: "", destinationFacility: "", transferTo: "", primaryImpression: "", mechanismOfInjury: "", dispatchedAt: live ? "" : "14:02", enRouteAt: live ? "" : "14:04", onSceneAt: live ? "" : "14:11", leftSceneAt: live ? "" : "14:24" });
+  const [disposition, setDispositionField] = useState({ type: "", destinationFacility: "", destinationFacilityId: null, transferTo: "", primaryImpression: "", mechanismOfInjury: "", dispatchedAt: live ? "" : "14:02", enRouteAt: live ? "" : "14:04", onSceneAt: live ? "" : "14:11", leftSceneAt: live ? "" : "14:24" });
   const [signatures, setSignatures] = useState([]);
   const [showSearch, setShowSearch] = useState(false);
   const [protocolDocs, setProtocolDocs] = useState(live ? [] : SAMPLE_PROTOCOLS);
@@ -311,6 +311,7 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack, onSubmitted }) 
   // ---- Saved entries come back from the server, so a chart that was reopened for
   // correction opens with what was already recorded, and a mistaken entry can be removed.
   const [serverState, setServerState] = useState({ status: "draft", reopenNote: "" });
+  const [places, setPlaces] = useState([]);
   const [hydrated, setHydrated] = useState(!live);
   const [submitting, setSubmitting] = useState(false);
   const [submitProblem, setSubmitProblem] = useState(null); // { message, missing }
@@ -325,10 +326,21 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack, onSubmitted }) 
     setProcedures(c.procedures.slice().reverse().map((p) => ({ id: p.procedure_id, serverId: p.procedure_id, name: p.procedure_name, performedAt: new Date(p.performed_at), outcome: p.outcome || "", notes: p.notes || "" })));
     setMedications(c.medications.slice().reverse().map((m) => ({ id: m.medication_id, serverId: m.medication_id, name: m.drug_name, dose: m.dose, route: m.route, administeredAt: new Date(m.administered_at), controlled: false })));
     if (everything) {
+      // What dispatch already knows: the destination the call named, and when the unit was sent,
+      // en route, on scene and left. Nothing here overwrites what the crew has typed.
+      const hhmm = (iso) => (iso ? new Date(iso).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "");
+      setDispositionField((d) => ({
+        ...d,
+        destinationFacility: d.destinationFacility || c.call?.destination_facility_name || "",
+        destinationFacilityId: d.destinationFacilityId || c.call?.destination_facility_id || null,
+        dispatchedAt: d.dispatchedAt || hhmm(c.times?.dispatchedAt), enRouteAt: d.enRouteAt || hhmm(c.times?.enRouteAt),
+        onSceneAt: d.onSceneAt || hhmm(c.times?.onSceneAt), leftSceneAt: d.leftSceneAt || hhmm(c.times?.leftSceneAt),
+      }));
       if (c.clinical_narrative) setNarrative(c.clinical_narrative);
       if (c.disposition) setDispositionField((d) => ({ ...d, type: c.disposition.disposition_type || "", transferTo: c.disposition.transfer_of_care_to || "", primaryImpression: c.disposition.primary_impression || "", mechanismOfInjury: c.disposition.mechanism_of_injury || "" }));
     }
   }
+  useEffect(() => { if (live) apiRequest("GET", "/facilities?limit=200").then(setPlaces).catch(() => {}); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!live) return;
     let cancelled = false;
@@ -379,11 +391,11 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack, onSubmitted }) 
   function commitDisposition(d) {
     if (!d.type) return;
     syncToBackend("Disposition", "PUT", "/disposition", {
-      dispositionType: d.type, destinationFacilityId: null, transferOfCareTo: d.transferTo || null,
+      dispositionType: d.type, destinationFacilityId: d.destinationFacilityId || null, transferOfCareTo: d.transferTo || null,
       primaryImpression: d.primaryImpression || null, secondaryImpressions: null, mechanismOfInjury: d.mechanismOfInjury || null,
     });
-    if (d.destinationFacility) {
-      noteUnsynced(`Disposition: destination "${d.destinationFacility}" is free text here but the schema stores a facility ID — destination was NOT saved`);
+    if (d.destinationFacility && !d.destinationFacilityId) {
+      noteUnsynced(`Disposition: destination "${d.destinationFacility}" isn't one of your saved places, so only the name stays on this device. Pick it from the list (a supervisor adds places under Team) to save it.`);
     }
   }
 
@@ -481,7 +493,7 @@ function EpcrChart({ session, incidentId, incidentLabel, onBack, onSubmitted }) 
         {tab === "procedures" && <ProceduresTab procedures={procedures} setProcedures={setProcedures} onCommit={commitProcedure} onRemove={(e) => removeSaved("procedures", e)} />}
         {tab === "medications" && <MedicationsTab medications={medications} setMedications={setMedications} allergies={patient.allergies} onCommit={commitMedication} onRemove={(e) => removeSaved("medications", e)} />}
         {tab === "narrative" && <NarrativeTab narrative={narrative} setNarrative={setNarrative} chartData={chartData} onCommit={commitNarrative} />}
-        {tab === "disposition" && <DispositionTab disposition={disposition} set={setDispositionField} canSave={isConfigured} onSave={() => commitDisposition(disposition)} />}
+        {tab === "disposition" && <DispositionTab disposition={disposition} set={setDispositionField} canSave={isConfigured} onSave={() => commitDisposition(disposition)} live={live} places={places} />}
         {tab === "signatures" && <SignaturesTab signatures={signatures} setSignatures={setSignatures} chartData={chartData} narrative={narrative} localOnly={isConfigured ? "Not synced: signatures need object storage (the schema stores a pointer to an uploaded image, not the image) and nothing in this backend has that yet." : null} />}
         {nextSection && (
           <button onClick={() => setTab(nextSection.key)} className="mt-4 w-full text-sm font-medium rounded px-3 py-2.5" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Continue to {nextSection.label} →</button>
@@ -830,7 +842,7 @@ function NarrativeTab({ narrative, setNarrative, chartData, onCommit }) {
   );
 }
 
-function DispositionTab({ disposition, set, canSave, onSave }) {
+function DispositionTab({ disposition, set, canSave, onSave, live = false, places = [] }) {
   const [saved, setSaved] = useState(false);
   function upd(field, value) { setSaved(false); set((d) => ({ ...d, [field]: value })); }
   return (
@@ -840,7 +852,7 @@ function DispositionTab({ disposition, set, canSave, onSave }) {
         <div className="flex flex-wrap gap-2 mb-3">{DISPOSITIONS.map((d) => <PresetButton key={d.value} label={d.label} active={disposition.type === d.value} onClick={() => upd("type", d.value)} />)}</div>
         {disposition.type === "transported" && (
           <div className="flex flex-col gap-2 mb-2">
-            <div><FieldLabel>Destination Facility</FieldLabel><TapOrType options={["Lincoln Hospital ED", "Jacobi Medical Center", "Montefiore ED"]} value={disposition.destinationFacility} onChange={(v) => upd("destinationFacility", v)} placeholder="Specify facility" /></div>
+            <div><FieldLabel>Destination Facility</FieldLabel><TapOrType options={live ? places.map((x) => x.name) : ["Lincoln Hospital ED", "Jacobi Medical Center", "Montefiore ED"]} value={disposition.destinationFacility} onChange={(v) => { upd("destinationFacility", v); upd("destinationFacilityId", places.find((x) => x.name === v)?.facility_id || null); }} placeholder={live ? "Pick a saved place" : "Specify facility"} /></div>
             <TextField label="Transfer of Care To" value={disposition.transferTo} onChange={(v) => upd("transferTo", v)} placeholder="Receiving RN/MD name" />
           </div>
         )}

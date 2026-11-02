@@ -24,6 +24,8 @@ export default function PlatformConsole({ session }) {
   const [notice, setNotice] = useState("");
   const [form, setForm] = useState({ name: "", state: "NY", protocolAuthority: "", ownerName: "", ownerEmail: "", ownerPassword: randomPassword() });
   const [shown, setShown] = useState(null);
+  const [q, setQ] = useState("");
+  const [uq, setUq] = useState("");
 
   const loadTenants = useCallback(async () => { try { setTenants(await apiRequest(session, "GET", "/platform/tenants")); } catch (e) { setError(e.message); } }, [session]);
   const loadUsers = useCallback(async (id) => { try { setUsers(await apiRequest(session, "GET", `/platform/tenants/${id}/users`)); } catch (e) { setError(e.message); } }, [session]);
@@ -82,7 +84,8 @@ export default function PlatformConsole({ session }) {
         </form>
 
         {tenants === null && !error && <div className="text-sm" style={{ color: TEXT_FAINT }}>Loading…</div>}
-        {(tenants || []).map((t) => (
+        {tenants && tenants.length > 3 && <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search companies" className="text-sm rounded px-2.5 py-1.5" style={{ ...field, width: "260px", maxWidth: "100%" }} />}
+        {(tenants || []).filter((t) => !q || t.display_name.toLowerCase().includes(q.toLowerCase())).map((t) => (
           <div key={t.tenant_id} className="rounded-lg border p-4 flex flex-col gap-2" style={{ backgroundColor: PANEL, borderColor: open?.tenant_id === t.tenant_id ? BLUE : HAIRLINE, opacity: t.is_active ? 1 : 0.7 }}>
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <div>
@@ -94,7 +97,14 @@ export default function PlatformConsole({ session }) {
                 <button onClick={() => act(() => apiRequest(session, "PATCH", `/platform/tenants/${t.tenant_id}`, { isActive: !t.is_active }), t.is_active ? `${t.display_name} suspended. Everyone there is signed out.` : `${t.display_name} reactivated.`)} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: t.is_active ? "#F0857D" : GREEN }}>{t.is_active ? "Suspend" : "Reactivate"}</button>
               </div>
             </div>
-            {open?.tenant_id === t.tenant_id && users.map((u) => <UserRow key={u.user_id} u={u} act={act} session={session} />)}
+            {open?.tenant_id === t.tenant_id && (
+              <>
+                {users.length > 6 && <input value={uq} onChange={(e) => setUq(e.target.value)} placeholder="Search accounts" className="text-sm rounded px-2.5 py-1.5" style={{ ...field, width: "240px", maxWidth: "100%" }} />}
+                <div className="rounded-md overflow-hidden" style={{ border: `1px solid ${HAIRLINE}` }}>
+                  {users.filter((u) => !uq || `${u.display_name} ${u.email}`.toLowerCase().includes(uq.toLowerCase())).map((u) => <UserRow key={u.user_id} u={u} act={act} session={session} />)}
+                </div>
+              </>
+            )}
           </div>
         ))}
       </div>
@@ -103,31 +113,36 @@ export default function PlatformConsole({ session }) {
 }
 
 function UserRow({ u, act, session }) {
+  const [openRow, setOpenRow] = useState(false);
   const [pw, setPw] = useState(null);
   const [given, setGiven] = useState(null);
   const patch = (body, ok) => act(() => apiRequest(session, "PATCH", `/platform/users/${u.user_id}`, body), ok);
   return (
-    <div className="rounded-md p-3 flex flex-col gap-2" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, opacity: u.is_active ? 1 : 0.6 }}>
-      <div className="flex items-start justify-between gap-2 flex-wrap">
-        <div className="min-w-0">
-          <div className="text-sm font-medium">{u.display_name}{!u.is_active && <span className="ml-2 text-xs" style={{ color: AMBER }}>deactivated</span>}{u.locked && <span className="ml-2 text-xs" style={{ color: RED }}>locked</span>}</div>
-          <div className="text-xs" style={{ color: TEXT_SECONDARY }}>{u.email} · {[u.role, ...(u.extra_roles || [])].join(", ")} · 2-step {u.mfa_enabled ? "on" : "not set up"}</div>
+    <div style={{ backgroundColor: SUNKEN, borderBottom: `1px solid ${HAIRLINE}`, opacity: u.is_active ? 1 : 0.6 }}>
+      <button onClick={() => setOpenRow(!openRow)} aria-expanded={openRow} className="w-full flex items-center gap-3 px-3 py-2 text-left">
+        <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: !u.is_active ? TEXT_FAINT : u.mfa_enabled ? GREEN : AMBER }} />
+        <span className="min-w-0 flex-1"><span className="block text-sm truncate">{u.display_name}{u.locked && <span className="ml-2 text-xs" style={{ color: RED }}>locked</span>}</span><span className="block text-xs truncate" style={{ color: TEXT_FAINT }}>{u.email} · {[u.role, ...(u.extra_roles || [])].join(", ")}</span></span>
+        <span className="text-xs shrink-0" style={{ color: TEXT_FAINT }}>{openRow ? "▲" : "▼"}</span>
+      </button>
+      {openRow && (
+        <div className="px-3 pb-3 flex flex-col gap-2">
+          <div className="text-xs" style={{ color: TEXT_SECONDARY }}>Two-step sign-in: {u.mfa_enabled ? "on" : "not set up"}{!u.is_active ? " · deactivated" : ""}</div>
+          {given && <div className="text-xs mono" style={{ color: GREEN }}>New password for {u.email}: {given}  (not shown again)</div>}
+          <div className="flex gap-2 flex-wrap">
+            {pw === null ? (
+              <button onClick={() => setPw(randomPassword())} className="text-xs px-2 py-1.5 rounded" style={btn}>Reset password</button>
+            ) : (
+              <>
+                <input value={pw} onChange={(e) => setPw(e.target.value)} className="text-xs rounded px-2 py-1.5 mono" style={{ ...field, minWidth: "190px" }} />
+                <button onClick={async () => { if (await patch({ password: pw })) { setGiven(pw); setPw(null); } }} className="text-xs px-2 py-1.5 rounded" style={btnGreen}>Set</button>
+                <button onClick={() => setPw(null)} className="text-xs px-2 py-1.5 rounded" style={btn}>Cancel</button>
+              </>
+            )}
+            <button onClick={() => patch({ resetMfa: true }, "Two-step sign-in reset. They'll set it up again next time they sign in.")} className="text-xs px-2 py-1.5 rounded" style={btn}>Reset 2-step</button>
+            <button onClick={() => patch({ isActive: !u.is_active }, u.is_active ? "Deactivated." : "Reactivated.")} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: u.is_active ? "#F0857D" : GREEN }}>{u.is_active ? "Deactivate" : "Reactivate"}</button>
+          </div>
         </div>
-      </div>
-      {given && <div className="text-xs mono" style={{ color: GREEN }}>New password for {u.email}: {given}  (not shown again)</div>}
-      <div className="flex gap-2 flex-wrap">
-        {pw === null ? (
-          <button onClick={() => setPw(randomPassword())} className="text-xs px-2 py-1.5 rounded" style={btn}>Reset password</button>
-        ) : (
-          <>
-            <input value={pw} onChange={(e) => setPw(e.target.value)} className="text-xs rounded px-2 py-1.5 mono" style={{ ...field, minWidth: "190px" }} />
-            <button onClick={async () => { if (await patch({ password: pw })) { setGiven(pw); setPw(null); } }} className="text-xs px-2 py-1.5 rounded" style={btnGreen}>Set</button>
-            <button onClick={() => setPw(null)} className="text-xs px-2 py-1.5 rounded" style={btn}>Cancel</button>
-          </>
-        )}
-        <button onClick={() => patch({ resetMfa: true }, "Two-step sign-in reset. They'll set it up again next time they sign in.")} className="text-xs px-2 py-1.5 rounded" style={btn}>Reset 2-step</button>
-        <button onClick={() => patch({ isActive: !u.is_active }, u.is_active ? "Deactivated." : "Reactivated.")} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: u.is_active ? "#F0857D" : GREEN }}>{u.is_active ? "Deactivate" : "Reactivate"}</button>
-      </div>
+      )}
     </div>
   );
 }

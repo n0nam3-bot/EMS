@@ -161,12 +161,11 @@ test("staffing: an ALS unit needs a paramedic to go in service, an EMT or MVO ma
     assert.equal(r.status, 201, JSON.stringify(r.body));
     ctx[key] = r.body;
   };
-  await person("medic", "medic@a.test", "Pat Medic", { roles: ["crew"], fieldLevel: "paramedic" });
+  await person("medic", "medic@a.test", "Pat Medic", { roles: ["qa_qi"], fieldLevel: "paramedic" });   // also does QA/QI, so can't review their own charts
   await person("emt", "emt@a.test", "Eli Emt", { roles: ["crew"], fieldLevel: "emt" });
   await person("emt2", "emt2@a.test", "Eve Emt", { roles: ["crew"], fieldLevel: "emt" });
   await person("mvo", "mvo@a.test", "Dan Driver", { roles: ["crew"], fieldLevel: "mvo" });
   await person("qa", "qa@a.test", "Quinn Qa", { roles: ["qa_qi"] });
-  await person("qaRider", "qarider@a.test", "Reese Both", { roles: ["qa_qi"], fieldLevel: "emt" });
 
   ctx.als = (await call("POST", "/units", { designation: "Medic 1", capabilityLevel: "ALS" }, a)).body;
   const put = (who, unit, seat) => call("PUT", `/crew/${ctx[who].crew_member_id}/unit`, { unitId: ctx[unit].unit_id, seatRole: seat }, a);
@@ -182,13 +181,76 @@ test("staffing: an ALS unit needs a paramedic to go in service, an EMT or MVO ma
   assert.equal((await put("medic", "als", "non_driver")).status, 200);
   assert.equal(await status(), "available", "with a paramedic aboard it goes in service");
   assert.equal((await put("emt", "als", "non_driver")).status, 200, "an EMT rides along on an ALS unit without an ALS certification");
-  assert.equal((await put("qaRider", "als", "non_driver")).status, 200);
+  const full = await put("emt2", "als", "non_driver");
+  assert.equal(full.status, 409, "a unit holds at most 3 crew");
+  assert.match(full.body.error, /3 crew/);
+  const mvoSeat = await call("PATCH", `/crew/${ctx.mvo.crew_member_id}/seat`, { seatRole: "non_driver" }, a);
+  assert.equal(mvoSeat.status, 409, "an MVO always drives");
+});
+
+test("seats: an EMT can be the driver on an ALS unit paired with a paramedic, only one driver per unit, and dispatchers can staff units", async () => {
+  const a = await tokenFor("boss@a.test");
+  const disp = (await call("POST", "/users", { email: "d2@a.test", displayName: "Dee Dispatch", roles: ["dispatcher"], password: PW }, a)).body;
+  const dispTok = await tokenFor("d2@a.test");
+  const unit = (await call("POST", "/units", { designation: "Medic 7", capabilityLevel: "ALS" }, a)).body;
+  const medic2 = (await call("POST", "/users", { email: "m2@a.test", displayName: "Max Medic", roles: ["crew"], fieldLevel: "paramedic", password: PW }, a)).body;
+  const emtDriver = (await call("POST", "/users", { email: "ed@a.test", displayName: "Ed Driver", roles: ["crew"], fieldLevel: "emt", password: PW }, a)).body;
+  const type = (await call("GET", "/certification-types", null, a)).body.find((x) => x.code === "PARAMEDIC");
+  await call("POST", "/certifications", { crewMemberId: medic2.crew_member_id, certificationTypeId: type.certification_type_id, issuingBody: "NY DOH", issuedOn: "2025-01-01", expiresOn: "2030-01-01" }, a);
+  const units = async () => (await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 7");
+  assert.equal((await call("PUT", `/crew/${medic2.crew_member_id}/unit`, { unitId: unit.unit_id, seatRole: "non_driver" }, dispTok)).status, 200, "a dispatcher can put crew on a unit");
+  assert.equal((await units()).current_status, "out_of_service", "a paramedic alone has no driver");
+  const put = await call("PUT", `/crew/${emtDriver.crew_member_id}/unit`, { unitId: unit.unit_id, seatRole: "driver" }, dispTok);
+  assert.equal(put.status, 200);
+  const now = await units();
+  assert.equal(now.current_status, "available", "driver (an EMT) + paramedic puts an ALS unit in service");
+  assert.deepEqual(now.crew.map((c) => [c.name, c.role, c.fieldLevel]).sort(), [["Ed Driver", "driver", "emt"], ["Max Medic", "non_driver", "paramedic"]]);
+  assert.ok(now.crew.every((c) => c.crewMemberId), "each crew entry carries the id the OPS board needs");
+  assert.equal((await call("PATCH", `/crew/${medic2.crew_member_id}/seat`, { seatRole: "driver" }, dispTok)).status, 409, "only one driver");
+  assert.equal((await call("PATCH", `/crew/${emtDriver.crew_member_id}/seat`, { seatRole: "non_driver" }, dispTok)).status, 200);
+  assert.equal((await units()).current_status, "out_of_service", "no driver, so out of service again");
+  const nobody = await tokenFor("emt@a.test");
+  assert.equal((await call("PUT", `/crew/${medic2.crew_member_id}/unit`, { unitId: null }, nobody)).status, 403, "crew can't staff units");
+  const roster = (await call("GET", "/ops/roster?unassigned=1", null, dispTok)).body;
+  assert.ok(roster.every((r) => !r.unit_id) && roster.some((r) => r.name === "Pat Medic") === false);
+  assert.ok((await call("GET", "/ops/roster?q=ed", null, dispTok)).body.some((r) => r.name === "Ed Driver"), "search by name");
+  assert.equal((await call("GET", "/ops/roster", null, nobody)).status, 403);
+  ctx.dispTok = dispTok; ctx.disp = disp;
+});
+
+test("fixing a mistake: name, email and employee number can be corrected; a taken email is refused; the person signs in with the new email", async () => {
+  const a = await tokenFor("boss@a.test");
+  const u = (await call("POST", "/users", { email: "typo@a.test", displayName: "Jon Smyth", roles: ["dispatcher"], password: PW }, a)).body;
+  assert.equal((await call("PATCH", `/users/${u.user_id}`, { email: "boss@a.test" }, a)).status, 409, "an email already in use");
+  assert.equal((await call("PATCH", `/users/${u.user_id}`, { email: "root@platform.test" }, a)).status, 409, "...including a platform admin's");
+  assert.equal((await call("PATCH", `/users/${u.user_id}`, { email: "not an email" }, a)).status, 400);
+  const fixed = await call("PATCH", `/users/${u.user_id}`, { email: "Jon.Smith@a.test", displayName: "Jon Smith", employeeNumber: "9001" }, a);
+  assert.equal(fixed.status, 200);
+  assert.equal(fixed.body.email, "jon.smith@a.test");
+  assert.equal((await call("POST", "/auth/login", { email: "typo@a.test", password: PW })).status, 401, "the old email no longer works");
+  assert.equal((await call("POST", "/auth/login", { email: "jon.smith@a.test", password: PW })).body.step, "mfa_setup");
+  const row = (await call("GET", "/users?q=9001", null, a)).body[0];
+  assert.deepEqual([row.display_name, row.employee_number], ["Jon Smith", "9001"]);
+});
+
+test("long staff lists: search, filter by field/office, and page through with a total count", async () => {
+  const a = await tokenFor("boss@a.test");
+  for (let i = 0; i < 6; i++) await call("POST", "/users", { email: `bulk${i}@a.test`, displayName: `Bulk Person ${i}`, roles: i % 2 ? ["crew"] : ["biller"], fieldLevel: i % 2 ? "emt" : undefined, password: PW }, a);
+  const raw = await fetch(`${base}/users?q=Bulk&limit=4&offset=0`, { headers: { Authorization: `Bearer ${a}` } });
+  assert.equal(raw.headers.get("x-total-count"), "6");
+  assert.equal((await raw.json()).length, 4);
+  assert.equal((await call("GET", "/users?q=Bulk&limit=4&offset=4", null, a)).body.length, 2);
+  const field = (await call("GET", "/users?q=Bulk&kind=field", null, a)).body, office = (await call("GET", "/users?q=Bulk&kind=office", null, a)).body;
+  assert.equal(field.length, 3); assert.equal(office.length, 3);
+  assert.ok(field.every((u) => u.field_level) && office.every((u) => u.roles.includes("biller")));
+  assert.equal((await call("GET", "/users?q=%25", null, a)).body.length, 0, "a % in the search is just a character");
 });
 
 test("charts belong to the unit's clinical crew: MVOs and office staff never get one, submitting locks it, only QA/QI can reopen it, and corrections go to one named person", async () => {
   const a = await tokenFor("boss@a.test");
-  const tok = Object.fromEntries(await Promise.all(["medic", "emt", "emt2", "mvo", "qa", "qarider"].map(async (k) => [k, await tokenFor(`${k === "qarider" ? "qarider" : k}@a.test`)])));
+  const tok = Object.fromEntries(await Promise.all(["medic", "emt", "emt2", "mvo", "qa"].map(async (k) => [k, await tokenFor(`${k}@a.test`)])));
   const inc = (await call("POST", "/incidents", { incidentType: "emergency_911", priority: "urgent", sceneAddress: "5 Chart Ave" }, a)).body.incident_id;
+  ctx.chartIncident = inc;
   assert.equal((await call("POST", `/incidents/${inc}/assignments`, { unitId: ctx.als.unit_id, role: "primary" }, a)).status, 201);
 
   // who can start a chart
@@ -201,7 +263,7 @@ test("charts belong to the unit's clinical crew: MVOs and office staff never get
   assert.equal(created.body.unit_id, ctx.als.unit_id, "the chart is tied to the unit that treated the patient");
   assert.equal((await call("POST", "/pcr", { incidentId: inc }, tok.emt)).body.pcr_id, pcr, "asking again returns the same chart");
   const crewOnChart = (await q("SELECT cm.first_name FROM pcr_crew pc JOIN crew_members cm ON cm.crew_member_id = pc.crew_member_id WHERE pc.pcr_id = $1 ORDER BY 1", [pcr])).map((r) => r.first_name);
-  assert.deepEqual(crewOnChart, ["Eli", "Pat", "Reese"], "the EMT, the paramedic and the QA person who also rides; never the MVO");
+  assert.deepEqual(crewOnChart, ["Eli", "Pat"], "the EMT and the paramedic; never the MVO");
 
   // the crew can edit while it's a draft; nobody else can open it
   assert.equal((await call("POST", `/pcr/${pcr}/vitals`, { heartRate: 88, bpSystolic: 120, bpDiastolic: 80 }, tok.medic)).status, 201);
@@ -232,8 +294,8 @@ test("charts belong to the unit's clinical crew: MVOs and office staff never get
   assert.equal(review.body.access, "review");
   assert.equal(review.body.vitals.length, 1);
   assert.equal((await call("PATCH", `/pcr/${pcr}/narrative`, { clinicalNarrative: "qa edit" }, tok.qa)).status, 403, "QA reviews, doesn't edit");
-  assert.equal((await call("GET", `/pcr/${pcr}`, null, tok.qarider)).status, 403, "QA/QI can't review a chart they were on");
-  assert.equal((await call("GET", "/qa/charts?status=submitted", null, tok.qarider)).body.length, 0);
+  assert.equal((await call("GET", `/pcr/${pcr}`, null, tok.medic)).status, 403, "Pat has the QA/QI role but was on this call, so can't review its chart");
+  assert.equal((await call("GET", "/qa/charts?status=submitted", null, tok.medic)).body.length, 0);
   assert.equal((await call("POST", `/pcr/${pcr}/reopen`, { assignToUserId: ctx.emt.user_id, note: "x" }, tok.qa)).status, 400, "a reason is required");
   assert.equal((await call("POST", `/pcr/${pcr}/reopen`, { assignToUserId: ctx.mvo.user_id, note: "Add the second set of vitals" }, tok.qa)).status, 400, "only someone on the chart's clinical crew can be assigned");
   assert.equal((await call("POST", `/pcr/${pcr}/reopen`, { assignToUserId: ctx.emt2.user_id, note: "Add the second set of vitals" }, tok.qa)).status, 400, "...and not an outsider");
@@ -259,7 +321,7 @@ test("charts belong to the unit's clinical crew: MVOs and office staff never get
   assert.deepEqual(events, ["created", "submitted", "reopened", "resubmitted"]);
 
   // sign-off
-  assert.equal((await call("POST", `/pcr/${pcr}/approve`, {}, tok.qarider)).status, 403, "can't approve a chart you were on");
+  assert.equal((await call("POST", `/pcr/${pcr}/approve`, {}, tok.medic)).status, 403, "can't approve a chart you were on");
   assert.equal((await call("POST", `/pcr/${pcr}/approve`, {}, tok.qa)).status, 200);
   assert.equal((await call("GET", `/pcr/${pcr}`, null, tok.qa)).body.status, "finalized");
   assert.equal((await call("POST", `/pcr/${pcr}/reopen`, { assignToUserId: ctx.emt.user_id, note: "too late now" }, tok.qa)).status, 409);
@@ -268,6 +330,49 @@ test("charts belong to the unit's clinical crew: MVOs and office staff never get
   const mvoStats = (await call("GET", "/me/stats", null, tok.mvo)).body;
   assert.deepEqual([mvoStats.assigned, mvoStats.completed, mvoStats.pending, mvoStats.canChart], [1, 0, 0, false], "an MVO has calls but never charts");
   assert.ok((await q("SELECT count(*) AS n FROM audit_log WHERE action = 'view' AND table_name = 'patient_care_records' AND record_id = $1", [pcr]))[0].n >= 2, "every chart open is audited");
+});
+
+test("shift check: a unit with a crew owes a check; the system records it when the crew does it, and can't see it any other way", async () => {
+  const a = await tokenFor("boss@a.test"), emt = await tokenFor("emt@a.test");
+  const row = async (n) => (await call("GET", "/unit-checks/status", null, a)).body.find((u) => u.unit_designation === n);
+  const idle = await row("Rig 9");
+  assert.equal(idle.check_due, false, "no crew on it, so nothing is owed");
+  const medic1 = await row("Medic 1");
+  assert.equal(medic1.crew_count > 0, true);
+  const items = (await call("GET", `/checklist?unitId=${ctx.als.unit_id}`, null, emt)).body.map((i) => ({ itemId: i.item_id, ok: true }));
+  await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items }, emt);
+  assert.equal((await row("Medic 1")).check_due, false, "done for this crew");
+  await admin.query("UPDATE unit_checks SET performed_at = now() - interval '14 hours' WHERE unit_id = $1", [ctx.als.unit_id]);
+  assert.equal((await row("Medic 1")).check_due, true, "a check from 14 hours ago doesn't cover a new shift");
+});
+
+test("saved places: a supervisor keeps the list, anyone searches it, and a call can point at one as its destination (which the chart then starts from)", async () => {
+  const a = await tokenFor("boss@a.test"), b = await tokenFor("boss@b.test");
+  await call("POST", `/incidents/${ctx.chartIncident}/complete`, {}, a);   // frees Medic 1 from the earlier call
+  assert.equal((await call("POST", "/facilities", { name: "x", facilityType: "hospital", address: "1 St" }, a)).status, 400);
+  const made = await call("POST", "/facilities", { name: "BronxCare Hospital Center", facilityType: "hospital", address: "1650 Grand Concourse, Bronx", lat: 40.8396, lon: -73.9115, accessNotes: "Use the ED ambulance bay" }, a);
+  assert.equal(made.status, 201);
+  assert.equal((await call("POST", "/facilities", { name: "bronxcare hospital center", facilityType: "hospital", address: "dup address" }, a)).status, 409, "no duplicates");
+  assert.equal((await call("POST", "/facilities", { name: "Anywhere", facilityType: "hospital", address: "1 St", lat: 1, lon: 1 }, ctx.dispTok)).status, 403, "dispatchers search, supervisors edit");
+  const found = (await call("GET", "/facilities?q=bronx", null, ctx.dispTok)).body;
+  assert.equal(found[0].name, "BronxCare Hospital Center");
+  assert.equal(found[0].lat, 40.8396);
+  assert.equal((await call("GET", "/facilities?q=bronx", null, b)).body.length, 0, "another company can't see it");
+
+  const call1 = await call("POST", "/incidents", { incidentType: "ift_on_demand", priority: "urgent", sceneAddress: "Somewhere Nursing Home", destinationText: "BronxCare Hospital Center", destinationFacilityId: made.body.facility_id, destLat: 40.8396, destLon: -73.9115 }, a);
+  assert.equal(call1.status, 201);
+  assert.equal(call1.body.destination_facility_id, made.body.facility_id);
+  assert.equal((await call("PATCH", `/incidents/${call1.body.incident_id}`, { destinationFacilityId: null }, a)).body.destination_facility_id, null, "it can be cleared");
+  await call("PATCH", `/incidents/${call1.body.incident_id}`, { destinationFacilityId: made.body.facility_id }, a);
+  // the crew's chart starts from what dispatch knows
+  await call("POST", `/incidents/${call1.body.incident_id}/assignments`, { unitId: ctx.als.unit_id, role: "primary" }, a);
+  await call("PATCH", `/units/${ctx.als.unit_id}/status`, { status: "on_scene" }, a);
+  const emt = await tokenFor("emt@a.test");
+  const chart = (await call("POST", "/pcr", { incidentId: call1.body.incident_id }, emt)).body;
+  const open = (await call("GET", `/pcr/${chart.pcr_id}`, null, emt)).body;
+  assert.equal(open.call.destination_facility_name, "BronxCare Hospital Center");
+  assert.ok(open.times.dispatchedAt && open.times.onSceneAt, "dispatch and on-scene times come from the status history");
+  assert.equal(open.times.leftSceneAt, null);
 });
 
 test("unit checks: the checklist is the agency's own, a shift check needs every line answered, a failure needs a note and flags the unit", async () => {

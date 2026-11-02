@@ -122,6 +122,7 @@ function incidentProblem(b, partial) {
   if (!partial || has("priority")) if (!PRIORITIES.includes(b.priority)) return `Priority must be one of: ${PRIORITIES.join(", ")}`;
   if (has("capabilityNeeded") && !LEVELS.includes(b.capabilityNeeded)) return "Level of care must be BLS, ALS or CCT";
   if (!partial || has("sceneAddress")) if (!text(b.sceneAddress) || text(b.sceneAddress).length < 3) return "Enter the pickup address or facility";
+  if (b.destinationFacilityId != null && !/^[0-9a-f-]{36}$/i.test(String(b.destinationFacilityId))) return "Pick a destination from the list";
   for (const [lat, lon] of [[b.lat, b.lon], [b.destLat, b.destLon]]) {
     if ((lat != null || lon != null) && !coord(lat, lon)) return "Map coordinates are not valid";
   }
@@ -158,17 +159,17 @@ router.post("/incidents", async (req, res) => {
     return client.query(
       `INSERT INTO incidents (tenant_id, incident_type, priority, protocol_set_id, scene_address, scene_location,
                               capability_needed, scene_detail, destination_text, destination_location,
-                              contact_name, contact_phone, patient_name, notes)
+                              contact_name, contact_phone, patient_name, notes, destination_facility_id)
        VALUES ($1, $2, $3, $4, $5,
                CASE WHEN $6::double precision IS NULL THEN NULL ELSE ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography END,
                $8, $9, $10,
                CASE WHEN $11::double precision IS NULL THEN NULL ELSE ST_SetSRID(ST_MakePoint($11, $12), 4326)::geography END,
-               $13, $14, $15, $16)
+               $13, $14, $15, $16, (SELECT facility_id FROM facilities WHERE facility_id = $17))
        RETURNING *, $7::double precision AS lat, $6::double precision AS lon`,
       [req.user.tenantId, b.incidentType, b.priority, active.rows[0].protocol_set_id, text(b.sceneAddress),
        lon ?? null, lat ?? null,
        b.capabilityNeeded || "BLS", text(b.sceneDetail), text(b.destinationText), destLon ?? null, destLat ?? null,
-       text(b.contactName, 200), text(b.contactPhone, 50), text(b.patientName, 200), text(b.notes, 2000)]
+       text(b.contactName, 200), text(b.contactPhone, 50), text(b.patientName, 200), text(b.notes, 2000), b.destinationFacilityId || null]
     );
   });
   if (!result) {
@@ -212,6 +213,10 @@ router.patch("/incidents/:id", async (req, res) => {
   if (has("contactPhone")) add("contact_phone", text(b.contactPhone, 50));
   if (has("patientName")) add("patient_name", text(b.patientName, 200));
   if (has("notes")) add("notes", text(b.notes, 2000));
+  if (has("destinationFacilityId")) {
+    if (b.destinationFacilityId === null) sets.push("destination_facility_id = NULL");
+    else { vals.push(b.destinationFacilityId); sets.push(`destination_facility_id = (SELECT facility_id FROM facilities WHERE facility_id = $${vals.length})`); }
+  }
   if (loc.scene) point("scene_location", loc.scene);
   if (loc.dest) point("destination_location", loc.dest);
   if (!sets.length) return res.status(400).json({ error: "Nothing to change" });

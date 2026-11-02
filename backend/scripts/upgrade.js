@@ -395,6 +395,20 @@ BEGIN
     RETURN TRUE;
 END $$;
 
+
+-- ---- Saved places (hospitals, nursing homes, dialysis...) ------------------------
+ALTER TABLE facilities ADD COLUMN IF NOT EXISTS phone TEXT;
+ALTER TABLE facilities ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+CREATE UNIQUE INDEX IF NOT EXISTS facilities_name_unique ON facilities (tenant_id, lower(name)) WHERE is_active;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS destination_facility_id UUID REFERENCES facilities(facility_id);
+
+-- Is this email already someone's login (a company user OR a platform admin)?
+CREATE OR REPLACE FUNCTION email_in_use(p_email TEXT, p_exclude UUID) RETURNS BOOLEAN
+LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+    SELECT EXISTS (SELECT 1 FROM users WHERE lower(email) = lower(p_email) AND (p_exclude IS NULL OR user_id <> p_exclude))
+        OR EXISTS (SELECT 1 FROM platform_admins WHERE lower(email) = lower(p_email))
+$$;
+
 -- ---- Row-level security and grants for the new tables ---------------------------
 DO $$
 DECLARE t TEXT;
@@ -416,7 +430,7 @@ BEGIN
         'platform_find_admin(text)', 'platform_get_admin(uuid)', 'platform_record_login(uuid,boolean)',
         'platform_save_mfa(uuid,text,boolean,bigint,text[])', 'platform_list_tenants()', 'platform_list_users(uuid)',
         'platform_create_tenant(text,text,text,text,text,text,uuid)', 'platform_set_tenant_active(uuid,boolean,uuid)',
-        'platform_user_action(uuid,uuid,text,boolean,boolean)'
+        'platform_user_action(uuid,uuid,text,boolean,boolean)', 'email_in_use(text,uuid)'
     ] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ems_app_runtime') THEN

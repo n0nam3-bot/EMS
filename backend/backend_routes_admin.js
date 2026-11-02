@@ -19,6 +19,9 @@ const router = express.Router();
 router.use(requireAuth);
 
 const ADMIN = requireRole("supervisor", "it_admin");
+// Putting people on units is the dispatchers' job too.
+const STAFFING = requireRole("supervisor", "it_admin", "dispatcher");
+const MAX_CREW = 3;
 const ROLES = ["dispatcher", "crew", "supervisor", "qa_qi", "compliance_officer", "biller", "it_admin", "read_only_auditor"];
 const FIELD_LEVELS = ["mvo", "emt", "aemt", "paramedic"];
 // A person can hold several roles. One is stored as their main role (shown first),
@@ -74,19 +77,52 @@ router.get("/geocode", handle(async (req, res) => {
 }));
 
 // ---- People ---------------------------------------------------------------
+// Staff lists get long. Search, filter and page on the server, and say how many there are in
+// total in the X-Total-Count header (the body stays a plain array).
 router.get("/users", ADMIN, handle(async (req, res) => {
+  const q = String(req.query.q ?? "").trim();
+  const kind = ["field", "office"].includes(req.query.kind) ? req.query.kind : null;
+  const status = ["active", "inactive"].includes(req.query.status) ? req.query.status : null;
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  const where = [], vals = [];
+  if (q) { vals.push(`%${q.replace(/[%_\\]/g, "\\$&")}%`); where.push(`(u.display_name ILIKE $${vals.length} OR u.email ILIKE $${vals.length} OR cm.employee_number ILIKE $${vals.length})`); }
+  if (kind === "field") where.push("cm.field_level IS NOT NULL");
+  if (kind === "office") where.push("(u.role::text <> 'crew' OR EXISTS (SELECT 1 FROM unnest(u.extra_roles) r WHERE r::text <> 'crew'))");
+  if (status) where.push(status === "active" ? "u.is_active" : "NOT u.is_active");
+  const W = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const out = await withTenant(req.user.tenantId, async (c) => {
+    const total = Number((await c.query(`SELECT count(*) AS n FROM users u LEFT JOIN crew_members cm ON cm.user_id = u.user_id ${W}`, vals)).rows[0].n);
+    const rows = (await c.query(
+      `SELECT u.user_id, u.email, u.display_name, u.role, u.extra_roles::text[] AS extra_roles, u.is_active, (u.mfa_enabled_at IS NOT NULL) AS mfa_enabled,
+              cm.crew_member_id, cm.employee_number, cm.field_level,
+              uca.unit_id, v.unit_designation, uca.seat_role
+       FROM users u
+       LEFT JOIN crew_members cm ON cm.user_id = u.user_id
+       LEFT JOIN unit_crew_assignments uca ON uca.crew_member_id = cm.crew_member_id AND uca.assigned_to IS NULL
+       LEFT JOIN units un ON un.unit_id = uca.unit_id
+       LEFT JOIN vehicles v ON v.vehicle_id = un.vehicle_id
+       ${W} ORDER BY u.display_name, u.user_id LIMIT ${limit} OFFSET ${offset}`, vals)).rows;
+    return { rows, total };
+  });
+  res.set("X-Total-Count", String(out.total)).json(out.rows.map((r) => ({ ...r, roles: [r.role, ...r.extra_roles] })));
+}));
+
+// The people dispatchers can put on a unit: active field staff, with who they're already on.
+router.get("/ops/roster", STAFFING, handle(async (req, res) => {
+  const q = String(req.query.q ?? "").trim();
+  const onlyFree = req.query.unassigned === "1";
+  const vals = [];
+  let extra = "";
+  if (q) { vals.push(`%${q.replace(/[%_\\]/g, "\\$&")}%`); extra += ` AND (cm.first_name || ' ' || cm.last_name ILIKE $${vals.length} OR cm.employee_number ILIKE $${vals.length})`; }
+  if (onlyFree) extra += " AND uca.unit_id IS NULL";
   const rows = await withTenant(req.user.tenantId, async (c) => (await c.query(
-    `SELECT u.user_id, u.email, u.display_name, u.role, u.extra_roles::text[] AS extra_roles, u.is_active, (u.mfa_enabled_at IS NOT NULL) AS mfa_enabled,
-            cm.crew_member_id, cm.employee_number, cm.field_level,
-            uca.unit_id, v.unit_designation, uca.seat_role
-     FROM users u
-     LEFT JOIN crew_members cm ON cm.user_id = u.user_id
+    `SELECT cm.crew_member_id, cm.user_id, cm.first_name || ' ' || cm.last_name AS name, cm.employee_number, cm.field_level, uca.unit_id, uca.seat_role
+     FROM crew_members cm JOIN users u ON u.user_id = cm.user_id AND u.is_active
      LEFT JOIN unit_crew_assignments uca ON uca.crew_member_id = cm.crew_member_id AND uca.assigned_to IS NULL
-     LEFT JOIN units un ON un.unit_id = uca.unit_id
-     LEFT JOIN vehicles v ON v.vehicle_id = un.vehicle_id
-     ORDER BY u.display_name`
-  )).rows);
-  res.json(rows.map((r) => ({ ...r, roles: [r.role, ...r.extra_roles] })));
+     WHERE cm.is_active AND cm.field_level IS NOT NULL ${extra}
+     ORDER BY cm.last_name, cm.first_name LIMIT 300`, vals)).rows);
+  res.json(rows);
 }));
 
 router.post("/users", ADMIN, handle(async (req, res) => {
@@ -102,8 +138,8 @@ router.post("/users", ADMIN, handle(async (req, res) => {
   const hash = await hashPassword(password);
   try {
     const created = await withTenant(req.user.tenantId, async (c) => {
-      const clash = await c.query("SELECT 1 FROM users WHERE lower(email) = $1", [cleanEmail]);
-      if (clash.rows.length) fail(409, "That email is already used by an account");
+      const taken = (await c.query("SELECT email_in_use($1, NULL) AS used", [cleanEmail])).rows[0].used;
+      if (taken) fail(409, "That email is already used by an account");
       const u = (await c.query(
         `INSERT INTO users (tenant_id, email, display_name, role, extra_roles, password_hash)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING user_id, email, display_name, role, extra_roles::text[] AS extra_roles, is_active`,
@@ -146,6 +182,13 @@ router.patch("/users/:id", ADMIN, handle(async (req, res) => {
     const sets = [], vals = [];
     const add = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
     if (b.displayName !== undefined) { if (String(b.displayName).trim().length < 2) fail(400, "Enter the person's full name"); add("display_name", String(b.displayName).trim()); }
+    if (b.email !== undefined) {
+      const email = String(b.email).trim().toLowerCase();
+      if (!EMAIL_RE.test(email)) fail(400, "Enter a valid email address");
+      const taken = (await c.query("SELECT email_in_use($1, $2) AS used", [email, req.params.id])).rows[0].used;
+      if (taken) fail(409, "That email is already used by another account");
+      add("email", email);
+    }
     let newLevel;
     if (touchesRoles) {
       const r = readRoles(b, { current: { roles: [cur.role, ...cur.extra_roles], fieldLevel: cur.field_level } });
@@ -213,11 +256,11 @@ router.post("/units", ADMIN, handle(async (req, res) => {
 // A unit goes into service when it has a crew, and an ALS or CCT unit also needs a
 // paramedic on it. It goes back out of service when that stops being true, unless
 // it's in the middle of a call.
-router.put("/crew/:crewMemberId/unit", ADMIN, handle(async (req, res) => {
+router.put("/crew/:crewMemberId/unit", STAFFING, handle(async (req, res) => {
   const { unitId, seatRole } = req.body || {};
   if (!UUID_RE.test(req.params.crewMemberId)) fail(400, "Bad crew member id");
   if (unitId !== null && !UUID_RE.test(String(unitId))) fail(400, "Pick a unit");
-  const seat = seatRole === "driver" ? "driver" : "non_driver";
+  let seat = seatRole === "driver" ? "driver" : "non_driver";
   let warning = null;
 
   await withTenant(req.user.tenantId, async (c) => {
@@ -232,6 +275,7 @@ router.put("/crew/:crewMemberId/unit", ADMIN, handle(async (req, res) => {
 
     if (unitId) {
       if (!cm.field_level) fail(409, `${who} doesn't work in the field. Give them a field level (MVO, EMT, AEMT or Paramedic) first.`);
+      if (cm.field_level === "mvo") seat = "driver";                       // an MVO always drives
       const unit = (await c.query(
         `SELECT un.unit_id, v.capability_level, v.unit_designation
          FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1`, [unitId]
@@ -245,6 +289,8 @@ router.put("/crew/:crewMemberId/unit", ADMIN, handle(async (req, res) => {
         );
         if (!cert.rows.length) fail(409, `${who} is a paramedic with no current ALS-level certification, so can't be put on ${unit.unit_designation}. Add their certification first.`);
       }
+      const size = Number((await c.query("SELECT count(*) AS n FROM unit_crew_assignments WHERE unit_id = $1 AND assigned_to IS NULL", [unitId])).rows[0].n);
+      if (size >= MAX_CREW) fail(409, `${unit.unit_designation} already has ${MAX_CREW} crew. Take someone off first.`);
       if (seat === "driver") {
         const d = (await c.query(
           `SELECT cm.first_name, cm.last_name FROM unit_crew_assignments uca JOIN crew_members cm ON cm.crew_member_id = uca.crew_member_id
@@ -265,20 +311,53 @@ router.put("/crew/:crewMemberId/unit", ADMIN, handle(async (req, res) => {
   res.json({ ok: true, ...(warning ? { warning } : {}) });
 }));
 
+// Change just the seat (driver / non-driver) of someone already on a unit.
+router.patch("/crew/:crewMemberId/seat", STAFFING, handle(async (req, res) => {
+  if (!UUID_RE.test(req.params.crewMemberId)) fail(400, "Bad crew member id");
+  const seat = req.body?.seatRole === "driver" ? "driver" : req.body?.seatRole === "non_driver" ? "non_driver" : null;
+  if (!seat) fail(400, "Seat must be driver or non_driver");
+  let warning = null;
+  await withTenant(req.user.tenantId, async (c) => {
+    const row = (await c.query(
+      `SELECT uca.assignment_id, uca.unit_id, uca.seat_role, cm.field_level, cm.first_name, cm.last_name
+       FROM unit_crew_assignments uca JOIN crew_members cm ON cm.crew_member_id = uca.crew_member_id
+       WHERE uca.crew_member_id = $1 AND uca.assigned_to IS NULL`, [req.params.crewMemberId])).rows[0];
+    if (!row) fail(404, "That person isn't on a unit");
+    if (row.field_level === "mvo" && seat !== "driver") fail(409, "An MVO always drives.");
+    if (seat === "driver") {
+      const d = (await c.query(
+        `SELECT cm.first_name, cm.last_name FROM unit_crew_assignments uca JOIN crew_members cm ON cm.crew_member_id = uca.crew_member_id
+         WHERE uca.unit_id = $1 AND uca.seat_role = 'driver' AND uca.assigned_to IS NULL AND uca.crew_member_id <> $2`, [row.unit_id, req.params.crewMemberId])).rows[0];
+      if (d) fail(409, `That unit already has a driver (${d.first_name} ${d.last_name}). Make them non-driver first.`);
+    }
+    await c.query("UPDATE unit_crew_assignments SET seat_role = $1 WHERE assignment_id = $2", [seat, row.assignment_id]);
+    warning = await reconcileUnit(c, req.user.tenantId, row.unit_id);
+  });
+  res.json({ ok: true, ...(warning ? { warning } : {}) });
+}));
+
 // Decides whether an idle unit should be in or out of service from who is on it.
+// A unit can take calls when it has a driver, someone who can treat (EMT or above), and, if it's
+// an ALS or CCT unit, a paramedic. (A mid-call unit is left alone.)
 async function reconcileUnit(c, tenantId, unitId) {
   const u = (await c.query(
     `SELECT un.current_status, v.capability_level, v.unit_designation FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1`, [unitId])).rows[0];
   if (!u || !["available", "out_of_service"].includes(u.current_status)) return null;   // mid-call: leave it alone
   const crew = (await c.query(
-    `SELECT count(*) AS n, count(*) FILTER (WHERE cm.field_level = 'paramedic') AS medics
+    `SELECT count(*) AS n,
+            count(*) FILTER (WHERE uca.seat_role = 'driver') AS drivers,
+            count(*) FILTER (WHERE cm.field_level IN ('emt', 'aemt', 'paramedic')) AS clinical,
+            count(*) FILTER (WHERE cm.field_level = 'paramedic') AS medics
      FROM unit_crew_assignments uca JOIN crew_members cm ON cm.crew_member_id = uca.crew_member_id
      WHERE uca.unit_id = $1 AND uca.assigned_to IS NULL`, [unitId])).rows[0];
-  const needsMedic = u.capability_level !== "BLS";
-  const ready = Number(crew.n) > 0 && (!needsMedic || Number(crew.medics) > 0);
+  const missing = [];
+  if (Number(crew.drivers) === 0) missing.push("a driver");
+  if (Number(crew.clinical) === 0) missing.push("an EMT or above");
+  if (u.capability_level !== "BLS" && Number(crew.medics) === 0) missing.push("a paramedic");
+  const ready = Number(crew.n) > 0 && missing.length === 0;
   const want = ready ? "available" : "out_of_service";
   if (want !== u.current_status) await setStatus(c, tenantId, unitId, want);
-  return Number(crew.n) > 0 && !ready ? `${u.unit_designation} stays out of service until a paramedic is on it.` : null;
+  return Number(crew.n) > 0 && !ready ? `${u.unit_designation} stays out of service until it has ${missing.join(" and ")}.` : null;
 }
 
 async function setStatus(c, tenantId, unitId, status) {
