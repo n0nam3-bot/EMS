@@ -28,6 +28,8 @@ import platformRoutes from "./backend_routes_platform.js";
 import qaRoutes from "./backend_routes_qa.js";
 import inspectionRoutes from "./backend_routes_inspections.js";
 import facilityRoutes from "./backend_routes_facilities.js";
+import scheduleRoutes from "./backend_routes_schedule.js";
+import reportRoutes from "./backend_routes_reports.js";
 import incidentRoutes from "./backend_routes_example.js";
 import locationRoutes from "./backend_routes_location.js";
 import unitRoutes from "./backend_routes_units.js";
@@ -91,7 +93,7 @@ if (!ON_VERCEL) {
 }
 
 // Before the routers: they require a login, health must not.
-app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok", build: 7, jwtKey: publicKeyStatus(), sessionSecret: sessionSecretStatus() }));
+app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok", build: 8, jwtKey: publicKeyStatus(), sessionSecret: sessionSecretStatus() }));
 
 // Sign-in first: every router below demands a session, login is the one thing that can't.
 app.use("/api", authRoutes);
@@ -101,6 +103,8 @@ app.use("/api", adminRoutes);
 app.use("/api", qaRoutes);
 app.use("/api", inspectionRoutes);
 app.use("/api", facilityRoutes);
+app.use("/api", scheduleRoutes);
+app.use("/api", reportRoutes);
 app.use("/api", locationRoutes);
 app.use("/api", unitRoutes);
 app.use("/api", complianceRoutes);

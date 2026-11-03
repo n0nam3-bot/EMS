@@ -9,6 +9,8 @@ export async function apiRequest(session, method, path, body) {
   if (!res.ok) {
     const err = new Error(data?.error || `Request failed (HTTP ${res.status})`);
     err.status = res.status;
+    err.conflict = data?.conflict;       // e.g. which existing shift a new one overlaps
+    err.missing = data?.missing;
     throw err;
   }
   return data;

@@ -116,10 +116,14 @@ router.get("/ops/roster", STAFFING, handle(async (req, res) => {
   let extra = "";
   if (q) { vals.push(`%${q.replace(/[%_\\]/g, "\\$&")}%`); extra += ` AND (cm.first_name || ' ' || cm.last_name ILIKE $${vals.length} OR cm.employee_number ILIKE $${vals.length})`; }
   if (onlyFree) extra += " AND uca.unit_id IS NULL";
+  if (req.query.onDuty === "1") extra += " AND sh.shift_id IS NOT NULL";
   const rows = await withTenant(req.user.tenantId, async (c) => (await c.query(
-    `SELECT cm.crew_member_id, cm.user_id, cm.first_name || ' ' || cm.last_name AS name, cm.employee_number, cm.field_level, uca.unit_id, uca.seat_role
+    `SELECT cm.crew_member_id, cm.user_id, cm.first_name || ' ' || cm.last_name AS name, cm.employee_number, cm.field_level, uca.unit_id, uca.seat_role,
+            (sh.shift_id IS NOT NULL) AS on_duty, sh.unit_id AS shift_unit_id, sv.unit_designation AS shift_unit, sh.ends_at AS shift_ends_at
      FROM crew_members cm JOIN users u ON u.user_id = cm.user_id AND u.is_active
      LEFT JOIN unit_crew_assignments uca ON uca.crew_member_id = cm.crew_member_id AND uca.assigned_to IS NULL
+     LEFT JOIN LATERAL (SELECT * FROM shifts s WHERE s.crew_member_id = cm.crew_member_id AND s.starts_at <= now() AND s.ends_at > now() ORDER BY s.starts_at LIMIT 1) sh ON TRUE
+     LEFT JOIN units su ON su.unit_id = sh.unit_id LEFT JOIN vehicles sv ON sv.vehicle_id = su.vehicle_id
      WHERE cm.is_active AND cm.field_level IS NOT NULL ${extra}
      ORDER BY cm.last_name, cm.first_name LIMIT 300`, vals)).rows);
   res.json(rows);
@@ -260,56 +264,62 @@ router.put("/crew/:crewMemberId/unit", STAFFING, handle(async (req, res) => {
   const { unitId, seatRole } = req.body || {};
   if (!UUID_RE.test(req.params.crewMemberId)) fail(400, "Bad crew member id");
   if (unitId !== null && !UUID_RE.test(String(unitId))) fail(400, "Pick a unit");
-  let seat = seatRole === "driver" ? "driver" : "non_driver";
-  let warning = null;
-
-  await withTenant(req.user.tenantId, async (c) => {
-    const cm = (await c.query("SELECT first_name, last_name, field_level FROM crew_members WHERE crew_member_id = $1 AND is_active", [req.params.crewMemberId])).rows[0];
-    if (!cm) fail(404, "Person not found, or deactivated");
-    const who = `${cm.first_name} ${cm.last_name}`.trim();
-
-    const freed = (await c.query(
-      "UPDATE unit_crew_assignments SET assigned_to = now() WHERE crew_member_id = $1 AND assigned_to IS NULL RETURNING unit_id",
-      [req.params.crewMemberId]
-    )).rows.map((r) => r.unit_id);
-
-    if (unitId) {
-      if (!cm.field_level) fail(409, `${who} doesn't work in the field. Give them a field level (MVO, EMT, AEMT or Paramedic) first.`);
-      if (cm.field_level === "mvo") seat = "driver";                       // an MVO always drives
-      const unit = (await c.query(
-        `SELECT un.unit_id, v.capability_level, v.unit_designation
-         FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1`, [unitId]
-      )).rows[0];
-      if (!unit) fail(404, "Unit not found");
-      if (unit.capability_level === "ALS" && cm.field_level === "paramedic") {
-        const cert = await c.query(
-          `SELECT 1 FROM certifications ce JOIN certification_types ct ON ct.certification_type_id = ce.certification_type_id
-           WHERE ce.crew_member_id = $1 AND ct.required_for_capability = 'ALS' AND ce.expires_on >= CURRENT_DATE`,
-          [req.params.crewMemberId]
-        );
-        if (!cert.rows.length) fail(409, `${who} is a paramedic with no current ALS-level certification, so can't be put on ${unit.unit_designation}. Add their certification first.`);
-      }
-      const size = Number((await c.query("SELECT count(*) AS n FROM unit_crew_assignments WHERE unit_id = $1 AND assigned_to IS NULL", [unitId])).rows[0].n);
-      if (size >= MAX_CREW) fail(409, `${unit.unit_designation} already has ${MAX_CREW} crew. Take someone off first.`);
-      if (seat === "driver") {
-        const d = (await c.query(
-          `SELECT cm.first_name, cm.last_name FROM unit_crew_assignments uca JOIN crew_members cm ON cm.crew_member_id = uca.crew_member_id
-           WHERE uca.unit_id = $1 AND uca.seat_role = 'driver' AND uca.assigned_to IS NULL`, [unitId]
-        )).rows[0];
-        if (d) fail(409, `${unit.unit_designation} already has a driver (${d.first_name} ${d.last_name}). Move them first.`);
-      }
-      await c.query(
-        "INSERT INTO unit_crew_assignments (tenant_id, unit_id, crew_member_id, seat_role) VALUES ($1, $2, $3, $4)",
-        [req.user.tenantId, unitId, req.params.crewMemberId, seat]
-      );
-    }
-    for (const id of new Set([...freed, ...(unitId ? [unitId] : [])])) {
-      const w = await reconcileUnit(c, req.user.tenantId, id);
-      if (w && id === unitId) warning = w;
-    }
-  });
+  const warning = await withTenant(req.user.tenantId, (c) => placeCrewMember(c, req.user.tenantId, req.params.crewMemberId, unitId, seatRole));
   res.json({ ok: true, ...(warning ? { warning } : {}) });
 }));
+
+// Puts one person on one unit (or takes them off with unitId null), enforcing every crewing rule, inside
+// the caller's transaction. Used by the OPS board and by "crew units as scheduled". Throws an HttpError
+// with plain words when a rule is broken; returns a warning string when it worked but the unit still can't
+// go in service.
+export async function placeCrewMember(c, tenantId, crewMemberId, unitId, seatRole) {
+  let seat = seatRole === "driver" ? "driver" : "non_driver";
+  let warning = null;
+  const cm = (await c.query("SELECT first_name, last_name, field_level FROM crew_members WHERE crew_member_id = $1 AND is_active", [crewMemberId])).rows[0];
+  if (!cm) fail(404, "Person not found, or deactivated");
+  const who = `${cm.first_name} ${cm.last_name}`.trim();
+
+  const freed = (await c.query(
+    "UPDATE unit_crew_assignments SET assigned_to = now() WHERE crew_member_id = $1 AND assigned_to IS NULL RETURNING unit_id",
+    [crewMemberId]
+  )).rows.map((r) => r.unit_id);
+
+  if (unitId) {
+    if (!cm.field_level) fail(409, `${who} doesn't work in the field. Give them a field level (MVO, EMT, AEMT or Paramedic) first.`);
+    if (cm.field_level === "mvo") seat = "driver";                       // an MVO always drives
+    const unit = (await c.query(
+      `SELECT un.unit_id, v.capability_level, v.unit_designation
+       FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1`, [unitId]
+    )).rows[0];
+    if (!unit) fail(404, "Unit not found");
+    if (unit.capability_level === "ALS" && cm.field_level === "paramedic") {
+      const cert = await c.query(
+        `SELECT 1 FROM certifications ce JOIN certification_types ct ON ct.certification_type_id = ce.certification_type_id
+         WHERE ce.crew_member_id = $1 AND ct.required_for_capability = 'ALS' AND ce.expires_on >= CURRENT_DATE`,
+        [crewMemberId]
+      );
+      if (!cert.rows.length) fail(409, `${who} is a paramedic with no current ALS-level certification, so can't be put on ${unit.unit_designation}. Add their certification first.`);
+    }
+    const size = Number((await c.query("SELECT count(*) AS n FROM unit_crew_assignments WHERE unit_id = $1 AND assigned_to IS NULL", [unitId])).rows[0].n);
+    if (size >= MAX_CREW) fail(409, `${unit.unit_designation} already has ${MAX_CREW} crew. Take someone off first.`);
+    if (seat === "driver") {
+      const d = (await c.query(
+        `SELECT cm.first_name, cm.last_name FROM unit_crew_assignments uca JOIN crew_members cm ON cm.crew_member_id = uca.crew_member_id
+         WHERE uca.unit_id = $1 AND uca.seat_role = 'driver' AND uca.assigned_to IS NULL`, [unitId]
+      )).rows[0];
+      if (d) fail(409, `${unit.unit_designation} already has a driver (${d.first_name} ${d.last_name}). Move them first.`);
+    }
+    await c.query(
+      "INSERT INTO unit_crew_assignments (tenant_id, unit_id, crew_member_id, seat_role) VALUES ($1, $2, $3, $4)",
+      [tenantId, unitId, crewMemberId, seat]
+    );
+  }
+  for (const id of new Set([...freed, ...(unitId ? [unitId] : [])])) {
+    const w = await reconcileUnit(c, tenantId, id);
+    if (w && id === unitId) warning = w;
+  }
+  return warning;
+}
 
 // Change just the seat (driver / non-driver) of someone already on a unit.
 router.patch("/crew/:crewMemberId/seat", STAFFING, handle(async (req, res) => {

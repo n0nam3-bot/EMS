@@ -8,6 +8,8 @@ import TeamConsole from "./consoles/team_console.jsx";
 import QaConsole from "./consoles/qa_console.jsx";
 import PlatformConsole from "./consoles/platform_console.jsx";
 import OpsConsole from "./consoles/ops_console.jsx";
+import ScheduleConsole from "./consoles/schedule_console.jsx";
+import ReportsConsole from "./consoles/reports_console.jsx";
 import { CallDraftTray } from "./consoles/call_form.jsx";
 import { apiRequest } from "./api.js";
 
@@ -17,26 +19,28 @@ const SESSION_KEY = "ems:session";
 const VIEWS = {
   dispatch: { label: "Dispatch", Component: DispatchConsole },
   ops: { label: "OPS", Component: OpsConsole },
+  schedule: { label: "Schedule", Component: ScheduleConsole },
   field: { label: "Field Unit", Component: FieldUnitConsole },
   epcr: { label: "ePCR", Component: EpcrCharting },
   qa: { label: "QA/QI", Component: QaConsole },
+  reports: { label: "Reports", Component: ReportsConsole },
   compliance: { label: "Compliance", Component: ComplianceConsole },
   team: { label: "Team", Component: TeamConsole },
   platform: { label: "Platform", Component: PlatformConsole },
 };
 const DEMO_VIEWS = ["dispatch", "field", "epcr", "compliance"];
-const VIEW_ORDER = ["dispatch", "ops", "field", "epcr", "qa", "compliance", "team", "platform"];
+const VIEW_ORDER = ["dispatch", "ops", "schedule", "field", "epcr", "qa", "reports", "compliance", "team", "platform"];
 // Which screens each role is shown. This tidies the menu; what a role may
 // actually DO is enforced by the server, not here. A person with several
 // roles gets every screen any of them gets.
 const ROLE_VIEWS = {
-  dispatcher: ["dispatch", "ops"],
-  supervisor: ["dispatch", "ops", "compliance", "team"],
-  it_admin: ["ops", "team"],
+  dispatcher: ["dispatch", "ops", "schedule"],
+  supervisor: ["dispatch", "ops", "schedule", "reports", "compliance", "team"],
+  it_admin: ["ops", "schedule", "reports", "team"],
   qa_qi: ["qa"],
-  compliance_officer: ["compliance"],
+  compliance_officer: ["reports", "compliance"],
   biller: ["compliance"],
-  read_only_auditor: ["compliance"],
+  read_only_auditor: ["reports", "compliance"],
   crew: ["field"],
 };
 const CLINICAL = ["emt", "aemt", "paramedic"];

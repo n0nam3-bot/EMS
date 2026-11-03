@@ -40,6 +40,8 @@ export default function OpsConsole({ session }) {
   const [unitQ, setUnitQ] = useState("");
   const [onlyAttention, setOnlyAttention] = useState(false);
   const [picked, setPicked] = useState(null);       // a person chosen by tap, waiting for a unit
+  const [poolMode, setPoolMode] = useState(null);     // "duty" | "all" (null = on duty if the schedule has anyone on duty)
+  const [plan, setPlan] = useState(null);             // the preview of "crew units as scheduled"
   const [dragOver, setDragOver] = useState(null);
   const qRef = useRef(q); qRef.current = q;
 
@@ -86,7 +88,18 @@ export default function OpsConsole({ session }) {
   };
   const dropOnPool = (e) => { e.preventDefault(); setDragOver(null); const p = readDrop(e); if (p?.fromUnitId) remove(p.crewMemberId); };
 
-  const shownPool = pool.filter((p) => levelFilter === "all" || p.field_level === levelFilter);
+  const dutyCount = pool.filter((p) => p.on_duty).length;
+  const mode = poolMode ?? (dutyCount > 0 ? "duty" : "all");
+  const shownPool = pool.filter((p) => (levelFilter === "all" || p.field_level === levelFilter) && (mode === "all" || p.on_duty));
+  const showPlan = () => run(async () => { setPlan(await apiRequest(session, "POST", "/schedule/apply", { dryRun: true })); });
+  const applyPlan = async () => {
+    setError(""); setNotice("");
+    try {
+      const r = await apiRequest(session, "POST", "/schedule/apply", {});
+      setPlan(null); await load();
+      setNotice(`Crewed as scheduled: ${r.placed} placed, ${r.removed} taken off.${r.skipped.length ? ` ${r.skipped.length} couldn't be done: ${r.skipped.map((x) => `${x.name} (${x.reason})`).join("; ")}` : ""}`);
+    } catch (e) { setError(e.message); }
+  };
   const shownUnits = useMemo(() => (units || []).filter((u) => {
     if (unitQ && !u.unit_designation.toLowerCase().includes(unitQ.toLowerCase())) return false;
     if (onlyAttention) { const c = checks[u.unit_id]; if (!(u.current_status === "out_of_service" || c?.check_due || c?.last_check_result === "fail")) return false; }
@@ -102,12 +115,31 @@ export default function OpsConsole({ session }) {
           <div className="text-xs tracking-widest uppercase" style={{ color: TEXT_FAINT }}>{session.agency}</div>
           <div className="text-lg font-semibold">OPS: units and crews</div>
         </div>
-        <div className="text-xs" style={{ color: TEXT_SECONDARY }}>Drag a person onto a unit, or tap them and then tap the unit. Up to {MAX_CREW} per unit.</div>
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="text-xs" style={{ color: TEXT_SECONDARY }}>Drag a person onto a unit, or tap them and then tap the unit. Up to {MAX_CREW} per unit.</div>
+          <button onClick={showPlan} className="text-sm px-3 py-1.5 rounded" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>Crew units as scheduled</button>
+        </div>
       </div>
 
       <div className="p-4 flex flex-col gap-3">
         {error && <div className="text-sm px-3 py-2 rounded-md" style={{ color: RED, backgroundColor: "rgba(240,85,74,0.1)", border: "1px solid #593434" }}>{error}</div>}
         {notice && <div className="text-sm px-3 py-2 rounded-md" style={{ color: GREEN, backgroundColor: "rgba(52,211,153,0.08)", border: "1px solid #2E5943" }}>{notice}</div>}
+        {plan && (
+          <div className="rounded-lg border p-4 flex flex-col gap-2" style={{ backgroundColor: PANEL, borderColor: BLUE }}>
+            <div className="text-sm font-semibold">Crew units as scheduled</div>
+            {plan.remove.length === 0 && plan.place.length === 0 ? <div className="text-sm" style={{ color: TEXT_SECONDARY }}>Nothing to change: every unit with a shift running now already has its scheduled crew.</div> : (
+              <>
+                <div className="text-xs" style={{ color: TEXT_SECONDARY }}>Only units that have a shift running right now are touched.</div>
+                {plan.remove.map((r) => <div key={`r${r.crewMemberId}`} className="text-sm">Take <b>{r.name}</b> off {r.unit} <span className="text-xs" style={{ color: TEXT_FAINT }}>(not scheduled on it now)</span></div>)}
+                {plan.place.map((p) => <div key={`p${p.crewMemberId}`} className="text-sm">Put <b>{p.name}</b> on {p.unit} as {p.seat === "driver" ? "driver" : "non-driver"}</div>)}
+              </>
+            )}
+            <div className="flex gap-2">
+              {(plan.remove.length > 0 || plan.place.length > 0) && <button onClick={applyPlan} className="text-sm px-4 py-2 rounded" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN }}>Apply</button>}
+              <button onClick={() => setPlan(null)} className="text-sm px-4 py-2 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>{plan.remove.length || plan.place.length ? "Cancel" : "Close"}</button>
+            </div>
+          </div>
+        )}
         {picked && (
           <div className="text-sm px-3 py-2 rounded-md flex items-center justify-between gap-2" style={{ color: BLUE, backgroundColor: "rgba(78,161,240,0.1)", border: `1px solid ${BLUE}` }}>
             <span>Placing <b>{picked.name}</b> ({LEVEL[picked.field_level]}): tap a unit.</span>
@@ -121,6 +153,9 @@ export default function OpsConsole({ session }) {
             onDragOver={(e) => { e.preventDefault(); setDragOver("pool"); }} onDragLeave={() => setDragOver(null)} onDrop={dropOnPool}>
             <div className="px-3 py-2 border-b" style={{ borderColor: HAIRLINE }}>
               <div className="text-xs font-semibold tracking-wide" style={{ color: TEXT_SECONDARY }}>NOT ON A UNIT ({shownPool.length})</div>
+              <div className="flex gap-1 mt-2">
+                {[["duty", `On duty (${dutyCount})`], ["all", `Everyone (${pool.length})`]].map(([k, l]) => <button key={k} onClick={() => setPoolMode(k)} className="text-xs px-2 py-1 rounded-full" style={chip(mode === k)}>{l}</button>)}
+              </div>
               <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search name or employee #" className="w-full text-sm rounded px-2 py-1.5 mt-2" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }} />
               <div className="flex gap-1 flex-wrap mt-2">
                 {[["all", "All"], ["mvo", "MVO"], ["emt", "EMT"], ["aemt", "AEMT"], ["paramedic", "Medic"]].map(([k, l]) => <button key={k} onClick={() => setLevelFilter(k)} className="text-xs px-2 py-1 rounded-full" style={chip(levelFilter === k)}>{l}</button>)}
@@ -128,11 +163,11 @@ export default function OpsConsole({ session }) {
             </div>
             <div className="p-2 flex flex-col gap-1 overflow-y-auto" style={{ maxHeight: "60vh" }}>
               {units === null && !error && <div className="text-xs p-2" style={{ color: TEXT_FAINT }}>Loading…</div>}
-              {units && shownPool.length === 0 && <div className="text-xs p-2" style={{ color: TEXT_FAINT }}>{pool.length === 0 ? "Everyone is on a unit (or no field staff yet)." : "Nobody matches."}</div>}
+              {units && shownPool.length === 0 && <div className="text-xs p-2" style={{ color: TEXT_FAINT }}>{pool.length === 0 ? "Everyone is on a unit (or no field staff yet)." : mode === "duty" && dutyCount === 0 ? "Nobody scheduled right now." : "Nobody matches."}</div>}
               {shownPool.map((p) => (
                 <div key={p.crew_member_id} draggable onDragStart={(e) => onDragStart(e, p, null)} onClick={() => setPicked(picked?.crew_member_id === p.crew_member_id ? null : p)}
                   className="flex items-center justify-between gap-2 rounded-md px-2 py-2 cursor-grab" style={{ backgroundColor: picked?.crew_member_id === p.crew_member_id ? "rgba(78,161,240,0.15)" : SUNKEN, border: `1px solid ${picked?.crew_member_id === p.crew_member_id ? BLUE : HAIRLINE}`, touchAction: "manipulation" }}>
-                  <span className="text-sm truncate">{p.name}</span>
+                  <span className="min-w-0"><span className="block text-sm truncate">{p.name}</span>{p.on_duty && <span className="block text-xs truncate" style={{ color: GREEN }}>{p.shift_unit ? `scheduled: ${p.shift_unit}` : "on duty"} until {new Date(p.shift_ends_at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</span>}</span>
                   <span className="text-xs shrink-0" style={{ color: LEVEL_COLOR[p.field_level] }}>{LEVEL[p.field_level]}</span>
                 </div>
               ))}

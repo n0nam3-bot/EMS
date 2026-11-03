@@ -12,6 +12,8 @@ import App from "../App.jsx";
 import TeamConsole from "../consoles/team_console.jsx";
 import QaConsole from "../consoles/qa_console.jsx";
 import OpsConsole from "../consoles/ops_console.jsx";
+import ScheduleConsole, { startOfWeek } from "../consoles/schedule_console.jsx";
+import ReportsConsole, { mmss } from "../consoles/reports_console.jsx";
 import { CallDraftTray } from "../consoles/call_form.jsx";
 
 beforeAll(async () => {
@@ -624,5 +626,107 @@ describe("ePCR starts from what dispatch knows", () => {
     expect(await screen.findByRole("button", { name: "BronxCare Hospital Center" })).toBeTruthy();   // their saved places are the choices
     expect(screen.getByDisplayValue("14:02")).toBeTruthy();
     expect(screen.getByDisplayValue("14:11")).toBeTruthy();
+  });
+});
+
+describe("schedule", () => {
+  const monday = startOfWeek(new Date());
+  const at = (dayOffset, h) => { const d = new Date(monday); d.setDate(d.getDate() + dayOffset); d.setHours(h, 0, 0, 0); return d.toISOString(); };
+  const SHIFT = { shift_id: "s1", crew_member_id: "c1", name: "Pat Medic", field_level: "paramedic", unit_id: "u1", unit_designation: "Medic 1", seat_role: null, starts_at: at(1, 7), ends_at: at(1, 19), notes: null };
+
+  it("weeks start on Monday", () => { expect(startOfWeek(new Date(2026, 10, 4, 15, 30)).getDay()).toBe(1); expect(startOfWeek(new Date(2026, 10, 1)).getDate()).toBe(26); /* Sun Nov 1 -> Mon Oct 26 */ });
+
+  it("shows a week by unit with each shift's time, and lets a shift be opened, saved and deleted", async () => {
+    const calls = fakeServer({ "GET /schedule": [SHIFT], "GET /units": [UNIT()], "PATCH /schedule/s1": { ok: true }, "DELETE /schedule/s1": { ok: true } });
+    render(<ScheduleConsole session={liveSession()} />);
+    expect(await screen.findByText("Pat Medic")).toBeTruthy();
+    expect(screen.getByText("07:00–19:00")).toBeTruthy();
+    expect(screen.getByText("No unit yet")).toBeTruthy();
+    fireEvent.click(screen.getByText("Pat Medic"));
+    expect(await screen.findByText("Edit shift: Pat Medic")).toBeTruthy();
+    fireEvent.change(screen.getByDisplayValue("12 hours"), { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save shift" }));
+    await waitFor(() => { const c = calls.find((x) => x.key === "PATCH /schedule/s1"); expect(c).toBeTruthy(); expect(new Date(c.body.endsAt) - new Date(c.body.startsAt)).toBe(10 * 3600000); });
+    fireEvent.click(await screen.findByText("Pat Medic"));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete shift" }));
+    await waitFor(() => expect(calls.some((x) => x.key === "DELETE /schedule/s1")).toBe(true));
+  });
+
+  it("adds the same shift for several days in a row, and says plainly when it clashes with another of that person's shifts", async () => {
+    let clash = true;
+    const calls = fakeServer({
+      "GET /schedule": [], "GET /units": [UNIT()],
+      "GET /ops/roster": [{ crew_member_id: "c1", name: "Pat Medic", field_level: "paramedic" }],
+      "POST /schedule": () => (clash ? { error: "Pat Medic already has a shift that overlaps.", conflict: { startsAt: at(2, 7), endsAt: at(2, 19) }, __status: 409 } : { created: 3, shiftIds: [] }),
+    });
+    render(<ScheduleConsole session={liveSession()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "+ Add shift" }));
+    fireEvent.change(await screen.findByPlaceholderText("Search field staff…"), { target: { value: "pat" } });
+    fireEvent.click(await screen.findByText("Pat Medic", { selector: "span" }));
+    fireEvent.change(screen.getByLabelText("Repeat for (days in a row)"), { target: { value: "3" } });
+    fireEvent.change(screen.getByLabelText("Unit"), { target: { value: "u1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add shift" }));
+    expect(await screen.findByText(/already has a shift that overlaps/)).toBeTruthy();
+    expect(screen.getByText(/existing shift:/)).toBeTruthy();
+    clash = false;
+    fireEvent.click(screen.getByRole("button", { name: "Add shift" }));
+    await waitFor(() => { const body = calls.filter((x) => x.key === "POST /schedule").pop().body; expect(body.occurrences.length).toBe(3); expect(body.unitId).toBe("u1"); expect(body.crewMemberId).toBe("c1"); });
+    // each day is the same clock time
+    const occ = calls.filter((x) => x.key === "POST /schedule").pop().body.occurrences;
+    expect(new Set(occ.map((o) => new Date(o.startsAt).getHours())).size).toBe(1);
+  });
+});
+
+describe("OPS and the schedule", () => {
+  const crew = (name, level, role, id) => ({ employeeId: "1", name, role, cert: null, crewMemberId: id, fieldLevel: level });
+  it("lists people on duty first, and 'Crew units as scheduled' shows the plan before changing anything", async () => {
+    const calls = fakeServer({
+      "GET /units": [{ unit_id: "u1", unit_designation: "Medic 7", capability_level: "ALS", current_status: "out_of_service", crew: [crew("Extra Emt", "emt", "non_driver", "c5")] }],
+      "GET /ops/roster": [
+        { crew_member_id: "c1", name: "Pat Medic", field_level: "paramedic", on_duty: true, shift_unit: "Medic 7", shift_ends_at: new Date(Date.now() + 5 * 3600e3).toISOString() },
+        { crew_member_id: "c2", name: "Off Duty", field_level: "emt", on_duty: false },
+      ],
+      "GET /unit-checks/status": [],
+      "POST /schedule/apply": (b) => (b.dryRun ? { dryRun: true, remove: [{ crewMemberId: "c5", name: "Extra Emt", unit: "Medic 7" }], place: [{ crewMemberId: "c1", name: "Pat Medic", unit: "Medic 7", seat: "non_driver" }] } : { removed: 1, placed: 1, skipped: [] }),
+    });
+    render(<OpsConsole session={liveSession()} />);
+    expect(await screen.findByText("Pat Medic")).toBeTruthy();
+    expect(screen.queryByText("Off Duty")).toBeNull();                         // on-duty by default
+    expect(screen.getByText(/scheduled: Medic 7/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Everyone (2)" }));
+    expect(await screen.findByText("Off Duty")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Crew units as scheduled" }));
+    expect(await screen.findByText(/off Medic 7/)).toBeTruthy();
+    expect(screen.getByText(/Put/)).toBeTruthy();
+    expect(calls.filter((c) => c.key === "POST /schedule/apply").every((c) => c.body.dryRun === true)).toBe(true);   // nothing applied yet
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(await screen.findByText(/1 placed, 1 taken off/)).toBeTruthy();
+  });
+});
+
+describe("reports", () => {
+  it("formats seconds as minutes:seconds", () => { expect(mmss(null)).toBe("–"); expect(mmss(0)).toBe("0:00"); expect(mmss(65)).toBe("1:05"); expect(mmss(599.6)).toBe("10:00"); });
+  it("shows response intervals by priority with an honest explanation of what's missing", async () => {
+    const calls = fakeServer({ "GET /reports/response": { days: 30, cancelled: 2, totalCalls: 14, daily: [{ day: "2026-10-30", calls: 6 }, { day: "2026-10-31", calls: 8 }],
+      byPriority: [{ priority: "critical", calls: 4, timed: 3, dispatchMedian: 42, dispatchP90: 95, turnoutMedian: 60, turnoutP90: 120, travelMedian: 300, travelP90: 480, responseMedian: 420, responseP90: 700 }, { priority: "routine", calls: 10, timed: 0, dispatchMedian: null, dispatchP90: null, turnoutMedian: null, turnoutP90: null, travelMedian: null, travelP90: null, responseMedian: null, responseP90: null }] } });
+    render(<ReportsConsole session={liveSession()} />);
+    expect(await screen.findByText("Critical")).toBeTruthy();
+    expect(screen.getByText("7:00 / 11:40")).toBeTruthy();                      // response median / 90th
+    expect(screen.getAllByText("– / –").length).toBe(4);                  // routine has no timed calls: all four intervals blank, not zero
+    expect(screen.getByText(/missed taps counts as a call but isn't timed/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "7 days" }));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("days=7"))).toBe(true));
+  });
+});
+
+describe("field unit: shifts", () => {
+  it("shows the crew member's upcoming shifts", async () => {
+    fakeServer({
+      "GET /auth/me": { user: LOGIN.user, agency: "A", unit: null, incident: null },
+      "GET /schedule/mine": [{ shift_id: "s1", starts_at: new Date(Date.now() + 86400e3).toISOString(), ends_at: new Date(Date.now() + 86400e3 + 12 * 3600e3).toISOString(), unit_designation: "Medic 7", seat_role: "driver" }],
+    });
+    render(<FieldUnitConsole session={liveSession("crew", { fieldLevel: "emt", roles: ["crew"] })} />);
+    expect(await screen.findByText("MY SHIFTS")).toBeTruthy();
+    expect(screen.getByText("Medic 7 · driver")).toBeTruthy();
   });
 });

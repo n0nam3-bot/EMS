@@ -409,11 +409,29 @@ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
         OR EXISTS (SELECT 1 FROM platform_admins WHERE lower(email) = lower(p_email))
 $$;
 
+
+-- ---- Shift schedule -------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS shifts (
+    shift_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      UUID NOT NULL REFERENCES tenants(tenant_id),
+    crew_member_id UUID NOT NULL REFERENCES crew_members(crew_member_id),
+    unit_id        UUID REFERENCES units(unit_id),          -- NULL = on duty but not yet assigned to a unit
+    seat_role      TEXT CHECK (seat_role IN ('driver', 'non_driver')),
+    starts_at      TIMESTAMPTZ NOT NULL,
+    ends_at        TIMESTAMPTZ NOT NULL,
+    notes          TEXT,
+    created_by     UUID REFERENCES users(user_id),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (ends_at > starts_at AND ends_at - starts_at <= interval '24 hours')
+);
+CREATE INDEX IF NOT EXISTS idx_shifts_time ON shifts (tenant_id, starts_at);
+CREATE INDEX IF NOT EXISTS idx_shifts_person ON shifts (crew_member_id, starts_at);
+
 -- ---- Row-level security and grants for the new tables ---------------------------
 DO $$
 DECLARE t TEXT;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['pcr_crew', 'pcr_events', 'checklist_items', 'unit_checks', 'unit_check_items'] LOOP
+    FOREACH t IN ARRAY ARRAY['pcr_crew', 'pcr_events', 'checklist_items', 'unit_checks', 'unit_check_items', 'shifts'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = t AND policyname = 'tenant_isolation') THEN
             EXECUTE format(
@@ -438,7 +456,7 @@ BEGIN
         END IF;
     END LOOP;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ems_app_runtime') THEN
-        GRANT SELECT, INSERT, UPDATE, DELETE ON pcr_crew, pcr_events, checklist_items, unit_checks, unit_check_items TO ems_app_runtime;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON pcr_crew, pcr_events, checklist_items, unit_checks, unit_check_items, shifts TO ems_app_runtime;
         GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ems_app_runtime;
         -- Records of what happened are append-only for the app.
         REVOKE UPDATE, DELETE ON pcr_events, unit_checks, unit_check_items FROM ems_app_runtime;

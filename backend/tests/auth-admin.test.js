@@ -215,7 +215,7 @@ test("seats: an EMT can be the driver on an ALS unit paired with a paramedic, on
   assert.ok(roster.every((r) => !r.unit_id) && roster.some((r) => r.name === "Pat Medic") === false);
   assert.ok((await call("GET", "/ops/roster?q=ed", null, dispTok)).body.some((r) => r.name === "Ed Driver"), "search by name");
   assert.equal((await call("GET", "/ops/roster", null, nobody)).status, 403);
-  ctx.dispTok = dispTok; ctx.disp = disp;
+  ctx.dispTok = dispTok; ctx.disp = disp; ctx.medic2 = medic2; ctx.emtDriver = emtDriver; ctx.medic7 = unit;
 });
 
 test("fixing a mistake: name, email and employee number can be corrected; a taken email is refused; the person signs in with the new email", async () => {
@@ -373,6 +373,74 @@ test("saved places: a supervisor keeps the list, anyone searches it, and a call 
   assert.equal(open.call.destination_facility_name, "BronxCare Hospital Center");
   assert.ok(open.times.dispatchedAt && open.times.onSceneAt, "dispatch and on-scene times come from the status history");
   assert.equal(open.times.leftSceneAt, null);
+});
+
+test("schedule: shifts can't overlap for a person, on-duty people are listed first, and 'crew units as scheduled' shows its plan before changing anything", async () => {
+  const a = await tokenFor("boss@a.test"), disp = ctx.dispTok, crewTok = await tokenFor("emt@a.test");
+  const hr = (h) => new Date(Date.now() + h * 3600000).toISOString();
+  const shift = (who, over = {}) => call("POST", "/schedule", { crewMemberId: ctx[who].crew_member_id, unitId: ctx.medic7.unit_id, startsAt: hr(-1), endsAt: hr(11), ...over }, disp);
+
+  assert.equal((await call("POST", "/schedule", { crewMemberId: ctx.medic2.crew_member_id, startsAt: hr(0), endsAt: hr(8) }, crewTok)).status, 403, "crew can't edit the schedule");
+  assert.equal((await shift("medic2", { startsAt: hr(5), endsAt: hr(1) })).status, 400, "ends before it starts");
+  assert.equal((await shift("medic2", { endsAt: hr(30) })).status, 400, "over 24 hours");
+  const m = await shift("medic2");
+  assert.equal(m.status, 201);
+  const clash = await shift("medic2", { startsAt: hr(6), endsAt: hr(18) });
+  assert.equal(clash.status, 409);
+  assert.ok(clash.body.conflict.startsAt, "the clashing shift is returned so the screen can show it");
+  const many = await call("POST", "/schedule", { crewMemberId: ctx.medic2.crew_member_id, unitId: ctx.medic7.unit_id, occurrences: [1, 2, 3].map((d) => ({ startsAt: hr(24 * d + 12), endsAt: hr(24 * d + 24) })) }, disp);
+  assert.equal(many.body.created, 3, "the same shift across several days");
+  assert.equal((await call("POST", "/schedule", { crewMemberId: ctx.medic2.crew_member_id, occurrences: [{ startsAt: hr(24 * 5), endsAt: hr(24 * 5 + 8) }, { startsAt: hr(24 * 2 + 14), endsAt: hr(24 * 2 + 20) }] }, disp)).status, 409, "all or nothing: one clash saves none");
+  assert.equal((await call("GET", `/schedule?from=${hr(-2)}&to=${hr(24 * 6)}`, null, disp)).body.length, 4, "nothing from the failed batch was saved");
+  assert.equal((await shift("emtDriver", { seatRole: "driver" })).status, 201);
+  assert.equal((await call("POST", "/schedule", { crewMemberId: ctx.disp.crew_member_id, startsAt: hr(0), endsAt: hr(8) }, disp)).status, 409, "office-only staff aren't scheduled on units");
+
+  const roster = (await call("GET", "/ops/roster?onDuty=1", null, disp)).body;
+  assert.deepEqual(roster.map((r) => r.name).sort(), ["Ed Driver", "Max Medic"]);
+  assert.ok(roster.every((r) => r.on_duty && r.shift_unit === "Medic 7"));
+  const mine = (await call("GET", "/schedule/mine", null, await tokenFor("ed@a.test"))).body;
+  assert.equal(mine.length, 1);
+  assert.equal(mine[0].unit_designation, "Medic 7");
+
+  // plan first. Medic 7 currently has Max (scheduled) and nobody else; an unscheduled extra is added to see them removed.
+  const extra = (await call("POST", "/users", { email: "extra@a.test", displayName: "Extra Emt", roles: ["crew"], fieldLevel: "emt", password: PW }, a)).body;
+  await call("PUT", `/crew/${extra.crew_member_id}/unit`, { unitId: ctx.medic7.unit_id, seatRole: "non_driver" }, disp);
+  await call("PUT", `/crew/${ctx.emtDriver.crew_member_id}/unit`, { unitId: null }, disp);
+  const plan = (await call("POST", "/schedule/apply", { dryRun: true }, disp)).body;
+  assert.equal(plan.dryRun, true);
+  assert.deepEqual(plan.remove.map((r) => r.name), ["Extra Emt"]);
+  assert.deepEqual(plan.place.map((p) => [p.name, p.seat]), [["Ed Driver", "driver"]]);
+  const stillThere = (await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 7");
+  assert.ok(stillThere.crew.some((c) => c.name === "Extra Emt"), "a dry run changes nothing");
+
+  const done = await call("POST", "/schedule/apply", {}, disp);
+  assert.deepEqual([done.body.removed, done.body.placed, done.body.skipped.length], [1, 1, 0]);
+  const after = (await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 7");
+  assert.deepEqual(after.crew.map((c) => [c.name, c.role]).sort(), [["Ed Driver", "driver"], ["Max Medic", "non_driver"]]);
+  assert.equal(after.current_status, "available", "crewed as scheduled: driver + paramedic");
+  assert.equal((await call("POST", "/schedule/apply", { dryRun: true }, disp)).body.place.length, 0, "applying again has nothing left to do");
+
+  const sh = (await call("GET", `/schedule?from=${hr(-2)}&to=${hr(14)}`, null, disp)).body.find((s) => s.name === "Max Medic");
+  assert.equal((await call("PATCH", `/schedule/${sh.shift_id}`, { endsAt: hr(9), notes: "Covering for Sam" }, disp)).status, 200);
+  assert.equal((await call("DELETE", `/schedule/${sh.shift_id}`, null, disp)).status, 200);
+  assert.equal((await call("DELETE", `/schedule/${sh.shift_id}`, null, disp)).status, 404);
+  assert.equal((await call("GET", "/schedule?from=2026-01-01&to=2027-06-01", null, disp)).status, 400, "ask for a month at a time");
+  assert.equal((await call("GET", `/schedule?from=${hr(-2)}&to=${hr(24)}`, null, await tokenFor("boss@b.test"))).body.length, 0, "another company's schedule is invisible");
+});
+
+test("response-time report: counts and timed intervals by priority, for supervisors and compliance, not for crew", async () => {
+  const a = await tokenFor("boss@a.test"), crewTok = await tokenFor("emt@a.test");
+  assert.equal((await call("GET", "/reports/response?days=30", null, crewTok)).status, 403);
+  const r = (await call("GET", "/reports/response?days=30", null, a)).body;
+  assert.equal(r.days, 30);
+  assert.ok(r.totalCalls >= 3 && r.byPriority.length >= 1);
+  const timed = r.byPriority.find((p) => p.timed > 0);
+  assert.ok(timed, "at least one priority has calls with a recorded on-scene time");
+  for (const k of ["dispatchMedian", "turnoutMedian", "travelMedian", "responseMedian", "responseP90"]) assert.ok(timed[k] === null || timed[k] >= 0, `${k} is a non-negative number of seconds`);
+  assert.ok(timed.responseP90 >= timed.responseMedian);
+  assert.ok(r.daily.reduce((n, d) => n + d.calls, 0) >= 3);
+  assert.equal((await call("GET", "/reports/response?days=999", null, a)).body.days, 30, "only the offered ranges");
+  assert.equal((await call("GET", "/reports/response?days=7", null, await tokenFor("boss@b.test"))).body.totalCalls, 0, "another company's calls aren't in it");
 });
 
 test("unit checks: the checklist is the agency's own, a shift check needs every line answered, a failure needs a note and flags the unit", async () => {

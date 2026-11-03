@@ -277,6 +277,9 @@ export default function FieldUnitConsole({ session }) {
           </div>
         )}
 
+        {/* My upcoming shifts */}
+        {live && me && <MyShifts session={session} />}
+
         {/* Profile */}
         {live && stats && (
           <div className="rounded-lg border p-4" style={card}>
@@ -324,6 +327,26 @@ export default function FieldUnitConsole({ session }) {
             </div>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function MyShifts({ session }) {
+  const [shifts, setShifts] = useState(null);
+  useEffect(() => { api(session, "GET", "/schedule/mine").then(setShifts).catch(() => setShifts([])); }, [session]);
+  if (!shifts || shifts.length === 0) return null;
+  const fmt = (iso, long) => new Date(iso).toLocaleString("en-US", long ? { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" } : { hour: "numeric", minute: "2-digit" });
+  return (
+    <div className="rounded-lg border p-4" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
+      <div className="text-xs tracking-wide font-semibold mb-2" style={{ color: TEXT_SECONDARY }}>MY SHIFTS</div>
+      <div className="flex flex-col gap-1">
+        {shifts.slice(0, 4).map((s) => (
+          <div key={s.shift_id} className="flex items-center justify-between gap-2 text-sm">
+            <span>{fmt(s.starts_at, true)} – {fmt(s.ends_at)}</span>
+            <span className="text-xs" style={{ color: s.unit_designation ? TEXT_PRIMARY : TEXT_FAINT }}>{s.unit_designation ? `${s.unit_designation}${s.seat_role === "driver" ? " · driver" : ""}` : "unit not set yet"}</span>
+          </div>
+        ))}
       </div>
     </div>
   );
