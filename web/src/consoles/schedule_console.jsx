@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { apiRequest } from "../api.js";
+import { groupCrews, numberCrews, buildGrid, ROLE_TAG, span } from "../scheduleLogic.js";
 
 const HAIRLINE = "#232C3A", PANEL = "#131A24", VOID = "#0A0E13", SUNKEN = "#0D131B";
 const TEXT_PRIMARY = "#E7ECF2", TEXT_SECONDARY = "#A9B6C6", TEXT_FAINT = "#8795AB";
@@ -28,6 +29,7 @@ export default function ScheduleConsole({ session }) {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [form, setForm] = useState(null);          // add / edit panel: { shift?, ...fields } or null
+  const [tab, setTab] = useState("BLS");              // ALS and BLS crews are shown on separate tabs
   const days = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)), [weekStart]);
 
   const load = useCallback(async () => {
@@ -41,10 +43,19 @@ export default function ScheduleConsole({ session }) {
   }, [session, weekStart]);
   useEffect(() => { load(); }, [load]);
 
-  const rows = [...units.map((u) => ({ id: u.unit_id, label: u.unit_designation, sub: u.capability_level })), { id: null, label: "No unit yet", sub: "on duty, not assigned" }];
-  const cellShifts = (unitId, day) => (shifts || []).filter((s) => (s.unit_id || null) === unitId && sameDay(new Date(s.starts_at), day));
+  // Crews, numbered per day by start time (BLS 1, BLS 2...), then laid out by start time from 0000 down.
+  const numbered = useMemo(() => numberCrews(groupCrews(shifts || [], Object.fromEntries(units.map((u) => [u.unit_id, u.capability_level])))), [shifts, units]);
+  const grids = useMemo(() => ({ BLS: buildGrid(numbered, "BLS", days), ALS: buildGrid(numbered, "ALS", days) }), [numbered, days]);
+  const grid = grids[tab];
+  // Open on whichever tab has shifts (an ALS-only week shouldn't look empty).
+  useEffect(() => {
+    if (shifts === null) return;
+    const other = tab === "BLS" ? "ALS" : "BLS";
+    if (grids[tab].count === 0 && grids[other].count > 0) setTab(other);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shifts, units]);
   const today = new Date();
-  const openAdd = (unitId, day) => setForm({ crewMemberId: "", personName: "", unitId: unitId || "", seatRole: "", date: dateInput(day), time: "07:00", hours: 12, repeat: 1, notes: "" });
+  const openAdd = (unitId, day, time = "0700") => setForm({ crewMemberId: "", personName: "", unitId: unitId || "", seatRole: "", date: dateInput(day), time: `${time.slice(0, 2)}:${time.slice(2)}`, hours: 12, repeat: 1, notes: "" });
   const openEdit = (s) => setForm({ shift: s, crewMemberId: s.crew_member_id, personName: s.name, unitId: s.unit_id || "", seatRole: s.seat_role || "", date: dateInput(new Date(s.starts_at)), time: hhmm(new Date(s.starts_at)), hours: Math.round((new Date(s.ends_at) - new Date(s.starts_at)) / 3600000), repeat: 1, notes: s.notes || "" });
 
   return (
@@ -69,29 +80,38 @@ export default function ScheduleConsole({ session }) {
         {notice && <div className="text-sm px-3 py-2 rounded-md" style={{ color: GREEN, backgroundColor: "rgba(52,211,153,0.08)", border: "1px solid #2E5943" }}>{notice}</div>}
         {form && <ShiftForm key={form.shift?.shift_id || "new"} session={session} units={units} initial={form} onClose={() => setForm(null)} onSaved={(msg) => { setForm(null); setNotice(msg); load(); }} />}
 
+        <div role="tablist" aria-label="Crew level" className="flex gap-2">
+          {["BLS", "ALS"].map((l) => (
+            <button key={l} role="tab" aria-selected={tab === l} onClick={() => setTab(l)} className="text-sm px-4 py-1.5 rounded-md" style={{ backgroundColor: tab === l ? (l === "ALS" ? GREEN : BLUE) : SUNKEN, color: tab === l ? "#06090D" : TEXT_PRIMARY, border: `1px solid ${HAIRLINE}`, fontWeight: tab === l ? 600 : 400 }}>
+              {l} <span className="text-xs" style={{ opacity: 0.8 }}>{grids[l].count}</span>
+            </button>
+          ))}
+        </div>
+
         <div className="rounded-lg border overflow-x-auto" style={{ borderColor: HAIRLINE, backgroundColor: PANEL }}>
-          <div style={{ minWidth: "860px" }}>
-            <div className="grid" style={{ gridTemplateColumns: "150px repeat(7, minmax(0, 1fr))" }}>
-              <div className="px-3 py-2 text-xs" style={{ color: TEXT_FAINT, borderBottom: `1px solid ${HAIRLINE}` }}>Unit</div>
-              {days.map((d) => <div key={d.toISOString()} className="px-2 py-2 text-xs text-center" style={{ color: sameDay(d, today) ? BLUE : TEXT_SECONDARY, fontWeight: sameDay(d, today) ? 600 : 400, borderBottom: `1px solid ${HAIRLINE}`, borderLeft: `1px solid #1B2330` }}>{dayLabel(d)}</div>)}
+          <div style={{ minWidth: "900px" }}>
+            <div className="grid" style={{ gridTemplateColumns: "72px repeat(7, minmax(0, 1fr))" }}>
+              <div className="px-2 py-2 text-xs" style={{ color: TEXT_FAINT, borderBottom: `1px solid ${HAIRLINE}` }}>Start time</div>
+              {days.map((d) => <div key={d.toISOString()} className="px-2 py-2 text-xs text-center" style={{ color: sameDay(d, today) ? BLUE : TEXT_SECONDARY, fontWeight: sameDay(d, today) ? 600 : 400, borderBottom: `1px solid ${HAIRLINE}`, borderLeft: `1px solid ${HAIRLINE}` }}>{dayLabel(d)}</div>)}
               {shifts === null && !error && <div className="px-3 py-4 text-sm col-span-8" style={{ color: TEXT_FAINT }}>Loading…</div>}
-              {shifts !== null && rows.map((r) => (
-                <React.Fragment key={r.id || "none"}>
-                  <div className="px-3 py-2 text-sm" style={{ borderBottom: `1px solid #1B2330` }}>
-                    <div className="font-medium truncate">{r.label}</div><div className="text-xs" style={{ color: TEXT_FAINT }}>{r.sub}</div>
-                  </div>
+              {shifts !== null && grid.rows.length === 0 && <div className="px-3 py-6 text-sm col-span-8" style={{ color: TEXT_FAINT }}>No {tab} shifts this week. Use + Add shift to schedule people.</div>}
+              {shifts !== null && grid.rows.map((t) => (
+                <React.Fragment key={t}>
+                  <div className="px-2 py-2 text-sm font-medium" style={{ borderBottom: `1px solid #1B2330`, fontFamily: "ui-monospace, monospace" }}>{t}</div>
                   {days.map((d) => (
-                    <div key={d.toISOString() + r.id} className="p-1 flex flex-col gap-1 group" style={{ borderBottom: `1px solid #1B2330`, borderLeft: `1px solid #1B2330`, minHeight: "56px", backgroundColor: sameDay(d, today) ? "rgba(78,161,240,0.04)" : undefined }}>
-                      {cellShifts(r.id, d).map((s) => {
-                        const st = new Date(s.starts_at), en = new Date(s.ends_at);
-                        return (
-                          <button key={s.shift_id} onClick={() => openEdit(s)} className="text-left rounded px-1.5 py-1" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, borderLeft: `3px solid ${LEVEL_COLOR[s.field_level] || HAIRLINE}` }}>
-                            <div className="text-xs font-medium truncate">{s.name}{s.seat_role === "driver" ? " (D)" : ""}</div>
-                            <div className="text-xs" style={{ color: TEXT_FAINT }}>{hhmm(st)}–{hhmm(en)}{!sameDay(st, en) ? " +1" : ""}</div>
-                          </button>
-                        );
-                      })}
-                      <button onClick={() => openAdd(r.id, d)} aria-label={`Add a shift on ${r.label}, ${dayLabel(d)}`} className="text-xs rounded opacity-0 group-hover:opacity-100 focus:opacity-100" style={{ color: TEXT_FAINT, border: `1px dashed ${HAIRLINE}` }}>+</button>
+                    <div key={t + d.toISOString()} className="p-1 flex flex-col gap-1 group" style={{ borderBottom: `1px solid #1B2330`, borderLeft: `1px solid #1B2330`, minHeight: "56px", backgroundColor: sameDay(d, today) ? "rgba(78,161,240,0.04)" : undefined }}>
+                      {grid.cell(t, d).map((c) => (
+                        <div key={c.key} className="rounded px-1.5 py-1" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, borderLeft: `3px solid ${c.level === "ALS" ? GREEN : BLUE}` }}>
+                          <div className="text-xs font-semibold" style={{ color: c.level === "ALS" ? GREEN : BLUE }}>{c.label}{c.unitName ? <span className="font-normal" style={{ color: TEXT_FAINT }}> · {c.unitName}</span> : null}</div>
+                          {c.members.map((s) => (
+                            <button key={s.shift_id} onClick={() => openEdit(s)} className="block w-full text-left text-xs py-0.5" style={{ color: TEXT_PRIMARY }}>
+                              <span style={{ color: LEVEL_COLOR[s.field_level] || TEXT_FAINT }}>[{ROLE_TAG[s.field_level] || "Staff"}]</span> {s.name}
+                              <div style={{ color: TEXT_FAINT }}>{span(s)}</div>
+                            </button>
+                          ))}
+                        </div>
+                      ))}
+                      <button onClick={() => openAdd(null, d, t)} aria-label={`Add a ${tab} shift starting ${t} on ${dayLabel(d)}`} className="text-xs rounded opacity-0 group-hover:opacity-100 focus:opacity-100" style={{ color: TEXT_FAINT, border: `1px dashed ${HAIRLINE}` }}>+</button>
                     </div>
                   ))}
                 </React.Fragment>
@@ -99,6 +119,7 @@ export default function ScheduleConsole({ session }) {
             </div>
           </div>
         </div>
+        <div className="text-xs" style={{ color: TEXT_FAINT }}>Crew numbers such as BLS 1 and ALS 1 are counted for each day in the order crews start, so they change as shifts are added or removed. They are schedule labels, not unit names. Times are 24-hour.</div>
         <div className="text-xs" style={{ color: TEXT_FAINT }}>Times are in this device's time zone. Anyone with a shift covering the current time shows as on duty on OPS, where "Crew units as scheduled" puts them on their units.</div>
       </div>
     </div>

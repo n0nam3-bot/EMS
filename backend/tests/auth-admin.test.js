@@ -44,9 +44,18 @@ async function signIn(email, password = PW) {
   }
   return call("POST", "/auth/mfa/verify", { challenge: first.body.challenge, code: codeFor(secrets.get(email)) });
 }
-async function tokenFor(email) {
-  if (!sessions.has(email)) { const r = await signIn(email); assert.equal(r.status, 200, `sign-in for ${email}: ${JSON.stringify(r.body)}`); sessions.set(email, r.body.token); }
-  return sessions.get(email);
+// Sign-ins are run one at a time: each one moves the shared fake clock forward, so two running at once
+// (the Promise.all calls below) could generate a code under one clock reading and have it verified under
+// another, which made this suite fail about one run in four.
+let signInQueue = Promise.resolve();
+function tokenFor(email) {
+  const run = async () => {
+    if (!sessions.has(email)) { const r = await signIn(email); assert.equal(r.status, 200, `sign-in for ${email}: ${JSON.stringify(r.body)}`); sessions.set(email, r.body.token); }
+    return sessions.get(email);
+  };
+  const result = signInQueue.then(run);
+  signInQueue = result.catch(() => {});
+  return result;
 }
 const q = async (sql, params) => (await admin.query(sql, params)).rows;
 

@@ -10,8 +10,8 @@ const TYPE_LABELS = { emergency_911: "911 Emergency", ift_scheduled: "IFT — Sc
 const PRIORITIES = { critical: "Critical", emergent: "Emergent", urgent: "Urgent", routine: "Routine" };
 
 // ---- the form's data ---------------------------------------------------------------------
-export const blankForm = () => ({ type: "emergency_911", priority: "emergent", capabilityNeeded: "BLS", address: "", lat: null, lon: null, detail: "", destination: "", destLat: null, destLon: null, destFacilityId: null, patientName: "", contactName: "", contactPhone: "", notes: "" });
-export const formFromIncident = (i) => ({ type: i.type, priority: i.priority, capabilityNeeded: i.capabilityNeeded, address: i.address || "", lat: i.lat ?? null, lon: i.lon ?? null, detail: i.detail || "", destination: i.destination || "", destLat: i.destLat ?? null, destLon: i.destLon ?? null, destFacilityId: i.destinationFacilityId ?? null, patientName: i.patientName || "", contactName: i.contactName || "", contactPhone: i.contactPhone || "", notes: i.notes || "" });
+export const blankForm = () => ({ type: "emergency_911", priority: "emergent", capabilityNeeded: "BLS", address: "", lat: null, lon: null, detail: "", destination: "", destLat: null, destLon: null, destFacilityId: null, pinApprox: false, destApprox: false, patientName: "", contactName: "", contactPhone: "", notes: "" });
+export const formFromIncident = (i) => ({ type: i.type, priority: i.priority, capabilityNeeded: i.capabilityNeeded, address: i.address || "", lat: i.lat ?? null, lon: i.lon ?? null, detail: i.detail || "", destination: i.destination || "", destLat: i.destLat ?? null, destLon: i.destLon ?? null, destFacilityId: i.destinationFacilityId ?? null, pinApprox: false, destApprox: false, patientName: i.patientName || "", contactName: i.contactName || "", contactPhone: i.contactPhone || "", notes: i.notes || "" });
 export function formToApi(f) {
   const body = {
     incidentType: f.type, priority: f.priority, capabilityNeeded: f.capabilityNeeded,
@@ -56,6 +56,14 @@ export function CallDraftTray({ session }) {
     return () => window.removeEventListener("ems-open-call", on);
   }, []);
 
+  // Tell the map what the open draft's pickup and drop-off are, so the dispatcher can see them
+  // BEFORE saving. null when no draft is open.
+  useEffect(() => {
+    const d = drafts.find((x) => x.open);
+    const pin = (lat, lon, label, approx) => (lat != null && lon != null ? { lat, lon, label, approx: Boolean(approx) } : null);
+    window.dispatchEvent(new CustomEvent("ems-draft-pins", { detail: d ? { pickup: pin(d.form.lat, d.form.lon, d.form.address, d.form.pinApprox), dest: pin(d.form.destLat, d.form.destLon, d.form.destination, d.form.destApprox) } : null }));
+  }, [drafts]);
+
   if (drafts.length === 0) return null;
   const patch = (key, p) => setDrafts((all) => all.map((x) => (x.key === key ? { ...x, ...p } : x)));
   const drop = (key) => setDrafts((all) => all.filter((x) => x.key !== key));
@@ -87,8 +95,8 @@ export function CallDraftTray({ session }) {
       apiRequest(session, "GET", `/geocode?q=${encodeURIComponent(q)}${near}`).catch((e) => { if (/turned off/.test(e.message)) return []; throw e; }),
     ]);
     return [
-      ...places.map((p) => ({ label: `${p.name}, ${p.address}`, short: `${p.name}, ${p.address}`, lat: p.lat, lon: p.lon, facilityId: p.facility_id, kind: "saved" })),
-      ...map.map((m) => ({ label: m.label, short: shortLabel(m.label), lat: m.lat, lon: m.lon, kind: "map" })),
+      ...places.map((p) => ({ label: `${p.name}, ${p.address}`, short: `${p.name}, ${p.address}`, lat: p.lat, lon: p.lon, facilityId: p.facility_id, kind: "saved", exact: true })),
+      ...map.map((m) => ({ label: m.label, short: shortLabel(m.label), lat: m.lat, lon: m.lon, kind: "map", exact: m.exact !== false, note: m.note })),
     ];
   }
 
@@ -145,24 +153,27 @@ function CallForm({ form, setForm, onSubmit, submitLabel, onSearch, error, busy 
     } catch (e) { setNote(e.message || "Search failed"); } finally { setSearching(null); }
   }
   function choose(field, item) {
+    // An exact match may tidy the text. A street-only match must NOT: keep what was typed
+    // (with its house number) and just pin the street, flagged as approximate.
+    const approx = item.exact === false;
     set(field === "pickup"
-      ? { address: item.short, lat: item.lat, lon: item.lon }
-      : { destination: item.short, destLat: item.lat, destLon: item.lon, destFacilityId: item.facilityId || null });
+      ? { address: approx ? form.address : item.short, lat: item.lat, lon: item.lon, pinApprox: approx }
+      : { destination: approx ? form.destination : item.short, destLat: item.lat, destLon: item.lon, destFacilityId: item.facilityId || null, destApprox: approx });
     setResults(null);
   }
-  const place = (field, label, value, pinned, placeholder, extra) => (
+  const place = (field, label, value, pinned, placeholder, extra, approx) => (
     <Field label={label}>
       <div className="flex gap-2">
         <input type="text" value={value} placeholder={placeholder} className="flex-1 min-w-0 text-sm rounded px-2 py-2" style={input}
-          onChange={(e) => set(field === "pickup" ? { address: e.target.value, lat: null, lon: null } : { destination: e.target.value, destLat: null, destLon: null, destFacilityId: null })} />
+          onChange={(e) => set(field === "pickup" ? { address: e.target.value, lat: null, lon: null, pinApprox: false } : { destination: e.target.value, destLat: null, destLon: null, destFacilityId: null, destApprox: false })} />
         {onSearch && <button type="button" onClick={() => find(field)} disabled={searching !== null} className="text-sm px-3 rounded shrink-0" style={{ ...input, color: BLUE }}>{searching === field ? "…" : "Find"}</button>}
       </div>
-      {value.trim() && <span className="text-xs" style={{ color: pinned ? GREEN : AMBER }}>{extra || (pinned ? "Pinned on the map" : onSearch ? "Not pinned. Tap Find and pick the exact place so units can be matched by distance." : "Demo: placed at a random spot")}</span>}
+      {value.trim() && <span className="text-xs" style={{ color: pinned && !approx ? GREEN : AMBER }}>{approx ? "Pinned to the street only: that house number wasn't found on the map. Check the address; the text above stays as you typed it." : extra || (pinned ? "Pinned on the map" : onSearch ? "Not pinned. Tap Find and pick the exact place so units can be matched by distance." : "Demo: placed at a random spot")}</span>}
       {results && results.field === field && (
         <div className="flex flex-col rounded border mt-1" style={{ borderColor: HAIRLINE }}>
           {results.items.map((item, idx) => (
             <button type="button" key={idx} onClick={() => choose(field, item)} className="text-left text-xs px-2 py-2 border-b flex gap-2" style={{ borderColor: "#1B2330", color: TEXT_PRIMARY, backgroundColor: PANEL }}>
-              <span className="shrink-0 px-1 rounded" style={{ color: item.kind === "saved" ? GREEN : TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>{item.kind === "saved" ? "Saved place" : "Map"}</span><span>{item.label}</span>
+              <span className="shrink-0 px-1 rounded" style={{ color: item.kind === "saved" ? GREEN : item.exact === false ? AMBER : TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>{item.kind === "saved" ? "Saved place" : item.exact === false ? "Street only" : "Map"}</span><span>{item.label}{item.exact === false && item.note ? <span style={{ color: AMBER }}> — {item.note}</span> : null}</span>
             </button>
           ))}
         </div>
@@ -182,9 +193,9 @@ function CallForm({ form, setForm, onSubmit, submitLabel, onSearch, error, busy 
           ))}
         </div>
       </Field>
-      {place("pickup", "Pickup address or facility *", form.address, form.lat != null, "e.g. BronxCare Hospital Center, Bronx")}
+      {place("pickup", "Pickup address or facility *", form.address, form.lat != null, "e.g. BronxCare Hospital Center, Bronx", null, form.pinApprox)}
       <Field label="Room, floor, unit or cross street"><input type="text" value={form.detail} onChange={(e) => set({ detail: e.target.value })} placeholder="e.g. 4th floor, room 412, main lobby" className="w-full text-sm rounded px-2 py-2" style={input} /></Field>
-      {place("dest", "Destination (for transfers)", form.destination, form.destLat != null, "e.g. Montefiore Moses", form.destFacilityId ? "Saved place: the chart will start with this destination" : null)}
+      {place("dest", "Destination (for transfers)", form.destination, form.destLat != null, "e.g. Montefiore Moses", form.destFacilityId ? "Saved place: the chart will start with this destination" : null, form.destApprox)}
       <div className="grid grid-cols-2 gap-3">
         <Field label="Patient name (optional)"><input type="text" value={form.patientName} onChange={(e) => set({ patientName: e.target.value })} className="w-full text-sm rounded px-2 py-2" style={input} /></Field>
         <Field label="Contact name"><input type="text" value={form.contactName} onChange={(e) => set({ contactName: e.target.value })} placeholder="Nurse, caller…" className="w-full text-sm rounded px-2 py-2" style={input} /></Field>

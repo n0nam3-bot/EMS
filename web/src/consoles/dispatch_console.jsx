@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { openCallDraft, setCallNearHint, formFromIncident } from "./call_form.jsx";
+import { buildMapPlan, placeForStatus, STATUS_COLORS, STATUS_LABELS, CALL_COLORS } from "../mapLogic.js";
 import {
   CheckCircle2,
   Navigation,
@@ -156,6 +157,8 @@ function normalizeApiUnit(u) {
     status: u.current_status,
     lat: u.lat,
     lon: u.lon,
+    locationSource: u.location_source || null,
+    vehicleNumber: u.vehicle_number || null,
   };
 }
 
@@ -268,6 +271,7 @@ export default function DispatchConsole({ session }) {
   const [incidents, setIncidents] = useState(() => (live ? [] : makeInitialIncidents(Date.now())));
   const [connectionStatus, setConnectionStatus] = useState(live ? "connecting" : "demo"); // demo | connecting | live | failed
   const [actionError, setActionError] = useState("");
+  const [draftPins, setDraftPins] = useState(null);   // the call being typed in the tray, previewed on the map
   const [selIncidentId, setSelIncidentId] = useState(null);
   const [selUnitId, setSelUnitId] = useState(null);
 
@@ -371,7 +375,13 @@ export default function DispatchConsole({ session }) {
   function handleStatusChange(unitId, newStatus) {
     performAction(
       () => apiRequest("PATCH", `/units/${unitId}/status`, { status: newStatus }),
-      () => setUnits((prev) => prev.map((u) => (u.id === unitId ? { ...u, status: newStatus } : u)))
+      () => setUnits((prev) => prev.map((u) => {
+        if (u.id !== unitId) return u;
+        // No GPS: put the unit where it would be (pickup on scene, drop-off at destination).
+        const call = incidents.find((i) => i.assignedUnits.some((a) => a.unitId === unitId));
+        const at = placeForStatus(newStatus, call);
+        return at ? { ...u, status: newStatus, lat: at.lat, lon: at.lon, locationSource: "status" } : { ...u, status: newStatus };
+      }))
     );
   }
   function handleAssign(incidentId, unitId, role) {
@@ -425,6 +435,11 @@ export default function DispatchConsole({ session }) {
     return o ? { lat: o.lat, lon: o.lon } : null;
   }, [units, incidents]);
   useEffect(() => { setCallNearHint(searchNear); }, [searchNear]);
+  useEffect(() => {
+    const on = (e) => setDraftPins(e.detail || null);
+    window.addEventListener("ems-draft-pins", on);
+    return () => window.removeEventListener("ems-draft-pins", on);
+  }, []);
 
   // The tray saves live calls itself and tells us to refresh; in the demo it hands the form to us.
   useEffect(() => {
@@ -498,6 +513,16 @@ export default function DispatchConsole({ session }) {
         .ems-pin .ring { width: 22px; height: 22px; border-radius: 50%; border: 3px solid var(--c); background: rgba(0,0,0,0.35); box-shadow: 0 0 0 2px rgba(0,0,0,0.5); }
         .ems-pin.sel .dot, .ems-pin.sel .ring { box-shadow: 0 0 0 4px #fff, 0 0 14px 5px var(--c); transform: scale(1.25); }
         .ems-pin.dim { opacity: 0.6; }
+        .ems-pin.faded { opacity: 0.4; }
+        .ems-pin.manual .dot { border-style: dashed; }
+        .ems-call { transform: translate(-11px, -50%); }
+        .ems-call .flag { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; font: 700 12px/1 Inter, system-ui, sans-serif; color: #0A0E13; background: var(--c); border: 2px solid #fff; box-shadow: 0 0 0 2px rgba(0,0,0,0.5); border-radius: 50%; }
+        .ems-call.dropoff .flag { border-radius: 4px; }
+        .ems-call.small .flag { width: 13px; height: 13px; font-size: 8px; border-width: 1px; opacity: 0.85; box-shadow: none; }
+        .ems-call.draft .flag { background: rgba(10,14,19,0.9); color: #fff; border: 2px dashed #fff; }
+        .ems-call.draft .lbl { border-style: dashed; border-color: #fff; }
+        .ems-call.approx .flag { border-color: #F5934A; color: #F5934A; }
+        .ems-call.approx .lbl { border-color: #F5934A; }
       `}</style>
 
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
@@ -530,7 +555,7 @@ export default function DispatchConsole({ session }) {
       <div className="p-4 flex flex-col lg:grid lg:grid-cols-[minmax(0,1fr)_440px] gap-4 lg:items-start">
         <div className="flex flex-col gap-3 lg:sticky lg:top-3 min-w-0">
           <LiveMap
-            units={units} incidents={activeIncidents}
+            units={units} incidents={activeIncidents} draft={draftPins}
             selUnitId={selUnitId} selIncidentId={selIncidentId}
             onSelectUnit={toggleUnit} onSelectIncident={toggleIncident}
           />
@@ -622,8 +647,10 @@ function useLeafletLoader() {
   return status;
 }
 
-function LiveMap({ units, incidents, selUnitId, selIncidentId, onSelectUnit, onSelectIncident }) {
+function LiveMap({ units, incidents, draft, selUnitId, selIncidentId, onSelectUnit, onSelectIncident }) {
   const leafletStatus = useLeafletLoader();
+  const [showQueued, setShowQueued] = useState(false);
+  const plan = useMemo(() => buildMapPlan({ units, incidents, selIncidentId, selUnitId, draft, showQueued }), [units, incidents, selIncidentId, selUnitId, draft, showQueued]);
   const [tilesWorking, setTilesWorking] = useState(null);
   const [trafficOn, setTrafficOn] = useState(true);
   const [mapStyle, setMapStyle] = useState(() => {
@@ -683,53 +710,54 @@ function LiveMap({ units, incidents, selUnitId, selIncidentId, onSelectUnit, onS
     if (trafficOn) t.addTo(map); else map.removeLayer(t);
   }, [trafficOn, tilesWorking]);
 
-  function fitAll() {
+  const frame = (pts) => {
     const map = mapRef.current;
-    if (!map) return;
-    const pts = [
-      ...units.filter((u) => u.lat != null && u.lon != null).map((u) => [u.lat, u.lon]),
-      ...incidents.filter((i) => i.lat != null && i.lon != null).map((i) => [i.lat, i.lon]),
-    ];
-    if (pts.length > 0) map.fitBounds(pts, { padding: [60, 60], maxZoom: 14 });
+    if (!map || pts.length === 0) return;
+    if (pts.length === 1) map.setView(pts[0], Math.max(map.getZoom(), 15));
+    else map.fitBounds(pts, { padding: [60, 60], maxZoom: 15 });
+  };
+  function fitAll() {
+    frame([...plan.unitPins.map((u) => [u.lat, u.lon]), ...plan.pins.map((p) => [p.lat, p.lon])]);
   }
 
+  // Draw what the plan says. Units: status colour. Calls: pickup / drop-off colours, small and dull
+  // when queued, dashed white while a call is still being typed.
   useEffect(() => {
     if (!mapRef.current || !layerRef.current) return;
     const L = window.L;
     layerRef.current.clearLayers();
-    const selU = units.find((u) => u.id === selUnitId);
-    const selI = incidents.find((i) => i.id === selIncidentId);
-    if (selU && selI && selU.lat != null && selI.lat != null) {
-      L.polyline([[selU.lat, selU.lon], [selI.lat, selI.lon]], { color: "#4EA1F0", weight: 3, dashArray: "6 8" }).addTo(layerRef.current);
+    for (const l of plan.lines) {
+      L.polyline([l.from, l.to], { color: l.color, weight: l.thin ? 2 : 3, opacity: l.thin ? 0.7 : 0.95, dashArray: l.dashed ? "6 8" : null, interactive: false }).addTo(layerRef.current);
     }
-    incidents.filter((i) => i.lat != null && i.lon != null).forEach((i) => {
-      const color = PRIORITY_CONFIG[i.priority].color;
-      const dim = i.assignedUnits.length > 0 && i.id !== selIncidentId;
-      const short = i.address.length > 30 ? i.address.slice(0, 29) + "\u2026" : i.address;
+    for (const p of plan.pins) {
+      const color = CALL_COLORS[p.kind][p.tone] || CALL_COLORS[p.kind].live;
+      const letter = p.kind === "pickup" ? "P" : "D";
+      const what = p.kind === "pickup" ? "Pickup" : "Drop-off";
+      const text = p.tone === "draft" ? `${what}${p.approx ? " (street only)" : " (not saved yet)"}` : p.small ? "" : `${what}: ${p.label.length > 26 ? p.label.slice(0, 25) + "\u2026" : p.label}`;
       const icon = L.divIcon({
         className: "ems-icon", iconSize: [0, 0],
-        html: `<div class="ems-pin ems-inc${i.id === selIncidentId ? " sel" : ""}${dim ? " dim" : ""}" style="--c:${color}"><span class="ring"></span><span class="lbl">${esc(short)}</span></div>`,
+        html: `<div class="ems-pin ems-call ${p.kind}${p.small ? " small" : ""}${p.tone === "draft" ? " draft" : ""}${p.approx ? " approx" : ""}" style="--c:${color}" title="${esc(what + ": " + p.label)}"><span class="flag">${letter}</span>${text ? `<span class="lbl">${esc(text)}</span>` : ""}</div>`,
       });
-      L.marker([i.lat, i.lon], { icon, zIndexOffset: i.id === selIncidentId ? 1000 : 0 })
-        .on("click", () => cbRef.current.incident && cbRef.current.incident(i.id))
+      L.marker([p.lat, p.lon], { icon, zIndexOffset: p.tone === "draft" ? 1200 : p.small ? 0 : 300 })
+        .on("click", () => p.callId !== "draft" && cbRef.current.incident && cbRef.current.incident(p.callId))
         .addTo(layerRef.current);
-    });
-    units.filter((u) => u.lat != null && u.lon != null).forEach((u) => {
-      const color = STATUS_CONFIG[u.status].color;
+    }
+    for (const u of plan.unitPins) {
       const icon = L.divIcon({
         className: "ems-icon", iconSize: [0, 0],
-        html: `<div class="ems-pin ems-unit${u.id === selUnitId ? " sel" : ""}" style="--c:${color}"><span class="dot"></span><span class="lbl">${esc(u.designation)} \u00b7 ${esc(u.capability)}</span></div>`,
+        html: `<div class="ems-pin ems-unit${u.selected ? " sel" : ""}${u.dim ? " faded" : ""}${u.fromStatus ? " manual" : ""}" style="--c:${u.color}" title="${esc(u.designation + " — " + (STATUS_LABELS[u.status] || u.status) + (u.fromStatus ? " (position set from status, no GPS yet)" : ""))}"><span class="dot"></span><span class="lbl">${esc(u.designation)} \u00b7 ${esc(u.capability)}</span></div>`,
       });
-      L.marker([u.lat, u.lon], { icon, zIndexOffset: u.id === selUnitId ? 1000 : 500 })
+      L.marker([u.lat, u.lon], { icon, zIndexOffset: u.selected ? 1000 : 500 })
         .on("click", () => cbRef.current.unit && cbRef.current.unit(u.id))
         .addTo(layerRef.current);
-    });
-    if (!fittedRef.current) {
-      const any = units.some((u) => u.lat != null) || incidents.some((i) => i.lat != null);
-      if (any) { fitAll(); fittedRef.current = true; }
     }
+    if (!fittedRef.current && (plan.unitPins.length || plan.pins.length)) { fitAll(); fittedRef.current = true; }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [units, incidents, selUnitId, selIncidentId, tilesWorking]);
+  }, [plan, tilesWorking]);
+
+  // Reframe when the focus changes: a call is picked, or a draft gets its first pin. (Not on every refresh.)
+  const focusKey = `${selIncidentId || ""}|${draft?.pickup ? "p" : ""}${draft?.dest ? "d" : ""}`;
+  useEffect(() => { if (mapRef.current && fittedRef.current) frame(plan.focus); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [focusKey]);
 
   if (leafletStatus === "failed" || tilesWorking === false) {
     return <ZoneMap units={units} incidents={incidents} />;
@@ -745,6 +773,7 @@ function LiveMap({ units, incidents, selUnitId, selIncidentId, onSelectUnit, onS
               <button key={key} onClick={() => pickStyle(key)} className="px-2.5 py-1.5" style={{ backgroundColor: mapStyle === key ? BLUE : SUNKEN, color: mapStyle === key ? "#06090D" : TEXT_PRIMARY, fontWeight: mapStyle === key ? 600 : 400 }}>{label}</button>
             ))}
           </div>
+          <button onClick={() => setShowQueued((v) => !v)} aria-pressed={showQueued} className="px-2.5 py-1.5 rounded-md" style={{ ...chip, borderColor: showQueued ? BLUE : HAIRLINE, color: showQueued ? BLUE : TEXT_PRIMARY }}>Queued calls {showQueued ? "shown" : "hidden"}</button>
           <button onClick={fitAll} className="px-2.5 py-1.5 rounded-md" style={chip}>Fit all</button>
           {TOMTOM_KEY ? (
             <button onClick={() => setTrafficOn((v) => !v)} className="px-2.5 py-1.5 rounded-md" style={{ ...chip, borderColor: trafficOn ? GREEN : HAIRLINE, color: trafficOn ? GREEN : TEXT_PRIMARY }}>
@@ -759,6 +788,21 @@ function LiveMap({ units, incidents, selUnitId, selIncidentId, onSelectUnit, onS
       <div className={mapStyle === "dark" ? "map-dark" : "map-standard"}>
         <div ref={containerRef} style={{ height: "clamp(340px, calc(100vh - 330px), 900px)", borderRadius: "6px", backgroundColor: SUNKEN }} />
       </div>
+      <MapLegend selected={Boolean(plan.selected)} />
+    </div>
+  );
+}
+
+function MapLegend({ selected }) {
+  const dot = (color, round = true) => <span style={{ display: "inline-block", width: 11, height: 11, borderRadius: round ? "50%" : "2px", backgroundColor: color, marginRight: 5, verticalAlign: "middle" }} />;
+  return (
+    <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs" style={{ color: TEXT_SECONDARY }} aria-label="Map legend">
+      {Object.entries(STATUS_LABELS).map(([k, label]) => <span key={k}>{dot(STATUS_COLORS[k])}{label}</span>)}
+      <span>{dot(CALL_COLORS.pickup.live)}Pickup</span>
+      <span>{dot(CALL_COLORS.dropoff.live, false)}Drop-off</span>
+      <span style={{ color: TEXT_FAINT }}>{dot(CALL_COLORS.pickup.queued)}Queued (small)</span>
+      <span style={{ color: TEXT_FAINT }}>Dashed ring: position set from status (no GPS yet)</span>
+      <span style={{ color: TEXT_FAINT }}>{selected ? "Showing the selected call's trip. Tap it again to see all ongoing calls." : "Showing ongoing calls and unit locations. Tap a call to see its trip."}</span>
     </div>
   );
 }

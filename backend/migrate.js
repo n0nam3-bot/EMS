@@ -20,6 +20,7 @@ import path from "path";
 import { pathToFileURL } from "url";
 import pg from "pg";
 import { UPGRADE_SQL } from "./scripts/upgrade.js";
+import { UPGRADE_DISPATCH_SQL } from "./scripts/upgrade_dispatch.js";
 
 const MIGRATION_ORDER = [
   "ems_dispatch_core_schema.sql",
@@ -63,6 +64,17 @@ export async function applyMigrations(client, migrationsDir = "./migrations") {
   } catch (err) {
     await client.query("ROLLBACK");
     throw new Error(`upgrade failed: ${err.message}`);
+  }
+  // Dispatch reliability (incident timeline). Same story: also run on its own
+  // against existing databases (scripts/upgrade_dispatch.js), safe to repeat.
+  try {
+    await client.query("BEGIN");
+    await client.query(UPGRADE_DISPATCH_SQL);
+    await client.query("COMMIT");
+    console.log("  upgrade (dispatch timeline) ... done");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw new Error(`dispatch upgrade failed: ${err.message}`);
   }
 }
 
@@ -114,6 +126,8 @@ export async function ensureRuntimeRole(client, password) {
   // table the app may only reach through its narrow functions.
   await client.query("REVOKE UPDATE, DELETE ON pcr_events, unit_checks, unit_check_items FROM ems_app_runtime");
   await client.query("REVOKE ALL ON platform_admins FROM ems_app_runtime");
+  // Added by scripts/upgrade_dispatch.js: the call timeline is append-only too.
+  await client.query("REVOKE UPDATE, DELETE ON incident_events, unit_vehicle_history FROM ems_app_runtime");
   // The two sign-in lookup functions (see scripts/upgrade.js) — the only way
   // the app can find an account before it knows which company it belongs to.
   await client.query(`DO $$ BEGIN
@@ -153,19 +167,11 @@ async function migrate() {
   await client.end();
 }
 
-// Guarded so importing this file (as tests/isolation.test.js does, to
-// reuse applyMigrations/ensureRuntimeRole against a real database)
-// doesn't ALSO trigger this module's own top-level migration run in
-// the background. Without this check, that's exactly what happens:
-// the import fires migrate() against whatever MIGRATION_DATABASE_URL
-// is in .env, which — if that database is already migrated — fails
-// and calls process.exit(1), tearing down whatever process imported
-// this file. The comparison goes through pathToFileURL because a plain
-// `file://${argv[1]}` string never matches on Windows (backslashes, a drive
-// letter) — which made `npm run migrate` do nothing there, silently.
-// That's not hypothetical; it's the actual bug that showed
-// up while building the test suite this guards, and it cost real time
-// to trace before the cause turned out to be this one missing check.
+// Guarded so importing this file (as tests do, to reuse applyMigrations /
+// ensureRuntimeRole against a real database) doesn't ALSO trigger this module's
+// own top-level migration run. The comparison goes through pathToFileURL because
+// a plain `file://${argv[1]}` string never matches on Windows, which made
+// `npm run migrate` silently do nothing there.
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   migrate().catch((err) => {
     console.error("Unexpected migration error:", err);

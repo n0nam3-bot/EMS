@@ -45,6 +45,7 @@ router.patch("/units/:id/location", async (req, res) => {
     return client.query(
       `UPDATE units
        SET current_location = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+           location_source = 'gps',
            location_updated_at = now()
        WHERE unit_id = $3
        RETURNING *`,

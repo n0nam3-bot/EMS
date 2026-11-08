@@ -47,6 +47,40 @@ DO $$ BEGIN
         REVOKE UPDATE, DELETE ON incident_events FROM ems_app_runtime;
     END IF;
 END $$;
+
+-- Where a unit is, and how we know. 'gps' = reported by the crew's device; 'status' = placed at the
+-- call's pickup or drop-off when a dispatcher or crew changed its status by hand (no GPS yet).
+ALTER TABLE units ADD COLUMN IF NOT EXISTS location_source TEXT;
+-- The vehicle a unit is driving right now (the truck's fleet number). Can be swapped mid-shift.
+ALTER TABLE units ADD COLUMN IF NOT EXISTS vehicle_number TEXT;
+-- A retired unit disappears from every list but its history stays.
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS unit_vehicle_history (
+    history_id               BIGSERIAL PRIMARY KEY,
+    tenant_id                UUID NOT NULL REFERENCES tenants(tenant_id),
+    unit_id                  UUID NOT NULL REFERENCES units(unit_id),
+    vehicle_number           TEXT,
+    previous_vehicle_number  TEXT,
+    reason                   TEXT,
+    changed_by_user_id       UUID,
+    changed_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_unit_vehicle_history_unit ON unit_vehicle_history (unit_id, history_id DESC);
+ALTER TABLE unit_vehicle_history ENABLE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'unit_vehicle_history' AND policyname = 'tenant_isolation') THEN
+        CREATE POLICY tenant_isolation ON unit_vehicle_history
+            USING (tenant_id = current_setting('app.current_tenant_id')::UUID)
+            WITH CHECK (tenant_id = current_setting('app.current_tenant_id')::UUID);
+    END IF;
+END $$;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ems_app_runtime') THEN
+        GRANT SELECT, INSERT ON unit_vehicle_history TO ems_app_runtime;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ems_app_runtime;
+        REVOKE UPDATE, DELETE ON unit_vehicle_history FROM ems_app_runtime;
+    END IF;
+END $$;
 `;
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

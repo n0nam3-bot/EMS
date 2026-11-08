@@ -44,6 +44,7 @@ router.get("/vehicles", async (req, res) => {
       SELECT vehicle_id, unit_designation, next_inspection_due,
         (next_inspection_due - CURRENT_DATE) AS days_until_due
       FROM vehicles
+      WHERE archived_at IS NULL
       ORDER BY next_inspection_due ASC NULLS LAST
     `)
   );

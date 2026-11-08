@@ -185,7 +185,7 @@ export default function OpsConsole({ session }) {
             <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}>
               {shownUnits.map((u) => <UnitCard key={u.unit_id} unit={u} check={checks[u.unit_id]} picked={picked} dragOver={dragOver === u.unit_id}
                 onOver={(e) => { e.preventDefault(); setDragOver(u.unit_id); }} onLeave={() => setDragOver(null)} onDrop={(e) => dropOnUnit(e, u)}
-                onTapPlace={() => picked && place(picked, u)} onDragStart={onDragStart} onRemove={remove} onSeat={toggleSeat} />)}
+                onTapPlace={() => picked && place(picked, u)} onDragStart={onDragStart} onRemove={remove} onSeat={toggleSeat} session={session} reload={load} />)}
             </div>
           </div>
         </div>
@@ -194,7 +194,47 @@ export default function OpsConsole({ session }) {
   );
 }
 
-function UnitCard({ unit, check, picked, dragOver, onOver, onLeave, onDrop, onTapPlace, onDragStart, onRemove, onSeat }) {
+// The truck this unit is driving. Assign a number, or swap it when there's a mechanical problem or an
+// accident so the unit stays in service. Swapping needs a reason, and every change is kept.
+function VehicleBox({ unit, session, reload }) {
+  const [open, setOpen] = useState(false);
+  const [number, setNumber] = useState("");
+  const [reason, setReason] = useState("");
+  const [history, setHistory] = useState(null);
+  const [err, setErr] = useState("");
+  const had = Boolean(unit.vehicle_number);
+  const start = async () => {
+    setOpen(true); setNumber(unit.vehicle_number || ""); setReason(""); setErr("");
+    try { setHistory(await apiRequest(session, "GET", `/units/${unit.unit_id}/vehicle-history`)); } catch (e) { setHistory([]); }
+  };
+  const save = async () => {
+    setErr("");
+    try { await apiRequest(session, "PUT", `/units/${unit.unit_id}/vehicle`, { vehicleNumber: number.trim(), reason: reason.trim() }); setOpen(false); await reload(); }
+    catch (e) { setErr(e.message); }
+  };
+  return (
+    <div onClick={(e) => e.stopPropagation()} className="text-xs flex flex-col gap-1.5" style={{ color: TEXT_SECONDARY }}>
+      <div className="flex items-center gap-2">
+        <span>Vehicle: <b style={{ color: unit.vehicle_number ? TEXT_PRIMARY : AMBER }}>{unit.vehicle_number ? `#${unit.vehicle_number}` : "none assigned"}</b></span>
+        {!open && <button onClick={start} className="px-1.5 py-0.5 rounded" style={{ border: `1px solid ${HAIRLINE}`, color: BLUE }}>{had ? "Swap vehicle" : "Assign vehicle"}</button>}
+      </div>
+      {open && (
+        <div className="flex flex-col gap-1.5 rounded-md p-2" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}` }}>
+          <input aria-label="Vehicle number" value={number} onChange={(e) => setNumber(e.target.value)} placeholder="Vehicle number, e.g. 214" className="text-sm rounded px-2 py-1.5" style={{ backgroundColor: PANEL, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }} />
+          {had && <input aria-label="Reason" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why? e.g. mechanical issue, accident" className="text-sm rounded px-2 py-1.5" style={{ backgroundColor: PANEL, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY }} />}
+          {err && <div style={{ color: RED }}>{err}</div>}
+          <div className="flex gap-2">
+            <button disabled={!number.trim() || (had && reason.trim().length < 3)} onClick={save} className="px-2 py-1 rounded font-medium" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN, opacity: !number.trim() || (had && reason.trim().length < 3) ? 0.5 : 1 }}>Save vehicle</button>
+            <button onClick={() => setOpen(false)} className="px-2 py-1 rounded" style={{ border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Cancel</button>
+          </div>
+          {history && history.length > 0 && <div style={{ color: TEXT_FAINT }}>{history.slice(0, 3).map((h, i) => <div key={i}>{new Date(h.changed_at).toLocaleDateString()}: {h.previous_vehicle_number ? `#${h.previous_vehicle_number} → ` : ""}#{h.vehicle_number}{h.reason ? ` (${h.reason})` : ""}</div>)}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UnitCard({ unit, check, picked, dragOver, onOver, onLeave, onDrop, onTapPlace, onDragStart, onRemove, onSeat, session, reload }) {
   const [label, color] = STATUS[unit.current_status] || [unit.current_status, TEXT_SECONDARY];
   const needs = unitNeeds(unit);
   const slots = Array.from({ length: MAX_CREW }, (_, i) => unit.crew[i] || null);
@@ -231,6 +271,7 @@ function UnitCard({ unit, check, picked, dragOver, onOver, onLeave, onDrop, onTa
           <div key={`empty${i}`} className="rounded-md px-2 py-1.5 text-xs" style={{ border: `1px dashed ${HAIRLINE}`, color: TEXT_FAINT }}>{i === 0 && unit.crew.length === 0 ? "Drop a person here" : "Open seat"}</div>
         ))}
       </div>
+      <VehicleBox unit={unit} session={session} reload={reload} />
       {needs.length > 0 && unit.crew.length > 0 && <div className="text-xs" style={{ color: AMBER }}>Needs {needs.join(" and ")} to take calls.</div>}
       {unit.crew.length === 0 && <div className="text-xs" style={{ color: TEXT_FAINT }}>No crew: out of service.</div>}
       {BUSY.includes(unit.current_status) && <div className="text-xs" style={{ color: TEXT_FAINT }}>On a call. Crew changes apply immediately.</div>}
