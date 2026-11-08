@@ -237,7 +237,7 @@ router.post("/units", ADMIN, handle(async (req, res) => {
   if (!designation) fail(400, "Give the unit a name, like Medic 4");
   if (!LEVELS.includes(level)) fail(400, "Level must be BLS, ALS or CCT");
   const unit = await withTenant(req.user.tenantId, async (c) => {
-    const dup = await c.query("SELECT 1 FROM vehicles WHERE lower(unit_designation) = lower($1) AND archived_at IS NULL", [designation]);
+    const dup = await c.query("SELECT 1 FROM vehicles WHERE lower(unit_designation) = lower($1)", [designation]);
     if (dup.rows.length) fail(409, `A unit named "${designation}" already exists`);
     const v = (await c.query(
       "INSERT INTO vehicles (tenant_id, unit_designation, capability_level) VALUES ($1, $2, $3) RETURNING vehicle_id",
@@ -251,97 +251,6 @@ router.post("/units", ADMIN, handle(async (req, res) => {
     )).rows[0];
   });
   res.status(201).json({ unit_id: unit.unit_id, unit_designation: designation, capability_level: level });
-}));
-
-// Rename a unit, or change its level (BLS/ALS/CCT). Changing the level of a unit that has a crew
-// or is on a call is refused: its crew requirements would change under it.
-router.patch("/units/:id", ADMIN, handle(async (req, res) => {
-  if (!UUID_RE.test(req.params.id)) fail(400, "Bad unit id");
-  const b = req.body || {};
-  const designation = b.designation === undefined ? null : String(b.designation).trim();
-  const level = b.capabilityLevel === undefined ? null : String(b.capabilityLevel).toUpperCase();
-  if (designation !== null && !designation) fail(400, "Give the unit a name, like Medic 4");
-  if (level !== null && !LEVELS.includes(level)) fail(400, "Level must be BLS, ALS or CCT");
-  if (designation === null && level === null) fail(400, "Nothing to change");
-  const out = await withTenant(req.user.tenantId, async (c) => {
-    const u = (await c.query(
-      `SELECT un.unit_id, un.current_status, v.vehicle_id, v.unit_designation, v.capability_level
-       FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1 AND v.archived_at IS NULL`, [req.params.id])).rows[0];
-    if (!u) fail(404, "Unit not found");
-    if (designation !== null && designation.toLowerCase() !== u.unit_designation.toLowerCase()) {
-      const dup = await c.query("SELECT 1 FROM vehicles WHERE lower(unit_designation) = lower($1) AND archived_at IS NULL AND vehicle_id <> $2", [designation, u.vehicle_id]);
-      if (dup.rows.length) fail(409, `A unit named "${designation}" already exists`);
-    }
-    if (level !== null && level !== u.capability_level) {
-      const crew = Number((await c.query("SELECT count(*) AS n FROM unit_crew_assignments WHERE unit_id = $1 AND assigned_to IS NULL", [req.params.id])).rows[0].n);
-      const onCall = (await c.query("SELECT 1 FROM incident_unit_assignments WHERE unit_id = $1 AND unassigned_at IS NULL", [req.params.id])).rows.length > 0;
-      if (crew > 0 || onCall) fail(409, "Take the crew off this unit (and finish its call) before changing its level.");
-    }
-    await c.query("UPDATE vehicles SET unit_designation = COALESCE($1, unit_designation), capability_level = COALESCE($2, capability_level) WHERE vehicle_id = $3", [designation, level, u.vehicle_id]);
-    return { unit_id: u.unit_id, unit_designation: designation ?? u.unit_designation, capability_level: level ?? u.capability_level };
-  });
-  res.json(out);
-}));
-
-// Delete a unit. One with no history is removed outright; one that has worked calls is RETIRED
-// (hidden from every list, history kept). Either way it can't have a crew on it or be on a call.
-router.delete("/units/:id", ADMIN, handle(async (req, res) => {
-  if (!UUID_RE.test(req.params.id)) fail(400, "Bad unit id");
-  const out = await withTenant(req.user.tenantId, async (c) => {
-    const u = (await c.query("SELECT un.unit_id, un.vehicle_id, v.unit_designation FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1 AND v.archived_at IS NULL", [req.params.id])).rows[0];
-    if (!u) fail(404, "Unit not found");
-    if ((await c.query("SELECT 1 FROM incident_unit_assignments WHERE unit_id = $1 AND unassigned_at IS NULL", [req.params.id])).rows.length) fail(409, `${u.unit_designation} is on a call. Finish or release the call first.`);
-    if ((await c.query("SELECT 1 FROM unit_crew_assignments WHERE unit_id = $1 AND assigned_to IS NULL", [req.params.id])).rows.length) fail(409, `${u.unit_designation} has a crew on it. Take them off in OPS first.`);
-    await c.query("SAVEPOINT remove_unit");
-    try {
-      await c.query("DELETE FROM unit_crew_assignments WHERE unit_id = $1", [req.params.id]);   // ended crew assignments only (none are open)
-      await c.query("DELETE FROM units WHERE unit_id = $1", [req.params.id]);
-      await c.query("DELETE FROM vehicles WHERE vehicle_id = $1", [u.vehicle_id]);
-      return { removed: true, retired: false };
-    } catch (err) {
-      if (err.code !== "23503" && err.code !== "42501") throw err;                              // history exists (or is protected): retire instead
-      await c.query("ROLLBACK TO SAVEPOINT remove_unit");
-      await c.query("UPDATE vehicles SET archived_at = now(), is_in_service = FALSE WHERE vehicle_id = $1", [u.vehicle_id]);
-      await c.query("UPDATE units SET current_status = 'out_of_service' WHERE unit_id = $1", [req.params.id]);
-      return { removed: true, retired: true };
-    }
-  });
-  res.json(out);
-}));
-
-// The truck a unit is driving. OPS can assign one, or swap it mid-shift when there's a mechanical
-// problem or an accident, so the unit stays in service. Changing from one vehicle to another needs a
-// reason, and every change is kept. A vehicle number can be on only one active unit at a time.
-router.put("/units/:id/vehicle", STAFFING, handle(async (req, res) => {
-  if (!UUID_RE.test(req.params.id)) fail(400, "Bad unit id");
-  const number = req.body?.vehicleNumber === null ? null : String(req.body?.vehicleNumber ?? "").trim().slice(0, 40);
-  const reason = String(req.body?.reason ?? "").trim().slice(0, 300);
-  if (number === "") fail(400, "Enter the vehicle number, like 214");
-  const out = await withTenant(req.user.tenantId, async (c) => {
-    const u = (await c.query("SELECT un.unit_id, un.vehicle_number, v.unit_designation FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1 AND v.archived_at IS NULL FOR UPDATE OF un", [req.params.id])).rows[0];
-    if (!u) fail(404, "Unit not found");
-    if ((u.vehicle_number ?? null) === number) return { unit_id: u.unit_id, vehicle_number: number, unchanged: true };
-    if (u.vehicle_number && reason.length < 3) fail(400, "Say why the vehicle is being changed (for example: mechanical issue, accident).");
-    if (number) {
-      const taken = (await c.query(
-        "SELECT v.unit_designation FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE lower(un.vehicle_number) = lower($1) AND un.unit_id <> $2 AND v.archived_at IS NULL", [number, req.params.id])).rows[0];
-      if (taken) fail(409, `Vehicle ${number} is already on ${taken.unit_designation}. Move it off that unit first.`);
-    }
-    await c.query("UPDATE units SET vehicle_number = $1 WHERE unit_id = $2", [number, req.params.id]);
-    await c.query(
-      "INSERT INTO unit_vehicle_history (tenant_id, unit_id, vehicle_number, previous_vehicle_number, reason, changed_by_user_id) VALUES ($1, $2, $3, $4, $5, $6)",
-      [req.user.tenantId, req.params.id, number, u.vehicle_number, reason || null, req.user.userId]);
-    return { unit_id: u.unit_id, vehicle_number: number, previous_vehicle_number: u.vehicle_number };
-  });
-  res.json(out);
-}));
-
-router.get("/units/:id/vehicle-history", STAFFING, handle(async (req, res) => {
-  if (!UUID_RE.test(req.params.id)) fail(400, "Bad unit id");
-  const rows = await withTenant(req.user.tenantId, async (c) => (await c.query(
-    `SELECT h.vehicle_number, h.previous_vehicle_number, h.reason, h.changed_at, u.display_name AS changed_by
-     FROM unit_vehicle_history h LEFT JOIN users u ON u.user_id = h.changed_by_user_id WHERE h.unit_id = $1 ORDER BY h.history_id DESC LIMIT 50`, [req.params.id])).rows);
-  res.json(rows);
 }));
 
 // Put a person on a unit (or take them off with unitId: null). One unit at a time

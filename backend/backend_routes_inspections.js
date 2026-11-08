@@ -188,7 +188,6 @@ router.get("/unit-checks/status", handle(async (req, res) => {
      LEFT JOIN LATERAL (SELECT * FROM unit_checks k WHERE k.unit_id = un.unit_id AND k.kind = 'shift_check' ORDER BY k.performed_at DESC LIMIT 1) last ON TRUE
      LEFT JOIN users lu ON lu.user_id = last.performed_by_user_id
      LEFT JOIN LATERAL (SELECT count(*) AS n, min(uca.assigned_from) AS since FROM unit_crew_assignments uca WHERE uca.unit_id = un.unit_id AND uca.assigned_to IS NULL) crew ON TRUE
-     WHERE v.archived_at IS NULL
      ORDER BY v.unit_designation`)).rows);
   // A unit with a crew on it owes one check per crew per shift. "Due" means it has a crew and no
   // check since that crew came on (or within the last 12 hours, whichever is more recent).
