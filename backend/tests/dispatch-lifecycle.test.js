@@ -199,11 +199,10 @@ test("the call timeline is append-only for the app's database login", async () =
   const app = new pg.Client({ connectionString: process.env.DATABASE_URL });
   await app.connect();
   try {
-    for (const sql of ["UPDATE incident_events SET note = 'x'", "DELETE FROM incident_events"]) {
-      await app.query("BEGIN");
-      await app.query("SELECT set_config('app.current_tenant_id', $1, true)", [TA]);
-      await assert.rejects(() => app.query(sql), /permission denied/i, sql);
-      await app.query("ROLLBACK");
-    }
+    await app.query("BEGIN");
+    await app.query("SELECT set_config('app.current_tenant_id', $1, true)", [TA]);
+    await assert.rejects(() => app.query("UPDATE incident_events SET note = 'x'"), /permission denied/i);
+    await assert.rejects(() => app.query("DELETE FROM incident_events"), /permission denied/i);
+    await app.query("ROLLBACK");
   } finally { await app.end(); }
 });
