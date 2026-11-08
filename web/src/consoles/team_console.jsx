@@ -381,31 +381,10 @@ function UnitRow({ u, status, open, toggle, act, session }) {
 
 function UnitDetails({ u, status, act, session }) {
   const [adding, setAdding] = useState(false);
-  const [name, setName] = useState(u.unit_designation);
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const removeUnit = () => act(async () => {
-    const r = await apiRequest(session, "DELETE", `/units/${u.unit_id}`);
-    return { warning: r.retired ? `${u.unit_designation} had call history, so it was retired: it's off every list and its history is kept.` : `${u.unit_designation} was deleted.` };
-  });
   const [f, setF] = useState({ kind: "dmv_inspection", result: "pass", performedOn: "", nextDue: "", notes: "" });
   const last = status?.last_check_at;
   return (
     <div className="px-4 pb-4 pt-1 flex flex-col gap-2" style={{ backgroundColor: "#111823" }}>
-      <div className="flex items-end gap-2 flex-wrap">
-        <Labeled label="Unit name"><input aria-label="Unit name" value={name} onChange={(e) => setName(e.target.value)} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled>
-        {name.trim() && name.trim() !== u.unit_designation && <button onClick={() => act(() => apiRequest(session, "PATCH", `/units/${u.unit_id}`, { designation: name.trim() }), "Unit renamed.")} className="text-sm px-3 py-1.5 rounded" style={btnGreen}>Rename</button>}
-        {name !== u.unit_designation && <button onClick={() => setName(u.unit_designation)} className="text-sm px-3 py-1.5 rounded" style={btn}>Undo</button>}
-        <span className="text-xs" style={{ color: TEXT_FAINT }}>Vehicle: {u.vehicle_number ? `#${u.vehicle_number}` : "none assigned"} (set in OPS)</span>
-        <span className="ml-auto flex items-center gap-2">
-          {confirmDelete ? (
-            <>
-              <span className="text-xs" style={{ color: AMBER }}>Delete {u.unit_designation}? A unit with call history is retired, not erased.</span>
-              <button onClick={removeUnit} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: "#F0857D" }}>Yes, delete</button>
-              <button onClick={() => setConfirmDelete(false)} className="text-xs px-2 py-1.5 rounded" style={btn}>Keep</button>
-            </>
-          ) : <button onClick={() => setConfirmDelete(true)} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: "#F0857D" }}>Delete unit</button>}
-        </span>
-      </div>
       <div className="text-xs" style={{ color: TEXT_SECONDARY }}>Crew: {u.crew.length ? u.crew.map((c) => `${c.name} (${c.role === "driver" ? "driver" : "non-driver"})`).join(", ") : "nobody yet. Use OPS to crew it."}</div>
       <div className="text-sm">
         <span style={{ color: TEXT_FAINT }}>Shift check: </span>
