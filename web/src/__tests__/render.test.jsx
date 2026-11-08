@@ -636,12 +636,12 @@ describe("schedule", () => {
 
   it("weeks start on Monday", () => { expect(startOfWeek(new Date(2026, 10, 4, 15, 30)).getDay()).toBe(1); expect(startOfWeek(new Date(2026, 10, 1)).getDate()).toBe(26); /* Sun Nov 1 -> Mon Oct 26 */ });
 
-  it("shows the crew with its start time, and lets a shift be opened, saved and deleted", async () => {
+  it("shows a week by unit with each shift's time, and lets a shift be opened, saved and deleted", async () => {
     const calls = fakeServer({ "GET /schedule": [SHIFT], "GET /units": [UNIT()], "PATCH /schedule/s1": { ok: true }, "DELETE /schedule/s1": { ok: true } });
     render(<ScheduleConsole session={liveSession()} />);
     expect(await screen.findByText("Pat Medic")).toBeTruthy();
-    expect(screen.getByText("0700-1900")).toBeTruthy();
-    expect(screen.getByText(/^ALS 1/)).toBeTruthy();                      // an ALS unit's crew; the tab opened itself
+    expect(screen.getByText("07:00–19:00")).toBeTruthy();
+    expect(screen.getByText("No unit yet")).toBeTruthy();
     fireEvent.click(screen.getByText("Pat Medic"));
     expect(await screen.findByText("Edit shift: Pat Medic")).toBeTruthy();
     fireEvent.change(screen.getByDisplayValue("12 hours"), { target: { value: "10" } });
@@ -650,36 +650,6 @@ describe("schedule", () => {
     fireEvent.click(await screen.findByText("Pat Medic"));
     fireEvent.click(await screen.findByRole("button", { name: "Delete shift" }));
     await waitFor(() => expect(calls.some((x) => x.key === "DELETE /schedule/s1")).toBe(true));
-  });
-
-  it("splits ALS and BLS onto tabs, lists start times from 0000 down, and numbers crews per day by start time", async () => {
-    const P = (id, name, level, day, h, hours = 8) => ({ shift_id: id, crew_member_id: "c" + id, name, field_level: level, unit_id: null, unit_designation: null, seat_role: null, starts_at: at(day, h), ends_at: at(day, h + hours), notes: null });
-    fakeServer({ "GET /schedule": [
-      P("a", "Ed Emt", "emt", 0, 10), P("b", "Dan Driver", "mvo", 0, 10),          // Mon 10:00 -> BLS 2
-      P("c", "Eve Emt", "emt", 0, 0), P("d", "Mia Mvo", "mvo", 0, 0),              // Mon 00:00 -> BLS 1
-      P("e", "Gus Emt", "emt", 1, 1), P("f", "Max Mvo", "mvo", 1, 1),              // Tue 01:00 -> BLS 1 (numbers restart each day)
-      P("g", "Pat Medic", "paramedic", 0, 6), P("h", "Dee Driver", "mvo", 0, 6),   // ALS tab
-    ], "GET /units": [UNIT()] });
-    render(<ScheduleConsole session={liveSession()} />);
-    expect(await screen.findByText("Mia Mvo")).toBeTruthy();                       // opens on BLS
-    expect(screen.queryByText("Pat Medic")).toBeNull();                            // ALS is on its own tab
-    const rows = screen.getAllByText(/^\d{4}$/).map((e) => e.textContent);
-    expect(rows).toEqual(["0000", "0100", "1000"]);                                // from 0000, only start times in use
-    const labels = screen.getAllByText(/^BLS \d/).map((e) => e.textContent.trim().split(" ").slice(0, 2).join(" "));
-    expect(labels).toEqual(["BLS 1", "BLS 1", "BLS 2"]);                           // Mon 0000, Tue 0100, Mon 1000 in row order
-    expect(screen.getAllByText(/\[MVO\]/).length).toBe(3);                     // the driver of each BLS crew is tagged
-    fireEvent.click(screen.getByRole("tab", { name: /ALS/ }));
-    expect(await screen.findByText("Pat Medic")).toBeTruthy();
-    expect(screen.queryByText("Mia Mvo")).toBeNull();
-    expect(screen.getByText(/^ALS 1/)).toBeTruthy();
-  });
-
-  it("a + in a time row opens a new shift at that start time on that day", async () => {
-    fakeServer({ "GET /schedule": [{ shift_id: "z", crew_member_id: "cz", name: "Zed Emt", field_level: "emt", unit_id: null, unit_designation: null, seat_role: null, starts_at: at(0, 5), ends_at: at(0, 13), notes: null }], "GET /units": [UNIT()], "GET /ops/roster": [] });
-    render(<ScheduleConsole session={liveSession()} />);
-    await screen.findByText("Zed Emt");
-    fireEvent.click(screen.getAllByRole("button", { name: /Add a BLS shift starting 0500/ })[2]);
-    expect((await screen.findByDisplayValue("05:00"))).toBeTruthy();
   });
 
   it("adds the same shift for several days in a row, and says plainly when it clashes with another of that person's shifts", async () => {
