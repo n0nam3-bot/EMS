@@ -211,6 +211,13 @@ CREATE TABLE IF NOT EXISTS checklist_items (
     source       TEXT NOT NULL DEFAULT 'custom' CHECK (source IN ('starter', 'custom', 'imported')),
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- (added to the table before anything seeds it: older databases need the column in place first)
+ALTER TABLE checklist_items ADD COLUMN IF NOT EXISTS section TEXT NOT NULL DEFAULT 'equipment';
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'checklist_items_section_check') THEN
+        ALTER TABLE checklist_items ADD CONSTRAINT checklist_items_section_check CHECK (section IN ('vehicle', 'equipment'));
+    END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS unit_checks (
     check_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id            UUID NOT NULL REFERENCES tenants(tenant_id),
@@ -244,22 +251,22 @@ BEGIN
     VALUES (p_tenant, 'EMT-B', 'EMT-Basic', NULL), (p_tenant, 'PARAMEDIC', 'Paramedic', 'ALS')
     ON CONFLICT (tenant_id, code) DO NOTHING;
     IF NOT EXISTS (SELECT 1 FROM checklist_items WHERE tenant_id = p_tenant) THEN
-        INSERT INTO checklist_items (tenant_id, applies_to, category, label, min_quantity, sort_order, source) VALUES
-          (p_tenant, 'BLS', 'Vehicle', 'Exterior, tires and lights checked', NULL, 10, 'starter'),
-          (p_tenant, 'BLS', 'Vehicle', 'Emergency lights and siren working', NULL, 20, 'starter'),
-          (p_tenant, 'BLS', 'Vehicle', 'Fuel level adequate', NULL, 30, 'starter'),
-          (p_tenant, 'BLS', 'Vehicle', 'Cot secured and operating', 1, 40, 'starter'),
-          (p_tenant, 'BLS', 'Oxygen and airway', 'Oxygen supply adequate, regulator working', NULL, 50, 'starter'),
-          (p_tenant, 'BLS', 'Oxygen and airway', 'Suction working', 1, 60, 'starter'),
-          (p_tenant, 'BLS', 'Oxygen and airway', 'Bag-valve-mask and airway adjuncts present', NULL, 70, 'starter'),
-          (p_tenant, 'BLS', 'Patient assessment', 'Blood pressure cuffs and stethoscope present', NULL, 80, 'starter'),
-          (p_tenant, 'BLS', 'Patient assessment', 'AED/monitor charged and operating', 1, 90, 'starter'),
-          (p_tenant, 'BLS', 'Infection control', 'PPE available and vehicle decontaminated', NULL, 100, 'starter'),
-          (p_tenant, 'BLS', 'Documentation', 'Vehicle check sheet and trip records on board', NULL, 110, 'starter'),
-          (p_tenant, 'ALS', 'ALS equipment', 'Cardiac monitor/defibrillator charged and tested', 1, 200, 'starter'),
-          (p_tenant, 'ALS', 'ALS equipment', 'IV and advanced airway supplies stocked', NULL, 210, 'starter'),
-          (p_tenant, 'ALS', 'Medications', 'Medication kit sealed and in date', 1, 220, 'starter'),
-          (p_tenant, 'ALS', 'Medications', 'Controlled substances counted and logged', NULL, 230, 'starter');
+        INSERT INTO checklist_items (tenant_id, applies_to, category, label, min_quantity, sort_order, source, section) VALUES
+          (p_tenant, 'BLS', 'Vehicle', 'Exterior, tires and lights checked', NULL, 10, 'starter', 'vehicle'),
+          (p_tenant, 'BLS', 'Vehicle', 'Emergency lights and siren working', NULL, 20, 'starter', 'vehicle'),
+          (p_tenant, 'BLS', 'Vehicle', 'Fuel level adequate', NULL, 30, 'starter', 'vehicle'),
+          (p_tenant, 'BLS', 'Vehicle', 'Cot secured and operating', 1, 40, 'starter', 'vehicle'),
+          (p_tenant, 'BLS', 'Oxygen and airway', 'Oxygen supply adequate, regulator working', NULL, 50, 'starter', 'equipment'),
+          (p_tenant, 'BLS', 'Oxygen and airway', 'Suction working', 1, 60, 'starter', 'equipment'),
+          (p_tenant, 'BLS', 'Oxygen and airway', 'Bag-valve-mask and airway adjuncts present', NULL, 70, 'starter', 'equipment'),
+          (p_tenant, 'BLS', 'Patient assessment', 'Blood pressure cuffs and stethoscope present', NULL, 80, 'starter', 'equipment'),
+          (p_tenant, 'BLS', 'Patient assessment', 'AED/monitor charged and operating', 1, 90, 'starter', 'equipment'),
+          (p_tenant, 'BLS', 'Infection control', 'PPE available and vehicle decontaminated', NULL, 100, 'starter', 'equipment'),
+          (p_tenant, 'BLS', 'Documentation', 'Vehicle check sheet and trip records on board', NULL, 110, 'starter', 'equipment'),
+          (p_tenant, 'ALS', 'ALS equipment', 'Cardiac monitor/defibrillator charged and tested', 1, 200, 'starter', 'equipment'),
+          (p_tenant, 'ALS', 'ALS equipment', 'IV and advanced airway supplies stocked', NULL, 210, 'starter', 'equipment'),
+          (p_tenant, 'ALS', 'Medications', 'Medication kit sealed and in date', 1, 220, 'starter', 'equipment'),
+          (p_tenant, 'ALS', 'Medications', 'Controlled substances counted and logged', NULL, 230, 'starter', 'equipment');
     END IF;
 END $$;
 SELECT seed_tenant_defaults(tenant_id) FROM tenants;
@@ -427,11 +434,78 @@ CREATE TABLE IF NOT EXISTS shifts (
 CREATE INDEX IF NOT EXISTS idx_shifts_time ON shifts (tenant_id, starts_at);
 CREATE INDEX IF NOT EXISTS idx_shifts_person ON shifts (crew_member_id, starts_at);
 
+ALTER TABLE units ADD COLUMN IF NOT EXISTS retired_at TIMESTAMPTZ;
+
+
+-- ---- Vehicles are not units ----------------------------------------------------------
+-- A UNIT is a crewed team (BLS 1, Medic 7). A VEHICLE is the physical ambulance with a number
+-- painted on it. A unit has one vehicle at a time, and it can be swapped (mechanical problem,
+-- accident) without the unit stopping. Inspections of the vehicle belong to the vehicle.
+DO $$ BEGIN
+    IF to_regclass('public.fleet_vehicles') IS NULL THEN
+        CREATE TABLE fleet_vehicles (
+            fleet_vehicle_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id             UUID NOT NULL REFERENCES tenants(tenant_id),
+            vehicle_number        TEXT NOT NULL,
+            make_model            TEXT,
+            plate                 TEXT,
+            status                TEXT NOT NULL DEFAULT 'in_service' CHECK (status IN ('in_service', 'out_of_service')),
+            out_of_service_reason TEXT,
+            last_inspection_date  DATE,
+            next_inspection_due   DATE,
+            retired_at            TIMESTAMPTZ,
+            created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        ALTER TABLE units ADD COLUMN IF NOT EXISTS fleet_vehicle_id UUID REFERENCES fleet_vehicles(fleet_vehicle_id);
+        -- One time, for units that already exist: give each its own vehicle, numbered like the unit,
+        -- carrying over its inspection dates. Rename them to the real vehicle numbers in Team.
+        DECLARE
+            r RECORD; f UUID; n INT;
+        BEGIN
+            FOR r IN SELECT u.unit_id, u.tenant_id, v.unit_designation, v.last_inspection_date, v.next_inspection_due
+                     FROM units u JOIN vehicles v ON v.vehicle_id = u.vehicle_id ORDER BY u.tenant_id, v.unit_designation, u.unit_id LOOP
+                -- if two units ever shared a name, number the later ones "Name (2)", "Name (3)" so nothing fails
+                SELECT count(*) INTO n FROM units u2 JOIN vehicles v2 ON v2.vehicle_id = u2.vehicle_id
+                WHERE u2.tenant_id = r.tenant_id AND lower(v2.unit_designation) = lower(r.unit_designation) AND u2.unit_id < r.unit_id;
+                INSERT INTO fleet_vehicles (tenant_id, vehicle_number, last_inspection_date, next_inspection_due)
+                VALUES (r.tenant_id, CASE WHEN n = 0 THEN r.unit_designation ELSE r.unit_designation || ' (' || (n + 1) || ')' END, r.last_inspection_date, r.next_inspection_due)
+                RETURNING fleet_vehicle_id INTO f;
+                UPDATE units SET fleet_vehicle_id = f WHERE unit_id = r.unit_id;
+            END LOOP;
+        END;
+    END IF;
+END $$;
+ALTER TABLE units ADD COLUMN IF NOT EXISTS fleet_vehicle_id UUID REFERENCES fleet_vehicles(fleet_vehicle_id);
+CREATE UNIQUE INDEX IF NOT EXISTS fleet_vehicle_number_unique ON fleet_vehicles (tenant_id, lower(vehicle_number)) WHERE retired_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS units_one_per_vehicle ON units (fleet_vehicle_id) WHERE fleet_vehicle_id IS NOT NULL AND retired_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS unit_vehicle_log (
+    log_id          BIGSERIAL PRIMARY KEY,
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+    unit_id         UUID NOT NULL REFERENCES units(unit_id),
+    from_vehicle_id UUID REFERENCES fleet_vehicles(fleet_vehicle_id),
+    to_vehicle_id   UUID REFERENCES fleet_vehicles(fleet_vehicle_id),
+    reason          TEXT,
+    by_user_id      UUID REFERENCES users(user_id),
+    at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---- Who checks what -----------------------------------------------------------------
+--   vehicle check    the DRIVER, for the vehicle the unit has right now
+--   BLS check        an EMT or above, for the BLS equipment inside it
+--   ALS check        the paramedic, for the ALS equipment
+UPDATE checklist_items SET section = 'vehicle' WHERE lower(category) = 'vehicle' AND section = 'equipment' AND source = 'starter';
+ALTER TABLE unit_checks ADD COLUMN IF NOT EXISTS fleet_vehicle_id UUID REFERENCES fleet_vehicles(fleet_vehicle_id);
+ALTER TABLE unit_checks ALTER COLUMN unit_id DROP NOT NULL;      -- an inspection of a spare vehicle has no unit
+ALTER TABLE unit_checks DROP CONSTRAINT IF EXISTS unit_checks_kind_check;
+ALTER TABLE unit_checks ADD CONSTRAINT unit_checks_kind_check
+    CHECK (kind IN ('shift_check', 'vehicle_check', 'bls_check', 'als_check', 'dmv_inspection', 'mechanical', 'doh_inspection', 'other'));
+
 -- ---- Row-level security and grants for the new tables ---------------------------
 DO $$
 DECLARE t TEXT;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['pcr_crew', 'pcr_events', 'checklist_items', 'unit_checks', 'unit_check_items', 'shifts'] LOOP
+    FOREACH t IN ARRAY ARRAY['pcr_crew', 'pcr_events', 'checklist_items', 'unit_checks', 'unit_check_items', 'shifts', 'fleet_vehicles', 'unit_vehicle_log'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = t AND policyname = 'tenant_isolation') THEN
             EXECUTE format(
@@ -456,10 +530,10 @@ BEGIN
         END IF;
     END LOOP;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ems_app_runtime') THEN
-        GRANT SELECT, INSERT, UPDATE, DELETE ON pcr_crew, pcr_events, checklist_items, unit_checks, unit_check_items, shifts TO ems_app_runtime;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON pcr_crew, pcr_events, checklist_items, unit_checks, unit_check_items, shifts, fleet_vehicles, unit_vehicle_log TO ems_app_runtime;
         GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ems_app_runtime;
         -- Records of what happened are append-only for the app.
-        REVOKE UPDATE, DELETE ON pcr_events, unit_checks, unit_check_items FROM ems_app_runtime;
+        REVOKE UPDATE, DELETE ON pcr_events, unit_checks, unit_check_items, unit_vehicle_log FROM ems_app_runtime;
         REVOKE ALL ON platform_admins FROM ems_app_runtime;
     END IF;
 END $$;
