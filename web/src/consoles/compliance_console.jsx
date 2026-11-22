@@ -220,16 +220,18 @@ export default function ComplianceConsole({ session }) {
               <Panel title="UNIT CHECKS (start of shift)">
                 {unitChecks.length === 0 && <div className="px-4 py-4 text-sm" style={{ color: TEXT_FAINT }}>No units yet.</div>}
                 {unitChecks.map((u) => {
-                  const hours = u.last_check_at ? (Date.now() - new Date(u.last_check_at)) / 3600000 : null;
-                  const failed = u.last_check_result === "fail";
-                  const color = failed ? RED : hours === null || hours > 24 ? AMBER : GREEN;
+                  const kinds = ["vehicle", "bls", "als"].filter((k) => u.checks?.[k]?.required);
+                  const due = kinds.filter((k) => u.checks[k].due);
+                  const failed = kinds.filter((k) => u.checks[k].last_result === "fail" && !u.checks[k].due);
+                  const color = failed.length ? RED : due.length ? AMBER : kinds.length ? GREEN : TEXT_FAINT;
+                  const NAME = { vehicle: "vehicle", bls: "BLS equipment", als: "ALS equipment" };
                   return (
                     <div key={u.unit_id} className="px-4 py-2 border-b text-sm" style={{ borderColor: "#1B2330" }}>
                       <div className="flex items-center justify-between gap-2">
-                        <span>{u.unit_designation} <span className="text-xs" style={{ color: TEXT_FAINT }}>{u.capability_level}</span></span>
-                        <span className="text-xs" style={{ color }}>{hours === null ? "no check on record" : failed ? `FAILED ${Math.round(hours)} h ago` : hours > 24 ? `last check ${Math.round(hours / 24)} days ago` : `passed ${Math.round(hours)} h ago`}</span>
+                        <span>{u.unit_designation} <span className="text-xs" style={{ color: TEXT_FAINT }}>{u.capability_level}{u.vehicle_number ? ` · vehicle ${u.vehicle_number}` : " · no vehicle"}</span></span>
+                        <span className="text-xs" style={{ color }}>{!u.crew_count ? "no crew" : failed.length ? `FAILED: ${failed.map((k) => NAME[k]).join(", ")}` : due.length ? `due: ${due.map((k) => NAME[k]).join(", ")}` : "all checks done"}</span>
                       </div>
-                      {failed && <div className="text-xs mt-0.5" style={{ color: RED }}>{u.failed_items.join("; ")}</div>}
+                      {failed.map((k) => <div key={k} className="text-xs mt-0.5" style={{ color: RED }}>{NAME[k]}: {u.checks[k].failed_items.join("; ")}</div>)}
                       {(u.periodic || []).map((p) => <div key={p.kind} className="text-xs mt-0.5" style={{ color: TEXT_SECONDARY }}>{{ dmv_inspection: "DMV inspection", mechanical: "Mechanical", doh_inspection: "DOH inspection", other: "Other" }[p.kind]}: {p.result === "pass" ? "passed" : "FAILED"} {new Date(p.performedAt).toLocaleDateString()}{p.nextDue ? `, next due ${new Date(p.nextDue).toLocaleDateString()}` : ""}</div>)}
                     </div>
                   );

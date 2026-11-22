@@ -46,7 +46,7 @@ export default function TeamConsole({ session }) {
     catch (e) { setError(e.message); return false; }
   }, []);
 
-  const tabs = [["field", "Field personnel"], ["office", "Office personnel"], ["units", "Units & inspections"], ["places", "Saved places"]];
+  const tabs = [["field", "Field personnel"], ["office", "Office personnel"], ["units", "Units & inspections"], ["vehicles", "Vehicles"], ["places", "Saved places"]];
   return (
     <div style={{ backgroundColor: VOID, color: TEXT_PRIMARY, fontFamily: "'Inter', system-ui, sans-serif" }} className="min-h-screen w-full">
       <style>{`* { box-sizing: border-box; } button, input, select, textarea { font-family: inherit; } .mono { font-family: ui-monospace, monospace; }`}</style>
@@ -62,6 +62,7 @@ export default function TeamConsole({ session }) {
         {notice && <div className="text-sm px-3 py-2 rounded-md" style={{ color: GREEN, backgroundColor: "rgba(52,211,153,0.08)", border: "1px solid #2E5943" }}>{notice}</div>}
         {(tab === "field" || tab === "office") && <People key={tab} kind={tab} session={session} act={act} />}
         {tab === "units" && <UnitsAndInspections session={session} act={act} />}
+        {tab === "vehicles" && <Vehicles session={session} act={act} />}
         {tab === "places" && <Places session={session} act={act} />}
       </div>
     </div>
@@ -359,15 +360,23 @@ function UnitsAndInspections({ session, act }) {
   );
 }
 
+const CHECK_NAMES = { vehicle: "Vehicle check", bls: "BLS equipment check", als: "ALS equipment check" };
+function checkChip(status) {
+  if (!status || !status.crew_count) return null;
+  if (status.check_due) return ["Check due", AMBER];
+  if (status.any_failed) return ["Check failed", RED];
+  return ["Checked", GREEN];
+}
+
 function UnitRow({ u, status, open, toggle, act, session }) {
-  const failed = status?.last_check_result === "fail";
-  const chip = !status?.crew_count ? null : status.check_due ? ["Check due", AMBER] : failed ? ["Check failed", RED] : ["Checked", GREEN];
+  const chip = checkChip(status);
   const next = (status?.periodic || []).filter((p) => p.nextDue).sort((a, b) => new Date(a.nextDue) - new Date(b.nextDue))[0];
   const nd = next ? daysUntil(next.nextDue) : null;
   return (
     <div className="border-b last:border-b-0" style={{ borderColor: "#1B2330" }}>
       <button onClick={toggle} aria-expanded={open} className="w-full flex items-center gap-3 px-3 py-2.5 text-left" style={{ backgroundColor: open ? "#17202C" : "transparent" }}>
         <span className="min-w-0 flex-1 text-sm font-medium truncate">{u.unit_designation} <span className="text-xs" style={{ color: TEXT_SECONDARY }}>{u.capability_level}</span></span>
+        <span className="text-xs shrink-0" style={{ color: u.vehicle_number ? TEXT_SECONDARY : AMBER }}>{u.vehicle_number ? `Vehicle ${u.vehicle_number}` : "No vehicle"}</span>
         {chip && <Chip color={chip[1]}>{chip[0]}</Chip>}
         {next && <span className="hidden sm:inline text-xs" style={{ color: nd < 0 ? RED : nd <= 30 ? AMBER : TEXT_FAINT }}>{KIND_LABEL[next.kind]} {nd < 0 ? `${-nd} d overdue` : `in ${nd} d`}</span>}
         <span className="text-xs shrink-0" style={{ color: u.current_status === "out_of_service" ? AMBER : TEXT_SECONDARY }}>{STATUS_LABEL[u.current_status] || u.current_status}</span>
@@ -381,50 +390,177 @@ function UnitRow({ u, status, open, toggle, act, session }) {
 
 function UnitDetails({ u, status, act, session }) {
   const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState({ designation: u.unit_designation, capabilityLevel: u.capability_level });
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [f, setF] = useState({ kind: "dmv_inspection", result: "pass", performedOn: "", nextDue: "", notes: "" });
-  const last = status?.last_check_at;
+  const dirty = editing.designation !== u.unit_designation || editing.capabilityLevel !== u.capability_level;
   return (
-    <div className="px-4 pb-4 pt-1 flex flex-col gap-2" style={{ backgroundColor: "#111823" }}>
-      <div className="text-xs" style={{ color: TEXT_SECONDARY }}>Crew: {u.crew.length ? u.crew.map((c) => `${c.name} (${c.role === "driver" ? "driver" : "non-driver"})`).join(", ") : "nobody yet. Use OPS to crew it."}</div>
-      <div className="text-sm">
-        <span style={{ color: TEXT_FAINT }}>Shift check: </span>
-        {!last ? <span style={{ color: status?.crew_count ? AMBER : TEXT_FAINT }}>{status?.crew_count ? "due: none recorded for this crew yet" : "none yet (no crew on it)"}</span>
-          : status.last_check_result === "pass" ? <span style={{ color: status.check_due ? AMBER : GREEN }}>{status.check_due ? "due again: last one" : "passed"} {ago(last)} by {status.last_check_by}</span>
-          : <span style={{ color: RED }}>FAILED {ago(last)} by {status.last_check_by}: {status.failed_items.join("; ")}</span>}
+    <div className="px-4 pb-4 pt-1 flex flex-col gap-3" style={{ backgroundColor: "#111823" }}>
+      <div className="flex items-end gap-2 flex-wrap">
+        <Labeled label="Unit name"><input value={editing.designation} onChange={(e) => setEditing({ ...editing, designation: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled>
+        <Labeled label="Level"><select value={editing.capabilityLevel} onChange={(e) => setEditing({ ...editing, capabilityLevel: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field}><option value="BLS">BLS</option><option value="ALS">ALS</option><option value="CCT">CCT</option></select></Labeled>
+        {dirty && <button onClick={() => act(() => apiRequest(session, "PATCH", `/units/${u.unit_id}`, editing), "Unit updated.")} className="text-sm px-3 py-1.5 rounded" style={btnGreen}>Save</button>}
+        {dirty && <button onClick={() => setEditing({ designation: u.unit_designation, capabilityLevel: u.capability_level })} className="text-sm px-3 py-1.5 rounded" style={btn}>Undo</button>}
       </div>
-      <div className="text-xs" style={{ color: TEXT_FAINT }}>Crews record the check on their Field screen. The system can't see it any other way.</div>
+      <div className="text-xs" style={{ color: TEXT_SECONDARY }}>Crew: {u.crew.length ? u.crew.map((c) => `${c.name} (${c.role === "driver" ? "driver" : "non-driver"})`).join(", ") : "nobody yet. Use OPS to crew it."}</div>
+      <div className="text-xs" style={{ color: u.vehicle_number ? TEXT_SECONDARY : AMBER }}>{u.vehicle_number ? `Vehicle ${u.vehicle_number}${u.vehicle_status === "out_of_service" ? " (out of service)" : ""}. Change it in OPS.` : "No vehicle assigned. Assign one in OPS."}</div>
+
+      <div className="flex flex-col gap-1">
+        <div className="text-xs font-semibold tracking-wide" style={{ color: TEXT_FAINT }}>SHIFT CHECKS</div>
+        {!status?.crew_count && <div className="text-xs" style={{ color: TEXT_FAINT }}>No crew on this unit, so nothing is owed.</div>}
+        {status?.crew_count > 0 && ["vehicle", "bls", "als"].map((k) => {
+          const c = status.checks[k];
+          if (!c.required && !(k === "als" && u.capability_level === "BLS")) return <div key={k} className="text-xs" style={{ color: TEXT_FAINT }}>{CHECK_NAMES[k]}: {k === "vehicle" ? "no driver or vehicle yet" : k === "bls" ? "no EMT on the unit yet" : "no paramedic on the unit yet"}</div>;
+          if (!c.required) return null;
+          return (
+            <div key={k} className="text-sm">
+              <span style={{ color: TEXT_FAINT }}>{CHECK_NAMES[k]} ({c.owner}): </span>
+              {!c.last_at ? <span style={{ color: AMBER }}>due, none recorded for this crew yet</span>
+                : c.last_result === "fail" && !c.due ? <span style={{ color: RED }}>FAILED {ago(c.last_at)} by {c.last_by}: {c.failed_items.join("; ")}</span>
+                : <span style={{ color: c.due ? AMBER : GREEN }}>{c.due ? "due again: last one" : "passed"} {ago(c.last_at)} by {c.last_by}</span>}
+            </div>
+          );
+        })}
+        <div className="text-xs" style={{ color: TEXT_FAINT }}>Crews record these on their Field screen. The system can't see them any other way.</div>
+      </div>
+
       {(status?.periodic || []).map((p) => {
         const d = p.nextDue ? daysUntil(p.nextDue) : null;
-        return <div key={p.kind} className="text-xs" style={{ color: TEXT_SECONDARY }}>{KIND_LABEL[p.kind]}: {p.result === "pass" ? "passed" : "FAILED"} {new Date(p.performedAt).toLocaleDateString()}{p.nextDue ? <span style={{ color: d < 0 ? RED : d <= 30 ? AMBER : TEXT_SECONDARY }}> · next due {new Date(p.nextDue).toLocaleDateString()} ({d < 0 ? `${-d} days overdue` : `${d} days`})</span> : null}</div>;
+        return <div key={p.kind} className="text-xs" style={{ color: TEXT_SECONDARY }}>{KIND_LABEL[p.kind]} (vehicle {u.vehicle_number}): {p.result === "pass" ? "passed" : "FAILED"} {new Date(p.performedAt).toLocaleDateString()}{p.nextDue ? <span style={{ color: d < 0 ? RED : d <= 30 ? AMBER : TEXT_SECONDARY }}> · next due {new Date(p.nextDue).toLocaleDateString()} ({d < 0 ? `${-d} days overdue` : `${d} days`})</span> : null}</div>;
       })}
-      {adding ? (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1">
-          <Labeled label="Inspection"><select value={f.kind} onChange={(e) => setF({ ...f, kind: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field}>{INSPECTION_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select></Labeled>
-          <Labeled label="Result"><select value={f.result} onChange={(e) => setF({ ...f, result: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field}><option value="pass">Passed</option><option value="fail">Failed</option></select></Labeled>
-          <Labeled label="Done on (blank = today)"><input type="date" value={f.performedOn} onChange={(e) => setF({ ...f, performedOn: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled>
-          <Labeled label="Next one due"><input type="date" value={f.nextDue} onChange={(e) => setF({ ...f, nextDue: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled>
-          <div className="sm:col-span-2"><Labeled label="Notes"><input value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled></div>
-          <div className="flex gap-2">
-            <button onClick={async () => { if (await act(() => apiRequest(session, "POST", "/unit-checks/inspection", { unitId: u.unit_id, ...f, performedOn: f.performedOn || undefined, nextDue: f.nextDue || undefined }), "Inspection recorded.")) setAdding(false); }} className="text-sm px-3 py-1.5 rounded" style={btnGreen}>Record</button>
-            <button onClick={() => setAdding(false)} className="text-sm px-3 py-1.5 rounded" style={btn}>Cancel</button>
+      {u.fleet_vehicle_id && (adding ? (
+        <InspectionForm f={f} setF={setF} onSave={async () => { if (await act(() => apiRequest(session, "POST", "/unit-checks/inspection", { fleetVehicleId: u.fleet_vehicle_id, ...f, performedOn: f.performedOn || undefined, nextDue: f.nextDue || undefined }), "Inspection recorded.")) setAdding(false); }} onCancel={() => setAdding(false)} />
+      ) : <button onClick={() => setAdding(true)} className="self-start text-xs px-2 py-1 rounded" style={btn}>+ Record an inspection of vehicle {u.vehicle_number}</button>)}
+
+      <div className="flex items-center gap-2 flex-wrap pt-2" style={{ borderTop: "1px solid #1B2330" }}>
+        {confirmDelete ? (
+          <>
+            <span className="text-xs" style={{ color: AMBER }}>Delete {u.unit_designation}? If it has any history it's retired instead: hidden, with its records kept.</span>
+            <button onClick={async () => { const done = await act(() => apiRequest(session, "DELETE", `/units/${u.unit_id}`).then((r) => ({ warning: r.deleted ? `${u.unit_designation} deleted.` : `${u.unit_designation} retired. Its history is kept.` }))); if (!done) setConfirmDelete(false); }} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: "#F0857D" }}>Yes, delete</button>
+            <button onClick={() => setConfirmDelete(false)} className="text-xs px-2 py-1.5 rounded" style={btn}>Keep it</button>
+          </>
+        ) : <button onClick={() => setConfirmDelete(true)} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: "#F0857D" }}>Delete unit</button>}
+      </div>
+    </div>
+  );
+}
+
+function InspectionForm({ f, setF, onSave, onCancel }) {
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1">
+      <Labeled label="Inspection"><select value={f.kind} onChange={(e) => setF({ ...f, kind: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field}>{INSPECTION_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select></Labeled>
+      <Labeled label="Result"><select value={f.result} onChange={(e) => setF({ ...f, result: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field}><option value="pass">Passed</option><option value="fail">Failed</option></select></Labeled>
+      <Labeled label="Done on (blank = today)"><input type="date" value={f.performedOn} onChange={(e) => setF({ ...f, performedOn: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled>
+      <Labeled label="Next one due"><input type="date" value={f.nextDue} onChange={(e) => setF({ ...f, nextDue: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled>
+      <div className="sm:col-span-2"><Labeled label="Notes"><input value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled></div>
+      <div className="flex gap-2"><button onClick={onSave} className="text-sm px-3 py-1.5 rounded" style={btnGreen}>Record</button><button onClick={onCancel} className="text-sm px-3 py-1.5 rounded" style={btn}>Cancel</button></div>
+    </div>
+  );
+}
+
+// ---- Vehicles: the numbered ambulances ---------------------------------------------------------------
+function Vehicles({ session, act }) {
+  const [rows, setRows] = useState(null);
+  const [total, setTotal] = useState(0);
+  const [q, setQ] = useState("");
+  const [page, setPage] = useState(0);
+  const [open, setOpen] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [form, setForm] = useState({ vehicleNumber: "", makeModel: "", plate: "" });
+  const timer = useRef();
+  const load = useCallback(async () => {
+    try { const r = await apiRequestPaged(session, `/fleet?all=1&limit=${PAGE}&offset=${page * PAGE}${q ? `&q=${encodeURIComponent(q)}` : ""}`); setRows(r.rows); setTotal(r.total); } catch (e) { setRows([]); }
+  }, [session, page, q]);
+  useEffect(() => { clearTimeout(timer.current); timer.current = setTimeout(load, q ? 250 : 0); return () => clearTimeout(timer.current); }, [load, q]);
+  const change = async (fn, ok) => { const done = await act(fn, ok); if (done) await load(); return done; };
+  return (
+    <>
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="text-xs" style={{ color: TEXT_SECONDARY }}>The physical ambulances. A unit uses one vehicle at a time, and OPS can switch it if something breaks. Inspections belong to the vehicle.</div>
+        <button onClick={() => setAdding(!adding)} className="text-sm px-3 py-1.5 rounded" style={adding ? btn : btnGreen}>{adding ? "Close" : "+ Add vehicle"}</button>
+      </div>
+      {adding && (
+        <form onSubmit={async (e) => { e.preventDefault(); if (await change(() => apiRequest(session, "POST", "/fleet", form), `Vehicle ${form.vehicleNumber} added.`)) { setForm({ vehicleNumber: "", makeModel: "", plate: "" }); setAdding(false); } }} className="rounded-lg border p-4 grid grid-cols-1 sm:grid-cols-3 gap-3 items-end" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
+          <Labeled label="Vehicle number"><input required value={form.vehicleNumber} onChange={(e) => setForm({ ...form, vehicleNumber: e.target.value })} placeholder="e.g. 214" className="text-sm rounded px-2 py-2" style={field} /></Labeled>
+          <Labeled label="Make and model (optional)"><input value={form.makeModel} onChange={(e) => setForm({ ...form, makeModel: e.target.value })} className="text-sm rounded px-2 py-2" style={field} /></Labeled>
+          <Labeled label="Plate (optional)"><input value={form.plate} onChange={(e) => setForm({ ...form, plate: e.target.value })} className="text-sm rounded px-2 py-2" style={field} /></Labeled>
+          <button type="submit" className="text-sm font-medium rounded px-3 py-2 sm:col-span-3" style={btnGreen}>Add vehicle</button>
+        </form>
+      )}
+      <ListBar q={q} setQ={setQ} placeholder="Search number, plate or model" total={total} shown={(rows || []).length} page={page} setPage={setPage} />
+      {rows && rows.length === 0 && <div className="text-sm" style={{ color: TEXT_FAINT }}>{q ? "No vehicle matches." : "No vehicles yet."}</div>}
+      <div className="rounded-lg border overflow-hidden" style={{ borderColor: HAIRLINE, backgroundColor: PANEL, display: rows && rows.length ? "block" : "none" }}>
+        {(rows || []).map((v) => <VehicleRow key={v.fleet_vehicle_id} v={v} open={open === v.fleet_vehicle_id} toggle={() => setOpen(open === v.fleet_vehicle_id ? null : v.fleet_vehicle_id)} act={change} session={session} />)}
+      </div>
+    </>
+  );
+}
+
+function VehicleRow({ v, open, toggle, act, session }) {
+  const [e, setE] = useState({ vehicleNumber: v.vehicle_number, makeModel: v.make_model || "", plate: v.plate || "" });
+  const [reason, setReason] = useState("");
+  const [asking, setAsking] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [f, setF] = useState({ kind: "dmv_inspection", result: "pass", performedOn: "", nextDue: "", notes: "" });
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const dirty = e.vehicleNumber !== v.vehicle_number || e.makeModel !== (v.make_model || "") || e.plate !== (v.plate || "");
+  const due = v.next_inspection_due ? daysUntil(v.next_inspection_due) : null;
+  const out = v.status === "out_of_service";
+  return (
+    <div className="border-b last:border-b-0" style={{ borderColor: "#1B2330", opacity: v.retired_at ? 0.55 : 1 }}>
+      <button onClick={toggle} aria-expanded={open} className="w-full flex items-center gap-3 px-3 py-2.5 text-left" style={{ backgroundColor: open ? "#17202C" : "transparent" }}>
+        <span className="min-w-0 flex-1"><span className="block text-sm font-medium truncate">Vehicle {v.vehicle_number}{v.retired_at ? " (retired)" : ""}</span><span className="block text-xs truncate" style={{ color: TEXT_FAINT }}>{[v.make_model, v.plate].filter(Boolean).join(" · ") || "no details"}</span></span>
+        <span className="text-xs shrink-0" style={{ color: v.unit_designation ? TEXT_PRIMARY : TEXT_FAINT }}>{v.unit_designation ? `on ${v.unit_designation}` : "not assigned"}</span>
+        {out && <Chip color={AMBER}>Out of service</Chip>}
+        {due !== null && <span className="hidden sm:inline text-xs" style={{ color: due < 0 ? RED : due <= 30 ? AMBER : TEXT_FAINT }}>inspection {due < 0 ? `${-due} d overdue` : `in ${due} d`}</span>}
+        <span className="text-xs shrink-0" style={{ color: TEXT_FAINT }}>{open ? "▲" : "▼"}</span>
+      </button>
+      {open && !v.retired_at && (
+        <div className="px-4 pb-4 pt-1 flex flex-col gap-3" style={{ backgroundColor: "#111823" }}>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <Labeled label="Number"><input value={e.vehicleNumber} onChange={(x) => setE({ ...e, vehicleNumber: x.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled>
+            <Labeled label="Make and model"><input value={e.makeModel} onChange={(x) => setE({ ...e, makeModel: x.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled>
+            <Labeled label="Plate"><input value={e.plate} onChange={(x) => setE({ ...e, plate: x.target.value })} className="text-sm rounded px-2 py-1.5" style={field} /></Labeled>
+          </div>
+          {dirty && <div className="flex gap-2"><button onClick={() => act(() => apiRequest(session, "PATCH", `/fleet/${v.fleet_vehicle_id}`, e), "Vehicle saved.")} className="text-sm px-3 py-1.5 rounded" style={btnGreen}>Save</button><button onClick={() => setE({ vehicleNumber: v.vehicle_number, makeModel: v.make_model || "", plate: v.plate || "" })} className="text-sm px-3 py-1.5 rounded" style={btn}>Undo</button></div>}
+          {out && <div className="text-sm" style={{ color: AMBER }}>Out of service: {v.out_of_service_reason}</div>}
+          <div className="text-xs" style={{ color: TEXT_SECONDARY }}>{v.last_inspection_date ? `Last inspected ${new Date(v.last_inspection_date).toLocaleDateString()}. ` : ""}{v.next_inspection_due ? `Next due ${new Date(v.next_inspection_due).toLocaleDateString()}.` : "No inspection date on file."}</div>
+          {adding ? <InspectionForm f={f} setF={setF} onSave={async () => { if (await act(() => apiRequest(session, "POST", "/unit-checks/inspection", { fleetVehicleId: v.fleet_vehicle_id, ...f, performedOn: f.performedOn || undefined, nextDue: f.nextDue || undefined }), "Inspection recorded.")) setAdding(false); }} onCancel={() => setAdding(false)} />
+            : <button onClick={() => setAdding(true)} className="self-start text-xs px-2 py-1 rounded" style={btn}>+ Record an inspection</button>}
+          <div className="flex items-center gap-2 flex-wrap pt-2" style={{ borderTop: "1px solid #1B2330" }}>
+            {out ? <button onClick={() => act(() => apiRequest(session, "POST", `/fleet/${v.fleet_vehicle_id}/return-to-service`, {}), "Back in service.")} className="text-xs px-2 py-1.5 rounded" style={btnGreen}>Return to service</button>
+              : asking ? (
+                <>
+                  <input value={reason} onChange={(x) => setReason(x.target.value)} placeholder="Why? (mechanical issue, accident...)" className="text-sm rounded px-2 py-1.5" style={{ ...field, minWidth: "220px" }} />
+                  <button disabled={reason.trim().length < 3} onClick={async () => { if (await act(() => apiRequest(session, "POST", `/fleet/${v.fleet_vehicle_id}/out-of-service`, { reason }), "Marked out of service.")) { setAsking(false); setReason(""); } }} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: AMBER, opacity: reason.trim().length < 3 ? 0.5 : 1 }}>Mark out of service</button>
+                  <button onClick={() => setAsking(false)} className="text-xs px-2 py-1.5 rounded" style={btn}>Cancel</button>
+                </>
+              ) : <button onClick={() => setAsking(true)} className="text-xs px-2 py-1.5 rounded" style={btn}>Mark out of service</button>}
+            {confirmDelete ? (
+              <>
+                <span className="text-xs" style={{ color: AMBER }}>Delete vehicle {v.vehicle_number}? With history it's retired instead.</span>
+                <button onClick={async () => { const done = await act(() => apiRequest(session, "DELETE", `/fleet/${v.fleet_vehicle_id}`).then((r) => ({ warning: r.deleted ? `Vehicle ${v.vehicle_number} deleted.` : `Vehicle ${v.vehicle_number} retired. Its history is kept.` }))); if (!done) setConfirmDelete(false); }} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: "#F0857D" }}>Yes, delete</button>
+                <button onClick={() => setConfirmDelete(false)} className="text-xs px-2 py-1.5 rounded" style={btn}>Keep it</button>
+              </>
+            ) : <button onClick={() => setConfirmDelete(true)} className="text-xs px-2 py-1.5 rounded" style={{ ...btn, color: "#F0857D" }}>Delete vehicle</button>}
           </div>
         </div>
-      ) : <button onClick={() => setAdding(true)} className="self-start text-xs px-2 py-1 rounded" style={btn}>+ Record an inspection</button>}
+      )}
     </div>
   );
 }
 
 function Checklist({ session, items, act }) {
   const [open, setOpen] = useState(false);
-  const [add, setAdd] = useState({ label: "", category: "", appliesTo: "BLS", minQuantity: "" });
-  const [imp, setImp] = useState({ text: "", appliesTo: "BLS", category: "" });
+  const [add, setAdd] = useState({ label: "", category: "", appliesTo: "BLS", minQuantity: "", section: "equipment" });
+  const [imp, setImp] = useState({ text: "", appliesTo: "BLS", category: "", section: "equipment" });
   const [editing, setEditing] = useState(null);
   const starter = items.some((i) => i.source === "starter" && i.is_active);
   const groups = items.reduce((m, i) => { (m[i.category] ||= []).push(i); return m; }, {});
   return (
     <div className="rounded-lg border p-4 flex flex-col gap-3" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
       <div className="flex items-center justify-between gap-2">
-        <div><div className="text-sm font-semibold">Unit check list</div><div className="text-xs" style={{ color: TEXT_SECONDARY }}>What crews check at the start of a shift. BLS items apply to every unit, ALS items to ALS and CCT units.</div></div>
+        <div><div className="text-sm font-semibold">Check lists</div><div className="text-xs" style={{ color: TEXT_SECONDARY }}>The driver checks the vehicle items. An EMT checks the BLS equipment, and the paramedic checks the ALS equipment, at the start of a shift.</div></div>
         <button onClick={() => setOpen(!open)} className="text-xs px-2 py-1.5 rounded shrink-0" style={btn}>{open ? "Hide" : `Edit (${items.filter((i) => i.is_active).length} items)`}</button>
       </div>
       {starter && (
@@ -441,7 +577,7 @@ function Checklist({ session, items, act }) {
                 <div key={i.item_id} className="flex items-center justify-between gap-2 text-sm" style={{ opacity: i.is_active ? 1 : 0.5 }}>
                   {editing === i.item_id ? <EditItem item={i} session={session} act={act} done={() => setEditing(null)} /> : (
                     <>
-                      <span className="min-w-0"><span className="text-xs mr-2 px-1 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>{i.applies_to}</span>{i.label}{i.min_quantity != null ? ` (min ${i.min_quantity})` : ""}</span>
+                      <span className="min-w-0"><span className="text-xs mr-2 px-1 rounded" style={{ color: TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>{i.section === "vehicle" ? "VEHICLE" : i.applies_to}</span>{i.label}{i.min_quantity != null ? ` (min ${i.min_quantity})` : ""}</span>
                       <span className="flex gap-1 shrink-0"><button onClick={() => setEditing(i.item_id)} className="text-xs px-1.5 rounded" style={btn}>Edit</button><button onClick={() => act(() => apiRequest(session, "PATCH", `/checklist/${i.item_id}`, { isActive: !i.is_active }))} className="text-xs px-1.5 rounded" style={btn}>{i.is_active ? "Remove" : "Restore"}</button></span>
                     </>
                   )}
@@ -451,15 +587,15 @@ function Checklist({ session, items, act }) {
           ))}
           <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
             <div className="sm:col-span-2"><Labeled label="Add an item"><input value={add.label} onChange={(e) => setAdd({ ...add, label: e.target.value })} placeholder="e.g. Pediatric BVM" className="text-sm rounded px-2 py-2" style={field} /></Labeled></div>
-            <Labeled label="Applies to"><select value={add.appliesTo} onChange={(e) => setAdd({ ...add, appliesTo: e.target.value })} className="text-sm rounded px-2 py-2" style={field}><option value="BLS">All units (BLS)</option><option value="ALS">ALS & CCT</option><option value="CCT">CCT only</option></select></Labeled>
+            <Labeled label="Checked by"><select value={add.section === "vehicle" ? "vehicle" : add.appliesTo} onChange={(e) => setAdd(e.target.value === "vehicle" ? { ...add, section: "vehicle", appliesTo: "BLS" } : { ...add, section: "equipment", appliesTo: e.target.value })} className="text-sm rounded px-2 py-2" style={field}><option value="vehicle">Driver (vehicle)</option><option value="BLS">EMT (BLS equipment)</option><option value="ALS">Paramedic (ALS equipment)</option><option value="CCT">Paramedic (CCT only)</option></select></Labeled>
             <Labeled label="Minimum quantity"><input type="number" min="0" value={add.minQuantity} onChange={(e) => setAdd({ ...add, minQuantity: e.target.value })} className="text-sm rounded px-2 py-2" style={field} /></Labeled>
             <div className="sm:col-span-2"><Labeled label="Category"><input value={add.category} onChange={(e) => setAdd({ ...add, category: e.target.value })} placeholder="e.g. Airway" className="text-sm rounded px-2 py-2" style={field} /></Labeled></div>
-            <div className="flex items-end"><button onClick={async () => { if (await act(() => apiRequest(session, "POST", "/checklist", { ...add, minQuantity: add.minQuantity === "" ? null : Number(add.minQuantity) }), "Item added.")) setAdd({ label: "", category: "", appliesTo: add.appliesTo, minQuantity: "" }); }} className="text-sm px-3 py-2 rounded" style={btnGreen}>Add</button></div>
+            <div className="flex items-end"><button onClick={async () => { if (await act(() => apiRequest(session, "POST", "/checklist", { ...add, minQuantity: add.minQuantity === "" ? null : Number(add.minQuantity) }), "Item added.")) setAdd({ label: "", category: "", appliesTo: add.appliesTo, minQuantity: "", section: add.section }); }} className="text-sm px-3 py-2 rounded" style={btnGreen}>Add</button></div>
           </div>
           <div className="flex flex-col gap-2">
             <Labeled label="Paste a list: one item per line, optionally with a quantity (e.g. “Pulse oximeter, 2”)"><textarea rows={5} value={imp.text} onChange={(e) => setImp({ ...imp, text: e.target.value })} className="text-sm rounded px-2 py-2 mono" style={{ ...field, resize: "vertical" }} /></Labeled>
             <div className="flex items-end gap-2 flex-wrap">
-              <Labeled label="Applies to"><select value={imp.appliesTo} onChange={(e) => setImp({ ...imp, appliesTo: e.target.value })} className="text-sm rounded px-2 py-2" style={field}><option value="BLS">All units (BLS)</option><option value="ALS">ALS & CCT</option><option value="CCT">CCT only</option></select></Labeled>
+              <Labeled label="Checked by"><select value={imp.section === "vehicle" ? "vehicle" : imp.appliesTo} onChange={(e) => setImp(e.target.value === "vehicle" ? { ...imp, section: "vehicle", appliesTo: "BLS" } : { ...imp, section: "equipment", appliesTo: e.target.value })} className="text-sm rounded px-2 py-2" style={field}><option value="vehicle">Driver (vehicle)</option><option value="BLS">EMT (BLS equipment)</option><option value="ALS">Paramedic (ALS equipment)</option><option value="CCT">Paramedic (CCT only)</option></select></Labeled>
               <Labeled label="Category"><input value={imp.category} onChange={(e) => setImp({ ...imp, category: e.target.value })} placeholder="Imported" className="text-sm rounded px-2 py-2" style={field} /></Labeled>
               <button disabled={!imp.text.trim()} onClick={async () => { const out = { added: 0, skipped: 0 }; if (await act(async () => { Object.assign(out, await apiRequest(session, "POST", "/checklist/import", imp)); return { warning: `Added ${out.added} items${out.skipped ? `, skipped ${out.skipped} already on the list` : ""}.` }; })) setImp({ ...imp, text: "" }); }} className="text-sm px-3 py-2 rounded" style={{ ...btnGreen, opacity: imp.text.trim() ? 1 : 0.5 }}>Import list</button>
             </div>

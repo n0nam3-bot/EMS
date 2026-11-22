@@ -33,6 +33,7 @@ export default function OpsConsole({ session }) {
   const [units, setUnits] = useState(null);
   const [pool, setPool] = useState([]);
   const [checks, setChecks] = useState({});
+  const [spare, setSpare] = useState([]);          // vehicles in service and not on a unit
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [q, setQ] = useState("");
@@ -47,12 +48,13 @@ export default function OpsConsole({ session }) {
 
   const load = useCallback(async () => {
     try {
-      const [u, r, c] = await Promise.all([
+      const [u, r, c, f] = await Promise.all([
         apiRequest(session, "GET", "/units"),
         apiRequest(session, "GET", `/ops/roster?unassigned=1${qRef.current ? `&q=${encodeURIComponent(qRef.current)}` : ""}`),
         apiRequest(session, "GET", "/unit-checks/status"),
+        apiRequest(session, "GET", "/fleet?available=1&limit=200").catch(() => []),
       ]);
-      setUnits(u); setPool(r); setChecks(Object.fromEntries(c.map((x) => [x.unit_id, x])));
+      setUnits(u); setPool(r); setSpare(f); setChecks(Object.fromEntries(c.map((x) => [x.unit_id, x])));
       setError("");
     } catch (e) { setError(e.message); }
   }, [session]);
@@ -73,6 +75,7 @@ export default function OpsConsole({ session }) {
     return run(() => apiRequest(session, "PUT", `/crew/${person.crewMemberId ?? person.crew_member_id}/unit`, { unitId: unit.unit_id, seatRole: defaultSeat(level, unit) }));
   };
   const remove = (crewMemberId) => run(() => apiRequest(session, "PUT", `/crew/${crewMemberId}/unit`, { unitId: null }));
+  const setVehicle = (unit, body) => run(() => apiRequest(session, "PUT", `/units/${unit.unit_id}/vehicle`, body), body.markOldOutOfService ? `${unit.unit_designation} is on its new vehicle and still active. The old one is out of service.` : "Vehicle updated.");
   const toggleSeat = (c) => run(() => apiRequest(session, "PATCH", `/crew/${c.crewMemberId}/seat`, { seatRole: c.role === "driver" ? "non_driver" : "driver" }));
 
   const onDragStart = (e, person, fromUnitId) => {
@@ -102,7 +105,7 @@ export default function OpsConsole({ session }) {
   };
   const shownUnits = useMemo(() => (units || []).filter((u) => {
     if (unitQ && !u.unit_designation.toLowerCase().includes(unitQ.toLowerCase())) return false;
-    if (onlyAttention) { const c = checks[u.unit_id]; if (!(u.current_status === "out_of_service" || c?.check_due || c?.last_check_result === "fail")) return false; }
+    if (onlyAttention) { const c = checks[u.unit_id]; if (!(u.current_status === "out_of_service" || c?.check_due || c?.any_failed || !u.fleet_vehicle_id)) return false; }
     return true;
   }), [units, unitQ, onlyAttention, checks]);
 
@@ -185,7 +188,7 @@ export default function OpsConsole({ session }) {
             <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}>
               {shownUnits.map((u) => <UnitCard key={u.unit_id} unit={u} check={checks[u.unit_id]} picked={picked} dragOver={dragOver === u.unit_id}
                 onOver={(e) => { e.preventDefault(); setDragOver(u.unit_id); }} onLeave={() => setDragOver(null)} onDrop={(e) => dropOnUnit(e, u)}
-                onTapPlace={() => picked && place(picked, u)} onDragStart={onDragStart} onRemove={remove} onSeat={toggleSeat} />)}
+                onTapPlace={() => picked && place(picked, u)} onDragStart={onDragStart} onRemove={remove} onSeat={toggleSeat} spare={spare} onVehicle={setVehicle} />)}
             </div>
           </div>
         </div>
@@ -194,15 +197,18 @@ export default function OpsConsole({ session }) {
   );
 }
 
-function UnitCard({ unit, check, picked, dragOver, onOver, onLeave, onDrop, onTapPlace, onDragStart, onRemove, onSeat }) {
+function UnitCard({ unit, check, picked, dragOver, onOver, onLeave, onDrop, onTapPlace, onDragStart, onRemove, onSeat, spare = [], onVehicle }) {
+  const [changing, setChanging] = useState(false);
   const [label, color] = STATUS[unit.current_status] || [unit.current_status, TEXT_SECONDARY];
   const needs = unitNeeds(unit);
   const slots = Array.from({ length: MAX_CREW }, (_, i) => unit.crew[i] || null);
   const full = unit.crew.length >= MAX_CREW;
   let checkChip = null;
-  if (check?.last_check_result === "fail" && !check.check_due) checkChip = ["Check failed", RED];
-  else if (check?.check_due) checkChip = ["Check due", AMBER];
-  else if (check?.last_check_at) checkChip = ["Checked", GREEN];
+  if (check?.crew_count) {
+    if (check.check_due) checkChip = ["Check due", AMBER];
+    else if (check.any_failed) checkChip = ["Check failed", RED];
+    else checkChip = ["Checked", GREEN];
+  }
   return (
     <div onDragOver={onOver} onDragLeave={onLeave} onDrop={onDrop} onClick={onTapPlace}
       className="rounded-lg border p-3 flex flex-col gap-2" style={{ backgroundColor: PANEL, borderColor: dragOver ? BLUE : picked && !full ? "#2F4A66" : HAIRLINE, cursor: picked ? "pointer" : "default", boxShadow: dragOver ? `0 0 0 2px ${BLUE}` : undefined }}>
@@ -213,6 +219,11 @@ function UnitCard({ unit, check, picked, dragOver, onOver, onLeave, onDrop, onTa
           <span className="text-xs px-1.5 py-0.5 rounded" style={{ color, border: `1px solid ${HAIRLINE}` }}>{label}</span>
         </div>
       </div>
+      <div className="flex items-center justify-between gap-2" onClick={(e) => e.stopPropagation()}>
+        <span className="text-xs" style={{ color: unit.fleet_vehicle_id ? TEXT_SECONDARY : AMBER }}>{unit.fleet_vehicle_id ? `Vehicle ${unit.vehicle_number}` : "No vehicle assigned"}</span>
+        <button onClick={() => setChanging(!changing)} className="text-xs px-2 py-1 rounded" style={{ color: BLUE, border: `1px solid ${HAIRLINE}` }}>{unit.fleet_vehicle_id ? "Switch vehicle" : "Assign vehicle"}</button>
+      </div>
+      {changing && <VehiclePanel unit={unit} spare={spare} onClose={() => setChanging(false)} onSubmit={(body) => { setChanging(false); onVehicle(unit, body); }} />}
       <div className="flex flex-col gap-1.5">
         {slots.map((c, i) => c ? (
           <div key={c.crewMemberId} draggable onDragStart={(e) => onDragStart(e, c, unit.unit_id)} onClick={(e) => e.stopPropagation()}
@@ -234,6 +245,38 @@ function UnitCard({ unit, check, picked, dragOver, onOver, onLeave, onDrop, onTa
       {needs.length > 0 && unit.crew.length > 0 && <div className="text-xs" style={{ color: AMBER }}>Needs {needs.join(" and ")} to take calls.</div>}
       {unit.crew.length === 0 && <div className="text-xs" style={{ color: TEXT_FAINT }}>No crew: out of service.</div>}
       {BUSY.includes(unit.current_status) && <div className="text-xs" style={{ color: TEXT_FAINT }}>On a call. Crew changes apply immediately.</div>}
+    </div>
+  );
+}
+
+// Giving a unit a vehicle, or switching it. The unit stays active: when the old vehicle broke down or was
+// in an accident, mark it out of service with the reason and the crew carries on in the other one.
+const SWITCH_REASONS = [["Mechanical issue", true], ["Accident (MVA)", true], ["Other problem", true], ["Just changing vehicles", false]];
+function VehiclePanel({ unit, spare, onClose, onSubmit }) {
+  const [vehicleId, setVehicleId] = useState("");
+  const [reason, setReason] = useState(SWITCH_REASONS[0][0]);
+  const [note, setNote] = useState("");
+  const [markOut, setMarkOut] = useState(true);
+  const had = Boolean(unit.fleet_vehicle_id);
+  const field = { backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_PRIMARY };
+  return (
+    <div className="rounded-md p-2 flex flex-col gap-2" style={{ backgroundColor: "#111823", border: `1px solid ${BLUE}` }} onClick={(e) => e.stopPropagation()}>
+      <select aria-label="Vehicle" value={vehicleId} onChange={(e) => setVehicleId(e.target.value)} className="text-sm rounded px-2 py-1.5" style={field}>
+        <option value="">{spare.length ? "Pick a vehicle…" : "No vehicle is free"}</option>
+        {spare.map((v) => <option key={v.fleet_vehicle_id} value={v.fleet_vehicle_id}>{v.vehicle_number}{v.make_model ? ` · ${v.make_model}` : ""}</option>)}
+      </select>
+      {had && (
+        <>
+          <select aria-label="Why" value={reason} onChange={(e) => { setReason(e.target.value); setMarkOut(SWITCH_REASONS.find((r) => r[0] === e.target.value)[1]); }} className="text-sm rounded px-2 py-1.5" style={field}>{SWITCH_REASONS.map(([r]) => <option key={r}>{r}</option>)}</select>
+          <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Details (optional)" className="text-sm rounded px-2 py-1.5" style={field} />
+          <label className="flex items-center gap-1.5 text-xs" style={{ color: TEXT_SECONDARY }}><input type="checkbox" checked={markOut} onChange={(e) => setMarkOut(e.target.checked)} />Take vehicle {unit.vehicle_number} out of service</label>
+        </>
+      )}
+      <div className="flex gap-2">
+        <button disabled={!vehicleId} onClick={() => onSubmit({ fleetVehicleId: vehicleId, ...(had ? { markOldOutOfService: markOut, reason: note.trim() ? `${reason}: ${note.trim()}` : reason } : {}) })} className="text-sm px-3 py-1.5 rounded" style={{ backgroundColor: "#1E3A2E", border: "1px solid #2E5943", color: GREEN, opacity: vehicleId ? 1 : 0.5 }}>{had ? "Switch" : "Assign"}</button>
+        <button onClick={onClose} className="text-sm px-3 py-1.5 rounded" style={{ backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: TEXT_SECONDARY }}>Cancel</button>
+      </div>
+      {had && <div className="text-xs" style={{ color: TEXT_FAINT }}>The unit and its crew stay active. The new vehicle needs its own vehicle check from the driver.</div>}
     </div>
   );
 }

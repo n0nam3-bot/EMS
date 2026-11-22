@@ -200,9 +200,11 @@ export default function FieldUnitConsole({ session }) {
         {newCall && incident && (
           <div role="alert" className="rounded-lg border p-3 text-sm font-semibold" style={{ color: "#06090D", backgroundColor: AMBER, borderColor: AMBER }}>New call assigned: {incident.scene_address}</div>
         )}
-        {live && unit && checkStatus?.check_due && (
-          <div className="rounded-lg border p-3 text-sm" style={{ color: AMBER, backgroundColor: "rgba(245,147,74,0.08)", borderColor: "#4A3A1E" }}>Your unit check is due. Do it before your first call.</div>
-        )}
+        {live && unit && checkStatus && (() => {
+          const mine = [["vehicle", unit.seat_role === "driver", "vehicle check"], ["bls", CLINICAL_LEVELS.includes(session.user.fieldLevel), "BLS equipment check"], ["als", session.user.fieldLevel === "paramedic" && unit.capability_level !== "BLS", "ALS equipment check"]]
+            .filter(([k, owns]) => owns && checkStatus.checks?.[k]?.due).map(([, , name]) => name);
+          return mine.length > 0 ? <div className="rounded-lg border p-3 text-sm" style={{ color: AMBER, backgroundColor: "rgba(245,147,74,0.08)", borderColor: "#4A3A1E" }}>Your {mine.join(" and ")} {mine.length > 1 ? "are" : "is"} due. Do {mine.length > 1 ? "them" : "it"} before your first call.</div> : null;
+        })()}
         {live && loadError && <div className="text-sm" style={{ color: RED }}>Could not load your unit: {loadError}</div>}
         {live && !loadError && me === null && <div className="text-sm" style={{ color: TEXT_FAINT }}>Loading…</div>}
 
@@ -297,7 +299,7 @@ export default function FieldUnitConsole({ session }) {
         )}
 
         {/* Start-of-shift unit check */}
-        {live && unit && <UnitCheck session={session} unit={unit} status={checkStatus} onDone={loadExtras} />}
+        {live && unit && <UnitChecks session={session} unit={unit} fieldLevel={session.user.fieldLevel} checkStatus={checkStatus} onDone={loadExtras} />}
 
         {/* GPS */}
         {(!live || unit) && (
@@ -352,7 +354,29 @@ function MyShifts({ session }) {
   );
 }
 
-function UnitCheck({ session, unit, status, onDone }) {
+const CLINICAL_LEVELS = ["emt", "aemt", "paramedic"];
+
+// The three start-of-shift checks, each owned by the person it belongs to:
+//   vehicle  the driver          (the vehicle the unit has right now)
+//   BLS      an EMT or above      (the BLS equipment inside it)
+//   ALS      the paramedic        (the ALS equipment; ALS and CCT units only)
+// Anyone can see how each one stands; only its owner can record it.
+function UnitChecks({ session, unit, fieldLevel, checkStatus, onDone }) {
+  const checks = checkStatus?.checks || {};
+  const can = { vehicle: unit.seat_role === "driver", bls: CLINICAL_LEVELS.includes(fieldLevel), als: fieldLevel === "paramedic" };
+  const cards = [
+    { kind: "vehicle", title: "VEHICLE CHECK", owner: "the driver" },
+    { kind: "bls", title: "BLS EQUIPMENT CHECK", owner: "an EMT" },
+    ...(unit.capability_level !== "BLS" ? [{ kind: "als", title: "ALS EQUIPMENT CHECK", owner: "the paramedic" }] : []),
+  ];
+  return (
+    <>
+      {cards.map((c) => <UnitCheck key={c.kind} session={session} unit={unit} kind={c.kind} title={c.title} owner={c.owner} can={can[c.kind]} status={checks[c.kind]} noVehicle={c.kind === "vehicle" && checkStatus && !checkStatus.fleet_vehicle_id} vehicleNumber={checkStatus?.vehicle_number} onDone={onDone} />)}
+    </>
+  );
+}
+
+function UnitCheck({ session, unit, kind, title, owner, can, status, noVehicle, vehicleNumber, onDone }) {
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState(null);
   const [answers, setAnswers] = useState({});   // itemId -> { ok, note }
@@ -362,18 +386,20 @@ function UnitCheck({ session, unit, status, onDone }) {
 
   useEffect(() => {
     if (!open || items) return;
-    api(session, "GET", `/checklist?unitId=${unit.unit_id}`).then(setItems).catch((e) => setError(e.message));
-  }, [open, items, session, unit.unit_id]);
+    api(session, "GET", `/checklist?unitId=${unit.unit_id}&kind=${kind}`).then(setItems).catch((e) => setError(e.message));
+  }, [open, items, session, unit.unit_id, kind]);
 
   const set = (id, patch) => setAnswers((a) => ({ ...a, [id]: { ...a[id], ...patch } }));
   const ready = items && items.length > 0 && items.every((i) => typeof answers[i.item_id]?.ok === "boolean" && (answers[i.item_id].ok || (answers[i.item_id].note || "").trim()));
-  const lastText = !status?.last_check_at ? "No check recorded yet" : `Last check ${new Date(status.last_check_at).toLocaleString()} by ${status.last_check_by}: ${status.last_check_result === "pass" ? "passed" : "FAILED"}`;
+  const lastText = noVehicle ? "No vehicle assigned yet. Ask dispatch to assign one in OPS."
+    : !status?.last_at ? "No check recorded yet"
+    : `Last check ${new Date(status.last_at).toLocaleString()} by ${status.last_by}: ${status.last_result === "pass" ? "passed" : "FAILED"}`;
   const byCategory = (items || []).reduce((m, i) => { (m[i.category] ||= []).push(i); return m; }, {});
 
   async function submit() {
     setBusy(true); setError("");
     try {
-      const r = await api(session, "POST", "/unit-checks", { unitId: unit.unit_id, items: items.map((i) => ({ itemId: i.item_id, ok: answers[i.item_id].ok, note: answers[i.item_id].note || undefined })) });
+      const r = await api(session, "POST", "/unit-checks", { unitId: unit.unit_id, kind, items: items.map((i) => ({ itemId: i.item_id, ok: answers[i.item_id].ok, note: answers[i.item_id].note || undefined })) });
       setDone(r.result === "pass" ? "Check recorded: everything OK." : `Check recorded. ${r.failedItems.length} item(s) flagged for your supervisor.`);
       setOpen(false); setItems(null); setAnswers({});
       onDone?.();
@@ -383,15 +409,17 @@ function UnitCheck({ session, unit, status, onDone }) {
   return (
     <div className="rounded-lg border p-4" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
       <div className="flex items-center justify-between gap-2">
-        <div className="text-xs tracking-wide font-semibold" style={{ color: TEXT_SECONDARY }}>UNIT CHECK</div>
-        {!open && <button onClick={() => { setOpen(true); setDone(""); }} className="text-sm rounded-md px-3" style={{ minHeight: "40px", backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: BLUE }}>Do the check</button>}
+        <div className="text-xs tracking-wide font-semibold" style={{ color: TEXT_SECONDARY }}>{title}{kind === "vehicle" && vehicleNumber ? ` · VEHICLE ${vehicleNumber}` : ""}</div>
+        {status?.due && <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: AMBER, border: `1px solid ${HAIRLINE}` }}>due</span>}
+        {!open && can && !noVehicle && <button onClick={() => { setOpen(true); setDone(""); }} className="text-sm rounded-md px-3" style={{ minHeight: "40px", backgroundColor: SUNKEN, border: `1px solid ${HAIRLINE}`, color: BLUE }}>Do the check</button>}
       </div>
-      <div className="text-xs mt-1" style={{ color: status?.last_check_result === "fail" ? RED : TEXT_FAINT }}>{lastText}</div>
+      <div className="text-xs mt-1" style={{ color: status?.last_result === "fail" && !status?.due ? RED : TEXT_FAINT }}>{lastText}</div>
+      {!can && !noVehicle && <div className="text-xs mt-1" style={{ color: TEXT_FAINT }}>Done by {owner} on this unit.</div>}
       {done && <div className="text-xs mt-1" style={{ color: GREEN }}>{done}</div>}
       {open && (
         <div className="mt-3 flex flex-col gap-3">
           {!items && !error && <div className="text-sm" style={{ color: TEXT_FAINT }}>Loading…</div>}
-          {items && items.length === 0 && <div className="text-sm" style={{ color: TEXT_FAINT }}>No checklist has been set up. Ask your supervisor.</div>}
+          {items && items.length === 0 && <div className="text-sm" style={{ color: TEXT_FAINT }}>No checklist has been set up for this. Ask your supervisor.</div>}
           {Object.entries(byCategory).map(([cat, list]) => (
             <div key={cat} className="flex flex-col gap-2">
               <div className="text-xs font-semibold" style={{ color: TEXT_FAINT }}>{cat.toUpperCase()}</div>

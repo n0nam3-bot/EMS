@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { X, Minus, Plus } from "lucide-react";
 import { apiRequest } from "../api.js";
+import { useLeafletLoader, esc, PICKUP_COLOR, DROPOFF_COLOR } from "./map_kit.jsx";
 
 // ---- shared design tokens ---------------------------------------------------------------
 const HAIRLINE = "#232C3A", PANEL = "#131A24", SUNKEN = "#0D131B";
@@ -10,8 +11,8 @@ const TYPE_LABELS = { emergency_911: "911 Emergency", ift_scheduled: "IFT — Sc
 const PRIORITIES = { critical: "Critical", emergent: "Emergent", urgent: "Urgent", routine: "Routine" };
 
 // ---- the form's data ---------------------------------------------------------------------
-export const blankForm = () => ({ type: "emergency_911", priority: "emergent", capabilityNeeded: "BLS", address: "", lat: null, lon: null, detail: "", destination: "", destLat: null, destLon: null, destFacilityId: null, patientName: "", contactName: "", contactPhone: "", notes: "" });
-export const formFromIncident = (i) => ({ type: i.type, priority: i.priority, capabilityNeeded: i.capabilityNeeded, address: i.address || "", lat: i.lat ?? null, lon: i.lon ?? null, detail: i.detail || "", destination: i.destination || "", destLat: i.destLat ?? null, destLon: i.destLon ?? null, destFacilityId: i.destinationFacilityId ?? null, patientName: i.patientName || "", contactName: i.contactName || "", contactPhone: i.contactPhone || "", notes: i.notes || "" });
+export const blankForm = () => ({ type: "emergency_911", priority: "emergent", capabilityNeeded: "BLS", address: "", lat: null, lon: null, approx: false, detail: "", destination: "", destLat: null, destLon: null, destFacilityId: null, patientName: "", contactName: "", contactPhone: "", notes: "" });
+export const formFromIncident = (i) => ({ type: i.type, priority: i.priority, capabilityNeeded: i.capabilityNeeded, address: i.address || "", lat: i.lat ?? null, lon: i.lon ?? null, approx: false, detail: i.detail || "", destination: i.destination || "", destLat: i.destLat ?? null, destLon: i.destLon ?? null, destFacilityId: i.destinationFacilityId ?? null, patientName: i.patientName || "", contactName: i.contactName || "", contactPhone: i.contactPhone || "", notes: i.notes || "" });
 export function formToApi(f) {
   const body = {
     incidentType: f.type, priority: f.priority, capabilityNeeded: f.capabilityNeeded,
@@ -56,6 +57,20 @@ export function CallDraftTray({ session }) {
     return () => window.removeEventListener("ems-open-call", on);
   }, []);
 
+  // Tell the dispatch map what the open call form is pointing at, so the pickup and drop-off show on
+  // the main map before anything is saved.
+  const openForm = drafts.find((d) => d.open)?.form;
+  const previewKey = openForm ? `${openForm.lat},${openForm.lon},${openForm.destLat},${openForm.destLon},${openForm.address},${openForm.destination}` : "";
+  useEffect(() => {
+    const detail = openForm ? {
+      pickup: openForm.lat != null ? { lat: openForm.lat, lon: openForm.lon, label: openForm.address } : null,
+      dest: openForm.destLat != null ? { lat: openForm.destLat, lon: openForm.destLon, label: openForm.destination } : null,
+    } : null;
+    window.dispatchEvent(new CustomEvent("ems-draft-preview", { detail }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewKey]);
+  useEffect(() => () => { window.dispatchEvent(new CustomEvent("ems-draft-preview", { detail: null })); }, []);
+
   if (drafts.length === 0) return null;
   const patch = (key, p) => setDrafts((all) => all.map((x) => (x.key === key ? { ...x, ...p } : x)));
   const drop = (key) => setDrafts((all) => all.filter((x) => x.key !== key));
@@ -88,7 +103,7 @@ export function CallDraftTray({ session }) {
     ]);
     return [
       ...places.map((p) => ({ label: `${p.name}, ${p.address}`, short: `${p.name}, ${p.address}`, lat: p.lat, lon: p.lon, facilityId: p.facility_id, kind: "saved" })),
-      ...map.map((m) => ({ label: m.label, short: shortLabel(m.label), lat: m.lat, lon: m.lon, kind: "map" })),
+      ...map.map((m) => ({ label: m.label, short: m.label, lat: m.lat, lon: m.lon, kind: "map", precision: m.precision, approximate: Boolean(m.approximate) })),
     ];
   }
 
@@ -128,6 +143,42 @@ export function CallDraftTray({ session }) {
   );
 }
 
+// A small map inside the form: the pickup (cyan P) and drop-off (magenta D) as you pick them, before saving.
+function TripPreview({ pickup, dest }) {
+  const status = useLeafletLoader();
+  const ref = useRef(null);
+  const mapRef = useRef(null);
+  const layerRef = useRef(null);
+  const key = `${pickup?.lat},${pickup?.lon},${dest?.lat},${dest?.lon}`;
+  useEffect(() => {
+    if (status !== "ready" || !ref.current || (!pickup && !dest)) return;
+    const L = window.L;
+    if (!mapRef.current) {
+      mapRef.current = L.map(ref.current, { zoomControl: false, attributionControl: false }).setView([pickup?.lat ?? dest.lat, pickup?.lon ?? dest.lon], 14);
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(mapRef.current);
+      layerRef.current = L.layerGroup().addTo(mapRef.current);
+    }
+    const g = layerRef.current; g.clearLayers();
+    const pin = (p, t, c) => L.marker([p.lat, p.lon], { icon: L.divIcon({ className: "", iconSize: [26, 26], iconAnchor: [13, 13], html: `<div title="${esc(p.label)}" style="width:26px;height:26px;border-radius:50%;background:#0A0E13;border:3px solid ${c};color:#fff;font:700 12px Inter,system-ui,sans-serif;display:flex;align-items:center;justify-content:center">${t}</div>` }) }).addTo(g);
+    const pts = [];
+    if (pickup) { pin(pickup, "P", PICKUP_COLOR); pts.push([pickup.lat, pickup.lon]); }
+    if (dest) { pin(dest, "D", DROPOFF_COLOR); pts.push([dest.lat, dest.lon]); }
+    if (pickup && dest) L.polyline(pts, { color: "#4EA1F0", weight: 3, dashArray: "6 6" }).addTo(g);
+    mapRef.current.invalidateSize();
+    if (pts.length > 1) mapRef.current.fitBounds(pts, { padding: [28, 28], maxZoom: 16 }); else mapRef.current.setView(pts[0], 16);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, key]);
+  useEffect(() => () => { if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } }, []);
+  if (!pickup && !dest) return null;
+  if (status !== "ready") return <div className="text-xs" style={{ color: TEXT_FAINT }}>{status === "failed" ? "Map preview unavailable." : "Loading the map preview…"}</div>;
+  return (
+    <div>
+      <div ref={ref} aria-label="Trip preview map" style={{ height: "150px", borderRadius: "6px", border: `1px solid ${HAIRLINE}` }} />
+      <div className="text-xs mt-1" style={{ color: TEXT_FAINT }}><span style={{ color: PICKUP_COLOR }}>P</span> pickup{dest ? <> · <span style={{ color: DROPOFF_COLOR }}>D</span> drop-off</> : ""}. Not saved yet.</div>
+    </div>
+  );
+}
+
 function CallForm({ form, setForm, onSubmit, submitLabel, onSearch, error, busy }) {
   const [results, setResults] = useState(null);       // { field, items }
   const [searching, setSearching] = useState(null);
@@ -145,9 +196,12 @@ function CallForm({ form, setForm, onSubmit, submitLabel, onSearch, error, busy 
     } catch (e) { setNote(e.message || "Search failed"); } finally { setSearching(null); }
   }
   function choose(field, item) {
+    // A street-only match for a house-numbered address pins the street, but the text stays what was
+    // typed ("475 Grand Avenue..."), so the house number is never lost and the crew gets the real address.
+    const keepTyped = item.approximate && /^\s*\d/.test(field === "pickup" ? form.address : form.destination);
     set(field === "pickup"
-      ? { address: item.short, lat: item.lat, lon: item.lon }
-      : { destination: item.short, destLat: item.lat, destLon: item.lon, destFacilityId: item.facilityId || null });
+      ? { address: keepTyped ? form.address : item.short, lat: item.lat, lon: item.lon, approx: keepTyped }
+      : { destination: keepTyped ? form.destination : item.short, destLat: item.lat, destLon: item.lon, destFacilityId: item.facilityId || null });
     setResults(null);
   }
   const place = (field, label, value, pinned, placeholder, extra) => (
@@ -157,12 +211,12 @@ function CallForm({ form, setForm, onSubmit, submitLabel, onSearch, error, busy 
           onChange={(e) => set(field === "pickup" ? { address: e.target.value, lat: null, lon: null } : { destination: e.target.value, destLat: null, destLon: null, destFacilityId: null })} />
         {onSearch && <button type="button" onClick={() => find(field)} disabled={searching !== null} className="text-sm px-3 rounded shrink-0" style={{ ...input, color: BLUE }}>{searching === field ? "…" : "Find"}</button>}
       </div>
-      {value.trim() && <span className="text-xs" style={{ color: pinned ? GREEN : AMBER }}>{extra || (pinned ? "Pinned on the map" : onSearch ? "Not pinned. Tap Find and pick the exact place so units can be matched by distance." : "Demo: placed at a random spot")}</span>}
+      {value.trim() && <span className="text-xs" style={{ color: pinned ? GREEN : AMBER }}>{extra || (pinned ? (field === "pickup" && form.approx ? "Pinned on the street (that house number isn't on the map). Check it before you send a unit." : "Pinned on the map") : onSearch ? "Not pinned. Tap Find and pick the exact place so units can be matched by distance." : "Demo: placed at a random spot")}</span>}
       {results && results.field === field && (
         <div className="flex flex-col rounded border mt-1" style={{ borderColor: HAIRLINE }}>
           {results.items.map((item, idx) => (
             <button type="button" key={idx} onClick={() => choose(field, item)} className="text-left text-xs px-2 py-2 border-b flex gap-2" style={{ borderColor: "#1B2330", color: TEXT_PRIMARY, backgroundColor: PANEL }}>
-              <span className="shrink-0 px-1 rounded" style={{ color: item.kind === "saved" ? GREEN : TEXT_FAINT, border: `1px solid ${HAIRLINE}` }}>{item.kind === "saved" ? "Saved place" : "Map"}</span><span>{item.label}</span>
+              <span className="shrink-0 px-1 rounded self-start" style={{ color: item.kind === "saved" ? GREEN : item.precision === "address" ? GREEN : AMBER, border: `1px solid ${HAIRLINE}` }}>{item.kind === "saved" ? "Saved place" : item.precision === "address" ? "Exact address" : item.approximate ? "Street only" : item.precision === "street" ? "Street" : "Place"}</span><span>{item.label}{item.approximate ? " (no house number found: pins the street)" : ""}</span>
             </button>
           ))}
         </div>
@@ -183,6 +237,7 @@ function CallForm({ form, setForm, onSubmit, submitLabel, onSearch, error, busy 
         </div>
       </Field>
       {place("pickup", "Pickup address or facility *", form.address, form.lat != null, "e.g. BronxCare Hospital Center, Bronx")}
+      <TripPreview pickup={form.lat != null ? { lat: form.lat, lon: form.lon, label: form.address } : null} dest={form.destLat != null ? { lat: form.destLat, lon: form.destLon, label: form.destination } : null} />
       <Field label="Room, floor, unit or cross street"><input type="text" value={form.detail} onChange={(e) => set({ detail: e.target.value })} placeholder="e.g. 4th floor, room 412, main lobby" className="w-full text-sm rounded px-2 py-2" style={input} /></Field>
       {place("dest", "Destination (for transfers)", form.destination, form.destLat != null, "e.g. Montefiore Moses", form.destFacilityId ? "Saved place: the chart will start with this destination" : null)}
       <div className="grid grid-cols-2 gap-3">
