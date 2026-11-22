@@ -14,6 +14,7 @@ import QaConsole from "../consoles/qa_console.jsx";
 import OpsConsole from "../consoles/ops_console.jsx";
 import ScheduleConsole, { startOfWeek } from "../consoles/schedule_console.jsx";
 import ReportsConsole, { mmss } from "../consoles/reports_console.jsx";
+import { effectivePosition } from "../consoles/map_kit.jsx";
 import { CallDraftTray } from "../consoles/call_form.jsx";
 
 beforeAll(async () => {
@@ -99,10 +100,11 @@ function fakeServer(routes) {
   return calls;
 }
 const LOGIN = { kind: "tenant", token: "t.t.t", expiresAt: new Date(Date.now() + 3600e3).toISOString(), user: { id: "u1", email: "boss@a.test", name: "Pat Boss", role: "supervisor", roles: ["supervisor", "qa_qi"], fieldLevel: null }, agency: "Acme Ambulance" };
+const CHK = (over = {}) => ({ required: true, owner: "the driver", due: false, last_at: new Date(Date.now() - 2 * 3600e3).toISOString(), last_by: "Dan Driver", last_result: "pass", failed_items: [], ...over });
 const liveSession = (role = "supervisor", extra = {}) => ({ mode: "live", kind: "tenant", apiBaseUrl: "/api", token: "t.t.t", agency: "Acme Ambulance", user: { ...LOGIN.user, role, roles: [role], ...extra } });
 const typeInto = (label, value) => fireEvent.change(screen.getByLabelText(label), { target: { value } });
 const INCIDENT = { incident_id: "i1", incident_type: "ift_on_demand", priority: "urgent", scene_address: "BronxCare Hospital Center", scene_detail: "Room 412", destination_text: "Montefiore Moses", patient_name: "", contact_name: "RN Pat", contact_phone: "718-555-0100", notes: "O2", capability_needed: "BLS", call_received_at: new Date().toISOString(), assigned_units: [], lat: 40.84, lon: -73.91, closed_at: null };
-const UNIT = (over) => ({ unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", current_status: "available", lat: 40.85, lon: -73.9, crew: [{ employeeId: "4471", name: "Casey Medic", role: "driver", cert: "ALS" }], ...over });
+const UNIT = (over) => ({ unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", current_status: "available", lat: 40.85, lon: -73.9, fleet_vehicle_id: "f1", vehicle_number: "214", crew: [{ employeeId: "4471", name: "Casey Medic", role: "driver", cert: "ALS" }], ...over });
 
 describe("sign-in", () => {
   it("starts at sign-in, shows no company or demo data, and offers a clearly separate demo", async () => {
@@ -406,20 +408,48 @@ describe("team admin", () => {
     expect(await screen.findByText(/no current ALS-level certification/)).toBeTruthy();
   });
 
-  it("units & inspections: shows the last shift check, flags a failure, and warns that the starter checklist isn't the agency's real inventory", async () => {
+  it("units & inspections: one headline per unit, the three checks by who owns them when opened, and a warning that the starter checklist isn't the agency's real inventory", async () => {
     fakeServer(TEAM_ROUTES({
-      "GET /checklist": [{ item_id: "i1", label: "Oxygen supply adequate", category: "Oxygen and airway", applies_to: "BLS", min_quantity: null, is_active: true, source: "starter" }],
-      "GET /unit-checks/status": [{ unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", crew_count: 1, check_due: false, last_check_at: new Date(Date.now() - 2 * 3600e3).toISOString(), last_check_result: "fail", last_check_by: "Eli Emt", failed_items: ["Suction working"], periodic: [{ kind: "dmv_inspection", performedAt: "2026-06-01T00:00:00Z", result: "pass", nextDue: "2027-06-01" }] }],
+      "GET /checklist": [{ item_id: "i1", label: "Oxygen supply adequate", category: "Oxygen and airway", applies_to: "BLS", section: "equipment", min_quantity: null, is_active: true, source: "starter" }],
+      "GET /unit-checks/status": [{ unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", crew_count: 2, check_due: false, any_failed: true, fleet_vehicle_id: "f1", vehicle_number: "214",
+        checks: { vehicle: CHK(), bls: CHK({ owner: "an EMT or above", last_by: "Eli Emt" }), als: CHK({ owner: "the paramedic", last_by: "Pat Medic", last_result: "fail", failed_items: ["Suction working"] }) },
+        periodic: [{ kind: "dmv_inspection", performedAt: "2026-06-01T00:00:00Z", result: "pass", nextDue: "2027-06-01" }] }],
     }));
     render(<TeamConsole session={liveSession()} />);
     fireEvent.click(await screen.findByRole("button", { name: "Units & inspections" }));
     expect(await screen.findByText("Check failed")).toBeTruthy();            // the closed row shows only the headline
+    expect(screen.getByText("Vehicle 214")).toBeTruthy();
     expect(screen.queryByText(/Suction working/)).toBeNull();
     fireEvent.click(screen.getByText("Medic 1"));
-    expect(await screen.findByText(/FAILED 2 h ago by Eli Emt: Suction working/)).toBeTruthy();
-    expect(screen.getByText(/DMV inspection: passed/)).toBeTruthy();
+    expect(await screen.findByText(/ALS equipment check \(the paramedic\)/)).toBeTruthy();
+    expect(screen.getByText(/FAILED 2 h ago by Pat Medic: Suction working/)).toBeTruthy();
+    expect(screen.getByText(/Vehicle check \(the driver\)/)).toBeTruthy();
+    expect(screen.getByText(/DMV inspection \(vehicle 214\)/)).toBeTruthy();
     expect(screen.getByText(/not your agency's required equipment/)).toBeTruthy();
     expect(screen.getByText(/Part 800/)).toBeTruthy();
+  });
+
+  it("vehicles: listed with the unit using each, added, and taken out of service only with a reason", async () => {
+    const calls = fakeServer(TEAM_ROUTES({
+      "GET /fleet": [{ fleet_vehicle_id: "f1", vehicle_number: "214", make_model: "Ford F-450", plate: "ABC123", status: "in_service", unit_id: "u1", unit_designation: "Medic 1", next_inspection_due: "2027-06-01" }, { fleet_vehicle_id: "f2", vehicle_number: "215", status: "in_service", unit_id: null }],
+      "POST /fleet": { fleet_vehicle_id: "f3" }, "POST /fleet/f2/out-of-service": { ok: true },
+    }));
+    render(<TeamConsole session={liveSession()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicles" }));
+    expect(await screen.findByText("Vehicle 214")).toBeTruthy();
+    expect(screen.getByText("on Medic 1")).toBeTruthy();
+    expect(screen.getByText("not assigned")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "+ Add vehicle" }));
+    fireEvent.change(screen.getByLabelText("Vehicle number"), { target: { value: "216" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add vehicle" }));
+    await waitFor(() => expect(calls.find((c) => c.key === "POST /fleet")?.body.vehicleNumber).toBe("216"));
+    fireEvent.click(screen.getByText("Vehicle 215"));
+    fireEvent.click(await screen.findByRole("button", { name: "Mark out of service" }));
+    const confirm = screen.getAllByRole("button", { name: "Mark out of service" }).pop();
+    expect(confirm.disabled).toBe(true);                                     // no reason, no button
+    fireEvent.change(screen.getByPlaceholderText(/Why\?/), { target: { value: "Overheating" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Mark out of service" }).pop());
+    await waitFor(() => expect(calls.find((c) => c.key === "POST /fleet/f2/out-of-service")?.body).toEqual({ reason: "Overheating" }));
   });
 });
 
@@ -506,7 +536,7 @@ describe("field unit: profile and unit check", () => {
     const calls = fakeServer({
       "GET /auth/me": { user: LOGIN.user, agency: "A", unit: { unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", current_status: "available", seat_role: "driver" }, incident: null },
       "GET /me/stats": { assigned: 4, completed: 0, pending: 0, awaitingCorrection: 0, canChart: false },
-      "GET /unit-checks/status": [{ unit_id: "u1", last_check_at: null, failed_items: [], periodic: [] }],
+      "GET /unit-checks/status": [{ unit_id: "u1", fleet_vehicle_id: "f1", vehicle_number: "214", crew_count: 2, check_due: true, any_failed: false, checks: { vehicle: { required: true, owner: "the driver", due: true, last_at: null, failed_items: [] }, bls: { required: true, owner: "an EMT or above", due: false, last_at: new Date().toISOString(), last_by: "Eli Emt", last_result: "pass", failed_items: [] }, als: { required: true, owner: "the paramedic", due: false, last_at: new Date().toISOString(), last_by: "Pat Medic", last_result: "pass", failed_items: [] } }, periodic: [] }],
       "GET /checklist": [{ item_id: "i1", label: "Oxygen supply adequate", category: "Oxygen and airway", min_quantity: null }, { item_id: "i2", label: "Suction working", category: "Oxygen and airway", min_quantity: 1 }],
       "POST /unit-checks": { result: "fail", failedItems: ["Suction working"] },
     });
@@ -515,7 +545,12 @@ describe("field unit: profile and unit check", () => {
     expect(screen.getByText("Assigned")).toBeTruthy();
     expect(screen.queryByText("Completed ePCRs")).toBeNull();
     expect(screen.getByText(/MVOs don't write patient charts/)).toBeTruthy();
-    fireEvent.click(await screen.findByRole("button", { name: "Do the check" }));
+    // an MVO who is driving owns the VEHICLE check only; the equipment checks belong to the EMT and the paramedic
+    expect(await screen.findAllByRole("button", { name: "Do the check" })).toHaveLength(1);
+    expect(screen.getByText(/VEHICLE CHECK · VEHICLE 214/)).toBeTruthy();
+    expect(screen.getByText("Done by an EMT on this unit.")).toBeTruthy();
+    expect(screen.getByText("Done by the paramedic on this unit.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Do the check" }));
     await screen.findByText("Oxygen supply adequate");
     const submit = screen.getByRole("button", { name: "Submit check" });
     expect(submit.disabled).toBe(true);
@@ -527,7 +562,8 @@ describe("field unit: profile and unit check", () => {
     fireEvent.change(screen.getByPlaceholderText("What's wrong?"), { target: { value: "Strap frayed" } });
     expect(submit.disabled).toBe(false);
     fireEvent.click(submit);
-    await waitFor(() => expect(calls.some((c) => c.key === "POST /unit-checks" && c.body.items.some((i) => i.ok === false && i.note === "Strap frayed"))).toBe(true));
+    await waitFor(() => expect(calls.some((c) => c.key === "POST /unit-checks" && c.body.kind === "vehicle" && c.body.items.some((i) => i.ok === false && i.note === "Strap frayed"))).toBe(true));
+    expect(calls.find((c) => c.key === "GET /checklist").url).toContain("kind=vehicle");
     expect(await screen.findByText(/flagged for your supervisor/)).toBeTruthy();
   });
 });
@@ -603,10 +639,12 @@ describe("field unit: due check and new-call alert", () => {
     fakeServer({
       "GET /auth/me": { user: LOGIN.user, agency: "A", unit: { unit_id: "u1", unit_designation: "Medic 1", capability_level: "ALS", current_status: "available", seat_role: "driver" }, incident: null },
       "GET /me/stats": { assigned: 0, completed: 0, pending: 0, awaitingCorrection: 0, canChart: true },
-      "GET /unit-checks/status": [{ unit_id: "u1", crew_count: 2, check_due: true, last_check_at: null, failed_items: [], periodic: [] }],
+      "GET /unit-checks/status": [{ unit_id: "u1", fleet_vehicle_id: "f1", vehicle_number: "214", crew_count: 2, check_due: true, any_failed: false, checks: { vehicle: { required: true, owner: "the driver", due: true, last_at: null, failed_items: [] }, bls: { required: true, owner: "an EMT or above", due: true, last_at: new Date().toISOString(), last_by: "Eli Emt", last_result: "pass", failed_items: [] }, als: { required: true, owner: "the paramedic", due: false, last_at: new Date().toISOString(), last_by: "Pat Medic", last_result: "pass", failed_items: [] } }, periodic: [] }],
     });
     render(<FieldUnitConsole session={liveSession("crew", { fieldLevel: "emt", roles: ["crew"] })} />);
-    expect(await screen.findByText(/Your unit check is due/)).toBeTruthy();
+    // this EMT is also the driver: their vehicle check AND BLS equipment check are due, but not the paramedic's ALS check
+    expect(await screen.findByText(/Your vehicle check and BLS equipment check are due/)).toBeTruthy();
+    expect(screen.queryByText(/ALS equipment check are due/)).toBeNull();
   });
 });
 
@@ -728,5 +766,124 @@ describe("field unit: shifts", () => {
     render(<FieldUnitConsole session={liveSession("crew", { fieldLevel: "emt", roles: ["crew"] })} />);
     expect(await screen.findByText("MY SHIFTS")).toBeTruthy();
     expect(screen.getByText("Medic 7 · driver")).toBeTruthy();
+  });
+});
+
+describe("map positions without GPS", () => {
+  const now = Date.parse("2026-11-03T12:00:00Z");
+  const call = { lat: 40.84, lon: -73.91, destLat: 40.86, destLon: -73.89 };
+  const unit = (over) => ({ lat: 40.8, lon: -73.95, status: "available", locationUpdatedAt: null, ...over });
+  it("a recent GPS fix wins; otherwise the unit is placed where its status says it must be, marked as an estimate", () => {
+    const fresh = effectivePosition(unit({ status: "on_scene", locationUpdatedAt: "2026-11-03T11:58:00Z" }), call, now);
+    expect(fresh).toMatchObject({ lat: 40.8, lon: -73.95, estimated: false, basis: "GPS" });
+    const stale = "2026-11-03T09:00:00Z";
+    expect(effectivePosition(unit({ status: "on_scene", locationUpdatedAt: stale }), call, now)).toMatchObject({ lat: 40.84, lon: -73.91, estimated: true });          // at the pickup
+    expect(effectivePosition(unit({ status: "at_destination", locationUpdatedAt: stale }), call, now)).toMatchObject({ lat: 40.86, lon: -73.89, estimated: true });    // at the DROP-OFF
+    const transit = effectivePosition(unit({ status: "transporting", locationUpdatedAt: stale }), call, now);
+    expect(transit.lat).toBeCloseTo(40.85, 5); expect(transit.lon).toBeCloseTo(-73.9, 5); expect(transit.estimated).toBe(true);                                         // half-way
+    expect(effectivePosition(unit({ status: "en_route", locationUpdatedAt: stale }), call, now)).toMatchObject({ lat: 40.8, lon: -73.95, basis: "last known position" });
+    expect(effectivePosition(unit({ status: "at_destination", locationUpdatedAt: stale }), { lat: 40.84, lon: -73.91 }, now)).toMatchObject({ lat: 40.84, lon: -73.91 });   // no drop-off pinned: the pickup
+    expect(effectivePosition({ lat: null, lon: null, status: "available" }, null, now)).toBeNull();
+    expect(effectivePosition(unit({ status: "available" }), null, now)).toMatchObject({ estimated: false });                                                           // demo/no timestamp: trusted
+  });
+});
+
+describe("address search and the trip preview", () => {
+  const RESULTS = [
+    { label: "475 Grand Ave, Palisades Park, NJ 07650", lat: 40.8481, lon: -73.9969, precision: "address", approximate: false },
+    { label: "Grand Avenue, Palisades Park, NJ 07650", lat: 40.847, lon: -73.995, precision: "street", approximate: true },
+  ];
+  const openForm = async () => {
+    render(<><DispatchConsole session={liveSession()} /><CallDraftTray session={liveSession()} /></>);
+    await screen.findByRole("button", { name: /New Call/ });
+    fireEvent.click(screen.getByRole("button", { name: /New Call/ }));
+    const pickup = await screen.findByPlaceholderText(/e\.g\. BronxCare/);
+    fireEvent.change(pickup, { target: { value: "475 Grand Avenue, Palisades Park, NJ" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Find" })[0]);
+    return pickup;
+  };
+  it("labels how precise each match is, and a street-only match never replaces the house number the dispatcher typed", async () => {
+    fakeServer({ "GET /units": [], "GET /incidents": [], "GET /geocode": RESULTS, "GET /facilities": [] });
+    const pickup = await openForm();
+    expect(await screen.findByText("Exact address")).toBeTruthy();
+    expect(screen.getByText("Street only")).toBeTruthy();
+    fireEvent.click(screen.getByText(/no house number found: pins the street/));
+    expect(pickup.value).toBe("475 Grand Avenue, Palisades Park, NJ");          // the 475 is still there
+    expect(screen.getByText(/Pinned on the street/)).toBeTruthy();               // ...with a warning that the pin is approximate
+  });
+  it("an exact match fills the address and pins it; the dispatch map is told so the pickup shows before saving", async () => {
+    fakeServer({ "GET /units": [], "GET /incidents": [], "GET /geocode": RESULTS, "GET /facilities": [] });
+    const seen = [];
+    const on = (e) => seen.push(e.detail);
+    window.addEventListener("ems-draft-preview", on);
+    const pickup = await openForm();
+    fireEvent.click(await screen.findByText("475 Grand Ave, Palisades Park, NJ 07650", { selector: "span" }));
+    expect(pickup.value).toBe("475 Grand Ave, Palisades Park, NJ 07650");
+    expect(screen.getByText("Pinned on the map")).toBeTruthy();
+    await waitFor(() => expect(seen.some((d) => d?.pickup?.lat === 40.8481 && d.pickup.label.startsWith("475 Grand"))).toBe(true));
+    window.removeEventListener("ems-draft-preview", on);
+  });
+});
+
+describe("dispatch map selection", () => {
+  it("selecting a queued call shows its trip (pickup to drop-off); with nothing selected the map is about ongoing calls and units", async () => {
+    fakeServer({ "GET /units": [UNIT()], "GET /incidents": [INCIDENT, { ...INCIDENT, incident_id: "i2", scene_address: "No Pin Rd", destination_text: null, lat: null, lon: null }] });
+    render(<DispatchConsole session={liveSession()} />);
+    expect(await screen.findByText(/LIVE MAP: ongoing calls and unit locations/)).toBeTruthy();
+    fireEvent.click(screen.getByText("BronxCare Hospital Center"));
+    expect(await screen.findByText(/TRIP: BronxCare Hospital Center → Montefiore Moses/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
+    expect(await screen.findByText(/LIVE MAP: ongoing calls/)).toBeTruthy();
+    fireEvent.click(screen.getByText("No Pin Rd"));
+    expect(await screen.findByText(/no pin on the map yet/)).toBeTruthy();              // an unpinned call says so instead of showing nothing
+  });
+});
+
+describe("team: units can be renamed and deleted", () => {
+  it("renames a unit and says what happened when it's deleted (deleted, or retired because it has history)", async () => {
+    const calls = fakeServer(TEAM_ROUTES({ "PATCH /units/u1": { ok: true }, "DELETE /units/u1": { retired: true }, "GET /unit-checks/status": [{ unit_id: "u1", crew_count: 0, check_due: false, any_failed: false, checks: { vehicle: CHK({ required: false }), bls: CHK({ required: false }), als: CHK({ required: false }) }, periodic: [] }] }));
+    render(<TeamConsole session={liveSession()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Units & inspections" }));
+    fireEvent.click(await screen.findByText("Medic 1"));
+    fireEvent.change(await screen.findByDisplayValue("Medic 1"), { target: { value: "ALS 1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls.find((c) => c.key === "PATCH /units/u1")?.body).toEqual({ designation: "ALS 1", capabilityLevel: "ALS" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete unit" }));
+    expect(screen.getByText(/retired instead/)).toBeTruthy();                // asks first, and says what "delete" means
+    fireEvent.click(screen.getByRole("button", { name: "Yes, delete" }));
+    await waitFor(() => expect(calls.some((c) => c.key === "DELETE /units/u1")).toBe(true));
+    expect(await screen.findByText(/retired\. Its history is kept/)).toBeTruthy();
+  });
+});
+
+describe("OPS: vehicles", () => {
+  const crew = (name, level, role, id) => ({ employeeId: "1", name, role, cert: null, crewMemberId: id, fieldLevel: level });
+  const base = (over = {}) => ({
+    "GET /units": [{ unit_id: "u1", unit_designation: "Medic 7", capability_level: "ALS", current_status: "available", fleet_vehicle_id: "f1", vehicle_number: "214", crew: [crew("Pat Medic", "paramedic", "non_driver", "c1"), crew("Dan Driver", "mvo", "driver", "c2")] },
+      { unit_id: "u2", unit_designation: "BLS 2", capability_level: "BLS", current_status: "out_of_service", fleet_vehicle_id: null, vehicle_number: null, crew: [] }],
+    "GET /ops/roster": [], "GET /unit-checks/status": [],
+    "GET /fleet": [{ fleet_vehicle_id: "f9", vehicle_number: "215", make_model: "Ford E-450" }], ...over,
+  });
+  it("switches a unit's vehicle after a breakdown: the old one goes out of service with the reason, and the unit stays active", async () => {
+    const calls = fakeServer(base({ "PUT /units/u1/vehicle": { ok: true } }));
+    render(<OpsConsole session={liveSession()} />);
+    expect(await screen.findByText("Vehicle 214")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Switch vehicle" }));
+    fireEvent.change(screen.getByLabelText("Vehicle"), { target: { value: "f9" } });
+    expect(screen.getByLabelText("Take vehicle 214 out of service").checked).toBe(true);        // on by default for a breakdown
+    fireEvent.change(screen.getByPlaceholderText("Details (optional)"), { target: { value: "overheating" } });
+    fireEvent.click(screen.getByRole("button", { name: "Switch" }));
+    await waitFor(() => expect(calls.find((c) => c.key === "PUT /units/u1/vehicle")?.body).toEqual({ fleetVehicleId: "f9", markOldOutOfService: true, reason: "Mechanical issue: overheating" }));
+    expect(await screen.findByText(/still active/)).toBeTruthy();
+  });
+  it("assigns a vehicle to a unit that has none (no 'out of service' question: there's no old vehicle)", async () => {
+    const calls = fakeServer(base({ "PUT /units/u2/vehicle": { ok: true } }));
+    render(<OpsConsole session={liveSession()} />);
+    expect(await screen.findByText("No vehicle assigned")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Assign vehicle" }));
+    expect(screen.queryByLabelText("Why")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Vehicle"), { target: { value: "f9" } });
+    fireEvent.click(screen.getByRole("button", { name: "Assign" }));
+    await waitFor(() => expect(calls.find((c) => c.key === "PUT /units/u2/vehicle")?.body).toEqual({ fleetVehicleId: "f9" }));
   });
 });
