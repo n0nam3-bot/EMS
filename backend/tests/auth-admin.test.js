@@ -248,7 +248,8 @@ test("long staff lists: search, filter by field/office, and page through with a 
 
 test("charts belong to the unit's clinical crew: MVOs and office staff never get one, submitting locks it, only QA/QI can reopen it, and corrections go to one named person", async () => {
   const a = await tokenFor("boss@a.test");
-  const tok = Object.fromEntries(await Promise.all(["medic", "emt", "emt2", "mvo", "qa"].map(async (k) => [k, await tokenFor(`${k}@a.test`)])));
+  const tok = {};
+  for (const k of ["medic", "emt", "emt2", "mvo", "qa"]) tok[k] = await tokenFor(`${k}@a.test`);   // one at a time: each sign-in moves the shared test clock
   const inc = (await call("POST", "/incidents", { incidentType: "emergency_911", priority: "urgent", sceneAddress: "5 Chart Ave" }, a)).body.incident_id;
   ctx.chartIncident = inc;
   assert.equal((await call("POST", `/incidents/${inc}/assignments`, { unitId: ctx.als.unit_id, role: "primary" }, a)).status, 201);
@@ -332,18 +333,94 @@ test("charts belong to the unit's clinical crew: MVOs and office staff never get
   assert.ok((await q("SELECT count(*) AS n FROM audit_log WHERE action = 'view' AND table_name = 'patient_care_records' AND record_id = $1", [pcr]))[0].n >= 2, "every chart open is audited");
 });
 
-test("shift check: a unit with a crew owes a check; the system records it when the crew does it, and can't see it any other way", async () => {
-  const a = await tokenFor("boss@a.test"), emt = await tokenFor("emt@a.test");
+test("checks: the driver does the vehicle, an EMT the BLS equipment, the paramedic the ALS equipment; each is due once per crew, and swapping the vehicle makes a new vehicle check due", async () => {
+  const a = await tokenFor("boss@a.test"), disp = ctx.dispTok;
+  const mvo = await tokenFor("mvo@a.test"), emt = await tokenFor("emt@a.test"), medic = await tokenFor("medic@a.test");
   const row = async (n) => (await call("GET", "/unit-checks/status", null, a)).body.find((u) => u.unit_designation === n);
-  const idle = await row("Rig 9");
-  assert.equal(idle.check_due, false, "no crew on it, so nothing is owed");
-  const medic1 = await row("Medic 1");
-  assert.equal(medic1.crew_count > 0, true);
-  const items = (await call("GET", `/checklist?unitId=${ctx.als.unit_id}`, null, emt)).body.map((i) => ({ itemId: i.item_id, ok: true }));
-  await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items }, emt);
-  assert.equal((await row("Medic 1")).check_due, false, "done for this crew");
+  const answer = async (kind, tok, fail) => {
+    const items = (await call("GET", `/checklist?unitId=${ctx.als.unit_id}&kind=${kind}`, null, tok)).body;
+    return { items, body: { unitId: ctx.als.unit_id, kind, items: items.map((i, n) => ({ itemId: i.item_id, ok: !(fail && n === 0), note: fail && n === 0 ? "Strap frayed" : undefined })) } };
+  };
+
+  const v1 = await call("POST", "/fleet", { vehicleNumber: "214", makeModel: "Ford F-450", plate: "ABC123" }, a);
+  assert.equal(v1.status, 201);
+  assert.equal((await call("POST", "/fleet", { vehicleNumber: "214" }, a)).status, 409, "a vehicle number is used once");
+  const v2 = (await call("POST", "/fleet", { vehicleNumber: "215" }, a)).body;
+  assert.equal((await call("POST", "/fleet", { vehicleNumber: "216" }, emt)).status, 403, "crew can't edit the fleet");
+
+  // no vehicle yet: nothing to check, and the vehicle check can't be recorded
+  const before = await row("Medic 1");
+  assert.equal(before.checks.vehicle.required, false);
+  const veh = await answer("vehicle", mvo);
+  assert.equal((await call("POST", "/unit-checks", veh.body, mvo)).status, 409, "assign a vehicle first");
+  assert.equal((await call("PUT", `/units/${ctx.als.unit_id}/vehicle`, { fleetVehicleId: v1.body.fleet_vehicle_id }, emt)).status, 403, "crew can't assign vehicles");
+  assert.equal((await call("PUT", `/units/${ctx.als.unit_id}/vehicle`, { fleetVehicleId: v1.body.fleet_vehicle_id }, disp)).status, 200, "a dispatcher can");
+  assert.equal((await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 1").vehicle_number, "214");
+
+  let s = await row("Medic 1");
+  assert.deepEqual([s.checks.vehicle.due, s.checks.bls.due, s.checks.als.due], [true, true, true], "a crewed unit with a vehicle owes all three");
+  assert.equal(s.checks.vehicle.owner, "the driver");
+  assert.ok(veh.items.length > 0 && veh.items.every((i) => i.section === "vehicle"), "the vehicle check is only vehicle items");
+  assert.ok((await answer("bls", emt)).items.every((i) => i.section === "equipment" && i.applies_to === "BLS"));
+  assert.ok((await answer("als", medic)).items.every((i) => i.applies_to === "ALS" || i.applies_to === "CCT"));
+
+  // who may record which
+  assert.equal((await call("POST", "/unit-checks", veh.body, emt)).status, 403, "an EMT who isn't driving can't do the vehicle check");
+  assert.equal((await call("POST", "/unit-checks", veh.body, mvo)).status, 201, "the driver can");
+  const bls = await answer("bls", emt);
+  assert.equal((await call("POST", "/unit-checks", bls.body, mvo)).status, 403, "an MVO doesn't do the equipment check");
+  assert.equal((await call("POST", "/unit-checks", bls.body, emt)).status, 201);
+  const als = await answer("als", medic, true);
+  assert.equal((await call("POST", "/unit-checks", (await answer("als", emt)).body, emt)).status, 403, "only the paramedic does the ALS check");
+  const alsFail = await call("POST", "/unit-checks", als.body, medic);
+  assert.equal(alsFail.status, 201);
+  assert.equal(alsFail.body.result, "fail");
+  assert.equal((await call("POST", "/unit-checks", { ...als.body, items: als.body.items.map((i) => ({ ...i, note: undefined })) }, medic)).status, 400, "a not-OK line needs a note");
+  assert.equal((await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, kind: "bls", items: [] }, emt)).status, 400, "every line must be answered");
+  const blsUnit = (await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Rig 9");
+  assert.equal((await call("POST", "/unit-checks", { unitId: blsUnit.unit_id, kind: "als", items: [] }, a)).status, 409, "a BLS unit has no ALS check");
+
+  s = await row("Medic 1");
+  assert.deepEqual([s.checks.vehicle.due, s.checks.bls.due, s.checks.als.due], [false, false, false]);
+  assert.deepEqual(s.checks.als.failed_items, [als.items[0].label]);
+  assert.equal(s.any_failed, true, "a failed check flags the unit");
+  assert.equal(s.check_due, false);
+
+  // 14 hours later the crew still owes a new round
   await admin.query("UPDATE unit_checks SET performed_at = now() - interval '14 hours' WHERE unit_id = $1", [ctx.als.unit_id]);
-  assert.equal((await row("Medic 1")).check_due, true, "a check from 14 hours ago doesn't cover a new shift");
+  assert.equal((await row("Medic 1")).check_due, true);
+  await call("POST", "/unit-checks", (await answer("vehicle", mvo)).body, mvo);
+  await call("POST", "/unit-checks", (await answer("bls", emt)).body, emt);
+  await call("POST", "/unit-checks", (await answer("als", medic)).body, medic);
+  s = await row("Medic 1");
+  assert.deepEqual([s.checks.vehicle.due, s.checks.bls.due, s.checks.als.due, s.any_failed], [false, false, false, false], "a new passing round clears the flag");
+
+  // MVA or a breakdown: switch vehicles, the unit stays active, the old vehicle comes out of service with a reason
+  assert.equal((await call("PUT", `/units/${ctx.als.unit_id}/vehicle`, { fleetVehicleId: v2.fleet_vehicle_id, markOldOutOfService: true }, disp)).status, 400, "a reason is required");
+  const unitBefore = (await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 1").current_status;
+  assert.equal((await call("PUT", `/units/${ctx.als.unit_id}/vehicle`, { fleetVehicleId: v2.fleet_vehicle_id, markOldOutOfService: true, reason: "Mechanical: overheating" }, disp)).status, 200);
+  const nowUnit = (await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 1");
+  assert.equal(nowUnit.vehicle_number, "215");
+  assert.equal(nowUnit.current_status, unitBefore, "the unit's status didn't change");
+  const fleet = (await call("GET", "/fleet", null, disp)).body;
+  const old = fleet.find((f) => f.vehicle_number === "214");
+  assert.deepEqual([old.status, old.out_of_service_reason, old.unit_id], ["out_of_service", "Mechanical: overheating", null]);
+  assert.equal(fleet.find((f) => f.vehicle_number === "215").unit_designation, "Medic 1");
+  s = await row("Medic 1");
+  assert.equal(s.checks.vehicle.due, true, "the new vehicle needs its own vehicle check");
+  assert.equal(s.checks.bls.due, false, "the equipment didn't change, so those checks stand");
+  assert.equal((await call("PUT", `/units/${blsUnit.unit_id}/vehicle`, { fleetVehicleId: old.fleet_vehicle_id }, disp)).status, 409, "an out-of-service vehicle can't be assigned");
+  assert.equal((await call("POST", `/fleet/${old.fleet_vehicle_id}/return-to-service`, {}, disp)).status, 200);
+  assert.equal((await call("PUT", `/units/${blsUnit.unit_id}/vehicle`, { fleetVehicleId: v2.fleet_vehicle_id }, disp)).status, 409, "a vehicle can only be on one unit");
+  assert.equal((await call("PUT", `/units/${blsUnit.unit_id}/vehicle`, { fleetVehicleId: old.fleet_vehicle_id }, disp)).status, 200);
+
+  // periodic inspections belong to the vehicle, and follow it
+  assert.equal((await call("POST", "/unit-checks/inspection", { fleetVehicleId: v2.fleet_vehicle_id, kind: "dmv_inspection", result: "pass", nextDue: "2027-06-30" }, emt)).status, 403);
+  assert.equal((await call("POST", "/unit-checks/inspection", { fleetVehicleId: v2.fleet_vehicle_id, kind: "dmv_inspection", result: "pass", nextDue: "2027-06-30" }, a)).status, 201);
+  assert.equal((await row("Medic 1")).periodic[0].kind, "dmv_inspection");
+  const comp = (await call("GET", "/vehicles", null, a)).body.find((v) => v.unit_designation === "215");
+  assert.equal(String(comp.next_inspection_due).slice(0, 10), "2027-06-30");
+  assert.equal((await call("PUT", `/units/${blsUnit.unit_id}/vehicle`, { fleetVehicleId: null }, disp)).status, 200, "a vehicle can be taken off");
 });
 
 test("saved places: a supervisor keeps the list, anyone searches it, and a call can point at one as its destination (which the chart then starts from)", async () => {
@@ -443,39 +520,53 @@ test("response-time report: counts and timed intervals by priority, for supervis
   assert.equal((await call("GET", "/reports/response?days=7", null, await tokenFor("boss@b.test"))).body.totalCalls, 0, "another company's calls aren't in it");
 });
 
-test("unit checks: the checklist is the agency's own, a shift check needs every line answered, a failure needs a note and flags the unit", async () => {
-  const a = await tokenFor("boss@a.test"), emt = await tokenFor("emt@a.test"), mvo = await tokenFor("mvo@a.test");
-  const forUnit = (await call("GET", `/checklist?unitId=${ctx.als.unit_id}`, null, emt)).body;
-  assert.ok(forUnit.some((i) => i.applies_to === "ALS") && forUnit.some((i) => i.applies_to === "BLS"), "an ALS unit gets BLS and ALS items");
-  const blsUnit = (await call("POST", "/units", { designation: "Ambulance 2", capabilityLevel: "BLS" }, a)).body;
-  assert.ok((await call("GET", `/checklist?unitId=${blsUnit.unit_id}`, null, a)).body.every((i) => i.applies_to === "BLS"));
-
+test("checklist: it's the agency's own, split into vehicle and equipment, importable by paste, and editable only by supervisors", async () => {
+  const a = await tokenFor("boss@a.test"), emt = await tokenFor("emt@a.test");
+  const all = (await call("GET", "/checklist", null, a)).body;
+  assert.ok(all.some((i) => i.section === "vehicle") && all.some((i) => i.section === "equipment" && i.applies_to === "ALS"), "the starter list has vehicle items and BLS/ALS equipment");
   const imp = await call("POST", "/checklist/import", { text: "Pulse oximeter, 2\nSpine board\t3\tBLS\tImmobilization\nTraction splint, 1, ALS, Splints\nPulse oximeter, 2", appliesTo: "BLS", category: "Equipment" }, a);
   assert.equal(imp.status, 201);
   assert.deepEqual(imp.body, { added: 3, skipped: 1 }, "a pasted list is imported; duplicates are skipped");
+  const tyres = await call("POST", "/checklist/import", { text: "Tire tread and pressure", section: "vehicle", category: "Vehicle" }, a);
+  assert.equal(tyres.body.added, 1);
+  assert.ok((await call("GET", `/checklist?unitId=${ctx.als.unit_id}&kind=vehicle`, null, emt)).body.some((i) => i.label === "Tire tread and pressure"), "an imported vehicle item lands on the driver's vehicle check");
   assert.equal((await call("POST", "/checklist/import", { text: "x" }, emt)).status, 403, "only supervisors edit the checklist");
+  assert.equal((await call("POST", "/checklist", { label: "Bad", section: "nonsense" }, a)).status, 400);
+});
 
-  const items = (await call("GET", `/checklist?unitId=${ctx.als.unit_id}`, null, emt)).body;
-  const allOk = items.map((i) => ({ itemId: i.item_id, ok: true }));
-  assert.equal((await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items: allOk.slice(1) }, emt)).status, 400, "every line must be answered");
-  const oneBad = allOk.map((x, i) => (i === 0 ? { ...x, ok: false } : x));
-  assert.equal((await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items: oneBad }, emt)).status, 400, "a not-OK line needs a note");
-  assert.equal((await call("POST", "/unit-checks", { unitId: blsUnit.unit_id, items: [] }, emt)).status, 403, "only the crew on a unit records its check");
-  const statusBefore = (await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 1").current_status;
-  const failed = await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items: oneBad.map((x, i) => (i === 0 ? { ...x, note: "Strap frayed" } : x)) }, mvo);
-  assert.equal(failed.status, 201);
-  assert.equal(failed.body.result, "fail");
-  const st = (await call("GET", "/unit-checks/status", null, a)).body.find((u) => u.unit_designation === "Medic 1");
-  assert.equal(st.last_check_result, "fail");
-  assert.deepEqual(st.failed_items, [items[0].label]);
-  assert.equal((await call("GET", "/units", null, a)).body.find((u) => u.unit_designation === "Medic 1").current_status, statusBefore, "a failed check flags the unit but never changes its service status; a supervisor decides");
-  assert.equal((await call("POST", "/unit-checks", { unitId: ctx.als.unit_id, items: allOk }, emt)).body.result, "pass");
+test("units: rename, change level, delete when never used, retire when they have history", async () => {
+  const a = await tokenFor("boss@a.test"), disp = ctx.dispTok;
+  const list = async () => (await call("GET", "/units", null, a)).body.map((u) => u.unit_designation);
+  const fresh = (await call("POST", "/units", { designation: "Spare 1", capabilityLevel: "BLS" }, a)).body;
+  assert.equal((await call("PATCH", `/units/${fresh.unit_id}`, { designation: "Spare One" }, a)).status, 200);
+  assert.ok((await list()).includes("Spare One"));
+  assert.equal((await call("PATCH", `/units/${fresh.unit_id}`, { designation: "medic 1" }, a)).status, 409, "no two units share a name");
+  assert.equal((await call("PATCH", `/units/${fresh.unit_id}`, { capabilityLevel: "XYZ" }, a)).status, 400);
+  assert.equal((await call("PATCH", `/units/${fresh.unit_id}`, { capabilityLevel: "ALS" }, a)).status, 200);
+  assert.equal((await call("PATCH", `/units/${fresh.unit_id}`, { designation: "Hijack" }, disp)).status, 403, "dispatchers don't rename units");
+  assert.deepEqual(await call("DELETE", `/units/${fresh.unit_id}`, null, a).then((r) => r.body), { deleted: true });
+  assert.ok(!(await list()).includes("Spare One"));
 
-  assert.equal((await call("POST", "/unit-checks/inspection", { unitId: ctx.als.unit_id, kind: "dmv_inspection", result: "pass", nextDue: "2027-06-30" }, emt)).status, 403);
-  assert.equal((await call("POST", "/unit-checks/inspection", { unitId: ctx.als.unit_id, kind: "dmv_inspection", result: "pass", nextDue: "2027-06-30" }, a)).status, 201);
-  const periodic = (await call("GET", "/unit-checks/status", null, a)).body.find((u) => u.unit_designation === "Medic 1").periodic;
-  assert.equal(periodic[0].kind, "dmv_inspection");
-  assert.equal(String((await call("GET", "/vehicles", null, a)).body.find((v) => v.unit_designation === "Medic 1").next_inspection_due).slice(0, 10), "2027-06-30");
+  const used = (await call("POST", "/units", { designation: "Used 3", capabilityLevel: "BLS" }, a)).body;
+  const person = (await call("POST", "/users", { email: "tmp@a.test", displayName: "Tmp Emt", roles: ["crew"], fieldLevel: "emt", password: PW }, a)).body;
+  await call("PUT", `/crew/${person.crew_member_id}/unit`, { unitId: used.unit_id, seatRole: "driver" }, disp);
+  assert.equal((await call("DELETE", `/units/${used.unit_id}`, null, a)).status, 409, "a crewed unit can't be deleted");
+  await call("PUT", `/crew/${person.crew_member_id}/unit`, { unitId: null }, disp);
+  assert.deepEqual((await call("DELETE", `/units/${used.unit_id}`, null, a)).body, { retired: true }, "a unit with history is retired, not erased");
+  assert.ok(!(await list()).includes("Used 3"));
+  assert.ok(!(await call("GET", "/unit-checks/status", null, a)).body.some((u) => u.unit_designation === "Used 3"), "retired units vanish from every list");
+  assert.equal((await call("POST", "/units", { designation: "Used 3", capabilityLevel: "BLS" }, a)).status, 201, "the name can be reused");
+  assert.equal((await q("SELECT count(*) AS n FROM units WHERE unit_id = $1 AND retired_at IS NOT NULL", [used.unit_id]))[0].n, "1", "its record is still there");
+
+  const spare = (await call("POST", "/fleet", { vehicleNumber: "999" }, a)).body;
+  assert.equal((await call("PATCH", `/fleet/${spare.fleet_vehicle_id}`, { vehicleNumber: "998", plate: "XYZ789" }, a)).status, 200);
+  assert.equal((await call("PATCH", `/fleet/${spare.fleet_vehicle_id}`, { vehicleNumber: "214" }, a)).status, 409);
+  assert.deepEqual((await call("DELETE", `/fleet/${spare.fleet_vehicle_id}`, null, a)).body, { deleted: true });
+  const inUse = (await call("GET", "/fleet", null, a)).body.find((f) => f.vehicle_number === "215");
+  assert.equal((await call("DELETE", `/fleet/${inUse.fleet_vehicle_id}`, null, a)).status, 409, "a vehicle a unit is using can't be removed");
+  const retired = (await call("GET", "/fleet", null, a)).body.find((f) => f.vehicle_number === "214");
+  assert.deepEqual((await call("DELETE", `/fleet/${retired.fleet_vehicle_id}`, null, a)).body, { retired: true }, "a vehicle with history is retired");
+  assert.ok(!(await call("GET", "/fleet", null, a)).body.some((f) => f.vehicle_number === "214"));
 });
 
 test("deactivating someone ends their session at once, and 8 bad passwords lock an account", async () => {

@@ -277,7 +277,8 @@ test("GET /certifications and GET /vehicles return real rows with the day counts
     "INSERT INTO certifications (tenant_id, crew_member_id, certification_type_id, issuing_body, issued_on, expires_on) VALUES ($1, $2, $3, 'NYS DOH', CURRENT_DATE - 700, CURRENT_DATE + 10)",
     [TENANT_A, cm.rows[0].crew_member_id, ct.rows[0].certification_type_id]
   );
-  await seed.query("INSERT INTO vehicles (tenant_id, unit_designation, capability_level, next_inspection_due) VALUES ($1, 'Inspection Probe', 'BLS', CURRENT_DATE + 5)", [TENANT_A]);
+  // Inspection dates belong to the physical vehicle (the fleet), not to the crewed unit.
+  await seed.query("INSERT INTO fleet_vehicles (tenant_id, vehicle_number, next_inspection_due) VALUES ($1, 'Inspection Probe', CURRENT_DATE + 5)", [TENANT_A]);
   await seed.end();
 
   const cert = (await client.getCertifications()).find((c) => c.last_name === "Probe");
