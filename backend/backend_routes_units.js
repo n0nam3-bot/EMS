@@ -32,6 +32,7 @@ router.get("/units", async (req, res) => {
         ST_Y(u.current_location::geometry) AS lat,
         ST_X(u.current_location::geometry) AS lon,
         v.unit_designation, v.capability_level,
+        u.fleet_vehicle_id, fv.vehicle_number, fv.status AS vehicle_status,
         COALESCE(
           json_agg(
             json_build_object(
@@ -47,9 +48,11 @@ router.get("/units", async (req, res) => {
         ) AS crew
       FROM units u
       JOIN vehicles v ON v.vehicle_id = u.vehicle_id
+      LEFT JOIN fleet_vehicles fv ON fv.fleet_vehicle_id = u.fleet_vehicle_id
       LEFT JOIN unit_crew_display ucd ON ucd.unit_id = u.unit_id
       LEFT JOIN crew_members cmx ON cmx.crew_member_id = ucd.crew_member_id
-      GROUP BY u.unit_id, u.current_status, u.location_updated_at, v.unit_designation, v.capability_level
+      WHERE u.retired_at IS NULL
+      GROUP BY u.unit_id, u.current_status, u.location_updated_at, v.unit_designation, v.capability_level, u.fleet_vehicle_id, fv.vehicle_number, fv.status
       ORDER BY v.unit_designation
     `)
   );

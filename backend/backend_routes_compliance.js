@@ -41,9 +41,9 @@ router.get("/certifications", async (req, res) => {
 router.get("/vehicles", async (req, res) => {
   const result = await withTenant(req.user.tenantId, (client) =>
     client.query(`
-      SELECT vehicle_id, unit_designation, next_inspection_due,
+      SELECT fleet_vehicle_id AS vehicle_id, vehicle_number AS unit_designation, next_inspection_due,
         (next_inspection_due - CURRENT_DATE) AS days_until_due
-      FROM vehicles
+      FROM fleet_vehicles WHERE retired_at IS NULL
       ORDER BY next_inspection_due ASC NULLS LAST
     `)
   );

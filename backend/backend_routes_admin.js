@@ -237,7 +237,7 @@ router.post("/units", ADMIN, handle(async (req, res) => {
   if (!designation) fail(400, "Give the unit a name, like Medic 4");
   if (!LEVELS.includes(level)) fail(400, "Level must be BLS, ALS or CCT");
   const unit = await withTenant(req.user.tenantId, async (c) => {
-    const dup = await c.query("SELECT 1 FROM vehicles WHERE lower(unit_designation) = lower($1)", [designation]);
+    const dup = await c.query("SELECT 1 FROM vehicles v JOIN units u ON u.vehicle_id = v.vehicle_id WHERE lower(v.unit_designation) = lower($1) AND u.retired_at IS NULL", [designation]);
     if (dup.rows.length) fail(409, `A unit named "${designation}" already exists`);
     const v = (await c.query(
       "INSERT INTO vehicles (tenant_id, unit_designation, capability_level) VALUES ($1, $2, $3) RETURNING vehicle_id",
@@ -251,6 +251,54 @@ router.post("/units", ADMIN, handle(async (req, res) => {
     )).rows[0];
   });
   res.status(201).json({ unit_id: unit.unit_id, unit_designation: designation, capability_level: level });
+}));
+
+// Rename a unit or change its level (BLS / ALS / CCT).
+router.patch("/units/:id", ADMIN, handle(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) fail(400, "Bad unit id");
+  const designation = req.body?.designation === undefined ? undefined : String(req.body.designation).trim();
+  const level = req.body?.capabilityLevel === undefined ? undefined : String(req.body.capabilityLevel).toUpperCase();
+  if (designation !== undefined && !designation) fail(400, "A unit needs a name");
+  if (level !== undefined && !LEVELS.includes(level)) fail(400, "Level must be BLS, ALS or CCT");
+  if (designation === undefined && level === undefined) fail(400, "Nothing to change");
+  await withTenant(req.user.tenantId, async (c) => {
+    const cur = (await c.query("SELECT u.vehicle_id FROM units u WHERE u.unit_id = $1 AND u.retired_at IS NULL", [req.params.id])).rows[0];
+    if (!cur) fail(404, "Unit not found");
+    if (designation !== undefined) {
+      const dup = await c.query("SELECT 1 FROM vehicles v JOIN units u ON u.vehicle_id = v.vehicle_id WHERE lower(v.unit_designation) = lower($1) AND u.retired_at IS NULL AND u.unit_id <> $2", [designation, req.params.id]);
+      if (dup.rows.length) fail(409, `A unit named "${designation}" already exists`);
+    }
+    await c.query("UPDATE vehicles SET unit_designation = COALESCE($1, unit_designation), capability_level = COALESCE($2, capability_level) WHERE vehicle_id = $3", [designation ?? null, level ?? null, cur.vehicle_id]);
+    if (level !== undefined) await reconcileUnit(c, req.user.tenantId, req.params.id);
+  });
+  res.json({ ok: true });
+}));
+
+// Delete a unit. One that has never been used is removed outright. One with history (calls, checks,
+// shifts, past crews) can't be erased without rewriting that history, so it is retired instead: hidden
+// everywhere, its records kept, its name free to reuse. A unit that is crewed or on a call can't go.
+router.delete("/units/:id", ADMIN, handle(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) fail(400, "Bad unit id");
+  const out = await withTenant(req.user.tenantId, async (c) => {
+    const u = (await c.query("SELECT u.unit_id, u.vehicle_id, u.current_status, u.fleet_vehicle_id FROM units u WHERE u.unit_id = $1 AND u.retired_at IS NULL", [req.params.id])).rows[0];
+    if (!u) fail(404, "Unit not found");
+    if (["assigned", "en_route", "on_scene", "transporting", "at_destination"].includes(u.current_status)) fail(409, "This unit is on a call. Finish or release the call first.");
+    const crew = Number((await c.query("SELECT count(*) AS n FROM unit_crew_assignments WHERE unit_id = $1 AND assigned_to IS NULL", [req.params.id])).rows[0].n);
+    if (crew > 0) fail(409, "This unit still has crew on it. Take them off in OPS first.");
+    const used = Number((await c.query(
+      `SELECT (SELECT count(*) FROM incident_unit_assignments WHERE unit_id = $1) + (SELECT count(*) FROM unit_checks WHERE unit_id = $1)
+            + (SELECT count(*) FROM shifts WHERE unit_id = $1) + (SELECT count(*) FROM unit_crew_assignments WHERE unit_id = $1)
+            + (SELECT count(*) FROM unit_status_history WHERE unit_id = $1) + (SELECT count(*) FROM patient_care_records WHERE unit_id = $1) + (SELECT count(*) FROM unit_vehicle_log WHERE unit_id = $1) AS n`, [req.params.id])).rows[0].n);
+    if (used === 0) {
+      await c.query("DELETE FROM units WHERE unit_id = $1", [req.params.id]);
+      await c.query("DELETE FROM vehicles WHERE vehicle_id = $1", [u.vehicle_id]);
+      return { deleted: true };
+    }
+    await c.query("UPDATE units SET retired_at = now(), current_status = 'out_of_service', fleet_vehicle_id = NULL WHERE unit_id = $1", [req.params.id]);
+    if (u.fleet_vehicle_id) await c.query("INSERT INTO unit_vehicle_log (tenant_id, unit_id, from_vehicle_id, to_vehicle_id, reason, by_user_id) VALUES ($1, $2, $3, NULL, 'unit retired', $4)", [req.user.tenantId, req.params.id, u.fleet_vehicle_id, req.user.userId]);
+    return { retired: true };
+  });
+  res.json(out);
 }));
 
 // Put a person on a unit (or take them off with unitId: null). One unit at a time
@@ -289,7 +337,7 @@ export async function placeCrewMember(c, tenantId, crewMemberId, unitId, seatRol
     if (cm.field_level === "mvo") seat = "driver";                       // an MVO always drives
     const unit = (await c.query(
       `SELECT un.unit_id, v.capability_level, v.unit_designation
-       FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1`, [unitId]
+       FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1 AND un.retired_at IS NULL`, [unitId]
     )).rows[0];
     if (!unit) fail(404, "Unit not found");
     if (unit.capability_level === "ALS" && cm.field_level === "paramedic") {
@@ -427,8 +475,8 @@ router.patch("/vehicles/:id", ADMIN, handle(async (req, res) => {
   const { lastInspectionDate, nextInspectionDue } = req.body || {};
   for (const d of [lastInspectionDate, nextInspectionDue]) if (d && !DATE_RE.test(String(d))) fail(400, "Dates must look like 2027-03-31");
   const r = await withTenant(req.user.tenantId, (c) => c.query(
-    `UPDATE vehicles SET last_inspection_date = COALESCE($1, last_inspection_date), next_inspection_due = COALESCE($2, next_inspection_due)
-     WHERE vehicle_id = $3 RETURNING vehicle_id`,
+    `UPDATE fleet_vehicles SET last_inspection_date = COALESCE($1, last_inspection_date), next_inspection_due = COALESCE($2, next_inspection_due)
+     WHERE fleet_vehicle_id = $3 RETURNING fleet_vehicle_id`,
     [lastInspectionDate || null, nextInspectionDue || null, req.params.id]
   ));
   if (!r.rows.length) fail(404, "Vehicle not found");

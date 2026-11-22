@@ -128,7 +128,7 @@ router.post("/schedule/apply", STAFFING, handle(async (req, res) => {
       `SELECT s.crew_member_id, cm.first_name || ' ' || cm.last_name AS name, cm.field_level, s.unit_id, s.seat_role, v.unit_designation, v.capability_level
        FROM shifts s JOIN crew_members cm ON cm.crew_member_id = s.crew_member_id AND cm.is_active
        JOIN units u ON u.unit_id = s.unit_id JOIN vehicles v ON v.vehicle_id = u.vehicle_id
-       WHERE s.starts_at <= now() AND s.ends_at > now() AND s.unit_id IS NOT NULL`)).rows;
+       WHERE s.starts_at <= now() AND s.ends_at > now() AND s.unit_id IS NOT NULL AND u.retired_at IS NULL`)).rows;
     const byUnit = new Map();
     for (const d of due) { if (!byUnit.has(d.unit_id)) byUnit.set(d.unit_id, []); byUnit.get(d.unit_id).push(d); }
     const remove = [], place = [];
