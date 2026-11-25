@@ -7,6 +7,9 @@
 //   MIGRATION_DATABASE_URL  owner connection string (direct, not pooled)
 import "dotenv/config";
 import pg from "pg";
+// The call timeline (incident_events). It lives in its own file, but THIS is the file the
+// "Update and set up" workflow runs against an existing database, so it must be applied here too.
+import { UPGRADE_DISPATCH_SQL } from "./upgrade_dispatch.js";
 
 export const UPGRADE_SQL = `
 -- ---- Roles: a person can hold several -----------------------------------
@@ -546,6 +549,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   try {
     await client.query("BEGIN");
     await client.query(UPGRADE_SQL);
+    await client.query(UPGRADE_DISPATCH_SQL);
     await client.query("COMMIT");
     console.log("Database upgrade applied.");
   } catch (err) {

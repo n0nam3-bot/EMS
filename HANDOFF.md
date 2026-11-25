@@ -9,8 +9,8 @@
 |---|---|
 | Repo | https://github.com/n0nam3-bot/EMS — **public**, default branch `main`, 85 commits since 2026-10-29 |
 | Live site | https://ems-delta-indol.vercel.app/ (the repo's "homepage" field). A chat cannot check it — see §14 |
-| Verified against | commit `c767532` (2026-11-22) |
-| Last full verification | 2026-11-23, by a Claude chat, in a Linux sandbox: Node 22.23, PostgreSQL 16.15, PostGIS 3.4.2 |
+| Verified against | the code of commit `c767532` (2026-11-22); `69d4b37` (2026-11-24) added only this file. The Sprint 1 restore (§15, 2026-11-24) is **verified in a sandbox and awaits confirmation on the live site** |
+| Last full verification | 2026-11-23 and 2026-11-24, by a Claude chat, in a Linux sandbox: Node 22.23, PostgreSQL 16.15, PostGIS 3.4.2 |
 
 **Evidence tags used in this file**
 
@@ -43,12 +43,12 @@ Tip: save the first four lines in Claude's user preferences (Settings) so every 
 
 1. **Work from the repo at HEAD, nothing else.** Clone it, run `git log --oneline -8`, and read the files you will touch *as they are now*. Not an uploaded zip, not an earlier chat, not memory. *Twice, an update built from a stale copy silently erased finished work (§13, lessons 1–2).*
 2. **Never rewrite a whole file from memory or from an old copy.** Make the smallest change that does the job. Before delivering, compare every outgoing file with HEAD (`git diff --stat`) and confirm that only the files you meant to change differ.
-3. **Test before and after, and say exactly what ran.** Backend needs Postgres + PostGIS (recipe in §9.3). The `npm test` script **must include `tests/dispatch-lifecycle.test.js`** — today it does not (§11, issue 1). Web: `npm test` and `npm run build`. Report counts. Never write "this should work".
+3. **Test before and after, and say exactly what ran.** Backend needs Postgres + PostGIS (recipe in §9.3). The `npm test` script lists five files, **including `tests/dispatch-lifecycle.test.js`** — if you add a test file, add it to that list (R3 will make this automatic; §11, issue 3). Web: `npm test` and `npm run build`. Report counts. Never write "this should work".
 4. **Label every claim**: verified (you ran it), code-read, or unverified. A chat cannot see Vercel, Neon, or the GitHub Actions runs. Do not pretend to; ask the owner (§14).
 5. **The owner works from a phone** (inferred from the workflow header and `DEPLOYMENT.md` — **[owner]** confirm). Never hand over terminal commands as instructions. Deliver changes as in §4: an `ems-update.zip` with repo-relative paths, an explicit list of any file to **delete** (a zip cannot delete), no new `.sql` files, no `.github/workflows` files.
 6. **Database changes go only in `UPGRADE_SQL` in `backend/scripts/upgrade.js`**, written to be safe to run repeatedly. Any new table with a `tenant_id` column needs row-level security and the `tenant_isolation` policy, plus explicit `GRANT`s to `ems_app_runtime` (and `REVOKE UPDATE, DELETE` if it is append-only). **Tests will not catch a missing grant** — see §4.4.
 7. **Never change or rotate `SESSION_SECRET`** without a plan for re-enrolling every user's two-step sign-in. It is the key that encrypts the stored MFA secrets (§5.3).
-8. **Bump `build` in `backend/server.js` (the `/api/health` response) on every release**, and tell the owner which number to expect, so a deploy can be proven. It is `9` at HEAD.
+8. **Bump `build` in `backend/server.js` (the `/api/health` response) on every release**, and tell the owner which number to expect, so a deploy can be proven. It is `10` once the 2026-11-24 restore is applied (`9` before).
 9. **No secrets, no real patient data and no real staff data in the repo.** It is public. The platform is **not approved for real patient data** (§11, issue 11).
 10. **Trust the code over any document.** If you find a doc that is wrong, fix it or add it to §11.
 11. **Keep this file true.** Whenever a change affects status, known issues, roadmap, env vars, the pipeline or a decision, update the section and add a line to §15 **in the same delivery**. When you fix something from §11, move it to §15 with the commit hash.
@@ -64,12 +64,15 @@ Tip: save the first four lines in Claude's user preferences (Settings) so every 
 
 **Where it runs** (per the workflow header, `vercel.json` and `DEPLOYMENT.md` — **[unverified]** from a chat): GitHub repo → Vercel (one project, two "services": `backend` as Express and `web` as Vite; `/api/*` is rewritten to the backend) → Neon managed Postgres. All human commits are manual uploads through the GitHub web UI by the owner's account; the 9 commits by `github-actions` are the "Apply update" workflow.
 
-### State at HEAD `c767532`
+### State of the code (sandbox verification; the live site is unchecked)
 
-| Check (2026-11-23) | Result |
+| Check (date in each row) | Result |
 |---|---|
-| Backend `npm test` — 4 files as scripted: isolation 18, api-client 32, auth-admin 18, geocode 6 | **74 / 74 pass**, about 22 s **[verified]** |
-| `backend/tests/dispatch-lifecycle.test.js` — exists but is **not in the `npm test` script** | **1 / 11 pass** **[verified]** — §11, issue 1 |
+| Backend `npm test` — 5 files: isolation 18, api-client 32, auth-admin 18, geocode 6, dispatch-lifecycle 11 | **85 / 85 pass**, about 40 s **[verified 2026-11-24, with the Sprint 1 restore applied]**. Before the restore: 74 / 74, the fifth file not being in the script **[verified 2026-11-23]** |
+| `dispatch-lifecycle.test.js` on the code before the restore (`c767532`) | 1 / 11 pass **[verified 2026-11-23]** — §11, issue 1 |
+| Production-style upgrade: a database built from `69d4b37`, then **only** `node scripts/upgrade.js` from the restore build, three times | `incident_events` created with row-level security, the tenant policy and INSERT/SELECT-only for the app login; repeatable; existing data untouched **[verified 2026-11-24]** |
+| Live server on that database: create → assign → status chain → clear → complete, with the refusals and the timeline | 20 / 20 **[verified 2026-11-24]** |
+| The restore build against a database that has **not** been upgraded | `/api/health` still says OK and reads work, but **creating a call returns HTTP 500** (rolled back cleanly) **[verified 2026-11-24]** — §11, issue 15 |
 | Web `npm test` (Vitest, jsdom) | 55 / 55 pass **[verified]** |
 | Web `npm run build` | OK — 446 kB JS (129 kB gzip) **[verified]** |
 | Fresh database: `npm run migrate`, then `scripts/upgrade.js` twice, then `scripts/bootstrap.js` twice | OK and repeatable **[verified]** |
@@ -80,7 +83,7 @@ Tip: save the first four lines in Claude's user preferences (Settings) so every 
 
 **Works** (covered by the passing automated suite and the live smoke test above): two-step sign-in (password + authenticator code, 8 recovery codes) and a separate platform-admin session; per-company data isolation enforced by the database; company administration (users with several roles, field levels, units, crew seating, certifications, fleet vehicles, facilities, checklists); creating calls with address search; assigning, releasing, completing and cancelling; unit status and location; mutual-aid grants; the field-unit screen; ePCR from draft to submit to QA approve/reopen with finalized charts locked; shifts; response-time report; hash-chained audit log with a verify endpoint.
 
-**Broken or dangerous** (details and evidence in §11): the dispatch-reliability work (Sprint 1) is missing from the code even though its document says it is done; **any signed-in role, including a read-only auditor, can create, assign and complete calls**; the documentation is three weeks stale; the pipeline has several silent-failure traps.
+**Broken or dangerous** (details and evidence in §11): **any signed-in role, including a read-only auditor, can create, assign and complete calls** (issue 2); the documentation was three weeks stale (issue 4; R4); the pipeline has silent-failure traps (issues 5 and 15). The Sprint 1 dispatch protections were missing until the 2026-11-24 restore (issue 1) — **verified in a sandbox, not yet confirmed on the live site**.
 
 ---
 
@@ -122,8 +125,9 @@ Steps 2–3 use the files as unpacked in step 1 (same workspace), so a zip that 
    - **Create / reset the company owner login** — **untick for routine updates** (see the trap below);
    - platform administrator email — blank.
 4. Wait for every step to go green. Vercel then redeploys by itself.
-5. Owner opens `https://ems-delta-indol.vercel.app/api/health`. **`build` must equal the number the chat promised** (rule 8). Also check `sessionSecret` is `valid`.
-6. If a step is red, the owner copies that step's log into the chat. Note that the code is **already pushed** by the time a later database step fails, so Vercel may be running new code against an old database; fix forward quickly.
+5. Owner opens `https://ems-delta-indol.vercel.app/api/health`. **`build` must equal the number the chat promised** (rule 8; it is `10` after the Sprint 1 restore). Also check `sessionSecret` is `valid`. **This proves the code, not the database** (issue 15).
+6. **Create a test call, then assign an available unit to it.** If creating the call fails with "Internal server error", the database step has not finished or has failed: open the workflow run, wait for the green tick (or copy the red log to the chat) and try again. If no unit shows as available, that is the new rule working: a unit must be staffed into service first, so seat a crew on one in OPS.
+7. If a step is red, the owner copies that step's log into the chat. The code is **already pushed** by the time a later database step fails, so Vercel may be running new code against an old database; fix forward quickly, or roll back in Vercel (§4.5).
 
 > **Trap — "Create / reset the company owner login" is ticked by default.** Each run with it ticked resets the owner's password to the `ADMIN_PASSWORD` secret (undoing any in-app password change), clears lockouts, re-activates the account, and rewrites the owner's name and email from the boxes. With the email box blank it fails after the upgrade step already ran. Tick it only to create the owner or to recover a forgotten password. **[code]** (`scripts/bootstrap.js`). It does **not** reset the owner's authenticator (recovery codes or the platform admin do — §4.6).
 
@@ -131,7 +135,7 @@ Steps 2–3 use the files as unpacked in step 1 (same workspace), so a zip that 
 
 | Need | Why | What to do |
 |---|---|---|
-| Delete or rename a file | `unzip -o` only adds and overwrites | List the files in the chat's reply. Owner: open the file on GitHub ▸ trash icon ▸ commit. **Nothing else removes orphans** — `backend/backend_dispatch.js` is one today (§11, issue 1) |
+| Delete or rename a file | `unzip -o` only adds and overwrites | List the files in the chat's reply. Owner: open the file on GitHub ▸ trash icon ▸ commit. **Nothing else removes orphans** (`backend/backend_dispatch.js` was one until the 2026-11-24 restore) |
 | Add a **new** `.sql` file | `.gitignore` contains `*.sql`, and the workflow's `git add -A` silently skips new ignored files while still committing edits to tracked ones **[verified]** | Put DDL in `UPGRADE_SQL` (a JS string in `upgrade.js`), or owner uploads the `.sql` through the GitHub UI, or remove the ignore rule |
 | Change `.github/workflows/*` | GitHub does not let the built-in token modify workflow files (platform rule, **not tested here**) | Owner edits the workflow in the GitHub UI (pencil icon). This is why the workflow never gained the `upgrade_dispatch.js` step that the Sprint 1 document promises |
 | Detect that a file in the zip is stale | No check exists | Rule 2 |
@@ -185,14 +189,14 @@ backend/
   backend_db.js                          pool, withTenant(), assertIsolationEnforced()
   backend_auth.js                        sessions, challenges, requireAuth / requireRole, platform sessions
   backend_mfa.js  backend_passwords.js   TOTP + recovery codes; scrypt hashing
-  backend_dispatch.js                    Sprint 1 rules — ORPHANED at HEAD, nothing imports it (§11, issue 1)
+  backend_dispatch.js                    unit/call lifecycle rules: allowed status moves, overrides, the call-timeline helper (used by the units and incidents routes)
   backend_geocode.js                     Census + Nominatim address search
   backend_websocket.js                   Socket.IO (disabled on Vercel; no console uses it)
   backend_routes_*.js                    one router per area (§7).  NOTE: backend_routes_example.js IS THE INCIDENTS ROUTER
   migrate.js                             first-time setup: 8 SQL files + UPGRADE_SQL, then the restricted runtime role
   migrations/*.sql                       the 8 base schema files (applied only on a fresh database)
-  scripts/upgrade.js                     UPGRADE_SQL — the ONLY place for later DDL
-  scripts/upgrade_dispatch.js            incident_events DDL — written but never run by anything (§11, issue 1)
+  scripts/upgrade.js                     UPGRADE_SQL — the ONLY place for later DDL; it also applies upgrade_dispatch.js
+  scripts/upgrade_dispatch.js            incident_events DDL (the call timeline) — applied by upgrade.js and migrate.js
   scripts/bootstrap.js, bootstrap_platform.js   create the company + owner / platform admin from env vars
   scripts/dev_token.js, bootstrap_example.sql    legacy helpers for the old RS256 token path
   tests/*.test.js                        isolation, api-client, auth-admin, geocode, dispatch-lifecycle (§9)
@@ -255,6 +259,8 @@ Hash-routed single page (`#/dispatch`, `#/ops`, …). `App.jsx` shows each role 
 | **Certification** | A database trigger refuses to seat crew with a missing or lapsed certification for the unit's level |
 | **Incident (call)** | `incident_type`: `emergency_911`, `ift_scheduled`, `ift_on_demand`, `mutual_aid`. `priority`: `critical`, `emergent`, `urgent`, `routine`. `capability_needed`: BLS/ALS/CCT. Has a scene and optional destination (a saved **facility** or free text) |
 | **Assignment** | `incident_unit_assignments`, role `primary`, `als_intercept`, `support`, `mutual_aid`. The database guarantees one active primary per call and **one active call per unit** (partial unique indexes) |
+| **Status moves** | A unit on a call moves forward only: `assigned` → `en_route` → `on_scene` → `transporting` → `at_destination`. Leaving the call is a release, a completion, or "Available" from `at_destination` (which clears the unit and leaves the call open). A unit with no call may be set `available`, `out_of_service` or `en_route` only, and going back in service needs its crew requirements met. Anything else needs an **override** by a supervisor, dispatcher or IT admin with a written reason, recorded in the audit log **[code; verified 2026-11-24]** |
+| **Call timeline** | `incident_events`, append-only: `call_received`, `unit_assigned`, `unit_en_route`, `unit_on_scene`, `unit_transporting`, `unit_at_destination`, `unit_cleared`, `unit_released`, `call_closed`, `call_cancelled`. Written in the same transaction as each change; no patient data. Read with `GET /incidents/:id/events` |
 | **ePCR (patient care record)** | `draft` → `submitted` → QA `approve` or `reopen` → `finalized`. One chart per (call, unit). Finalized charts are immutable, enforced by trigger and at the API. Amendments are separate rows |
 | **Mutual aid** | A grant lets another company *see* a call (never write), capped at 72 hours by a CHECK constraint, revoked by status. Shared calls redact patient and contact fields |
 | **Shift** | A scheduled period for a crew member, optionally on a unit; overlaps per person are refused |
@@ -273,7 +279,7 @@ Every router except sign-in demands a valid session (`router.use(requireAuth)`);
 | Health (`server.js`) | `GET /health` → `{status, build, jwtKey, sessionSecret}` | public |
 | Sign-in (`backend_routes_auth.js`) | `POST /auth/login`, `/auth/mfa/setup`, `/auth/mfa/enable`, `/auth/mfa/verify` | public (challenge token) |
 | Me (`…_auth`) | `GET /auth/me` (who, unit, current call), `GET /me/stats`, `POST /auth/change-password` | any role |
-| **Incidents** (`backend_routes_example.js` — **the file name is a misnomer**) | `GET /incidents` (**newest 100, no open/closed filter**), `GET/PATCH /incidents/:id`, `POST /incidents`, `POST /incidents/:id/cancel`, `POST /incidents/:id/assignments`, `DELETE /incidents/:id/assignments/:unitId`, `POST /incidents/:id/complete` | **any role — no check** (§11, issue 2) |
+| **Incidents** (`backend_routes_example.js` — **the file name is a misnomer**) | `GET /incidents` (every open call plus the last 24 h of closed ones — `?closedHours=` up to 168 — open first, capped at 500; sends `X-Server-Time`), `GET /incidents/:id/events` (the call timeline), `GET/PATCH /incidents/:id`, `POST /incidents`, `POST /incidents/:id/cancel`, `POST /incidents/:id/assignments`, `DELETE /incidents/:id/assignments/:unitId`, `POST /incidents/:id/complete` | **any role — no check** (§11, issue 2) |
 | Mutual aid (same file) | `POST /mutual-aid/grants`, `POST /mutual-aid/grants/:linkId/revoke` | supervisor, compliance_officer |
 | Units (`…_units`) | `GET /units`, `PATCH /units/:id/status` | any role; a user whose *primary* role is `crew` may move only their own unit |
 | Unit location (`…_location`) | `PATCH /units/:id/location` | any role (own-unit rule inside) |
@@ -325,12 +331,12 @@ Every router except sign-in demands a valid session (`router.use(requireAuth)`);
 | `backend/tests/api-client.test.js` | 32 | incident and unit routes; PCR lifecycle and finalized-chart lock; mutual-aid role check; audit access; deactivated users, role changes and suspended companies take effect immediately; live-feed authority; **refuses to start** without RLS |
 | `backend/tests/auth-admin.test.js` | 18 | two-step sign-in; multiple roles; staffing and seat rules; user editing and lists; unit checks by role; saved places; schedule; response report; unit rename/delete/retire; lockout after 8 bad passwords; resets; platform admin |
 | `backend/tests/geocode.test.js` | 6 | address labelling and ordering, with `fetch` mocked |
-| `backend/tests/dispatch-lifecycle.test.js` | 11 | Sprint 1 rules (assignment guard, races, status rules, board, closed-call refusal, timeline append-only). **Not in the `npm test` script — 1 / 11 pass at HEAD** |
+| `backend/tests/dispatch-lifecycle.test.js` | 11 | Sprint 1 rules (assignment guard, races, status rules, board, closed-call refusal, timeline append-only). **In the `npm test` script since 2026-11-24; 11 / 11 pass (it was 1 / 11 before the restore)** |
 | `web/src/__tests__/render.test.jsx` | 55 | every console rendering and basic interaction in jsdom, sign-in, role routing |
 
 ### 9.2 Blind spots — a green run does **not** prove these
 
-1. **`dispatch-lifecycle.test.js` is excluded from `npm test`.** The script is a hand-written list of four files; a clobbered `package.json` dropped the fifth (§11, issue 3).
+1. **The `npm test` script is a hand-written list of five files.** A new test file is not run until someone adds it — that is how the dispatch tests were dropped before (§11, issue 3). R3 replaces the list with a directory run.
 2. **Missing database grants** pass every test (§4.4).
 3. **Tests need a disposable server**: each suite runs `DROP SCHEMA public CASCADE` on `TEST_DATABASE_URL` and resets the cluster-wide `ems_app_runtime` password (§5.2).
 4. **No real browser or phone.** Web tests run in jsdom; Leaflet, OSRM, TomTom and print layouts are not exercised.
@@ -395,18 +401,20 @@ Sandbox notes: `/bin/sh` is `dash` (use `bash` for scripts); background processe
 
 Priority: **P0** = unsafe or wrong behaviour in the dispatch path today · **P1** = fix soon, it will bite · **P2** = hygiene. Numbers are referenced from other sections — do not renumber; append new issues at the end and mark fixed ones in §15.
 
-### 1. Dispatch Reliability Sprint 1 is missing from the code, though its document says it is done — **P0**
+### 1. Dispatch Reliability Sprint 1 was missing from the code — **restored 2026-11-24; awaiting confirmation on the live site**
 
-**What is wrong at HEAD** (all **[verified]** 2026-11-23 by the test file and by live probes against a server built from HEAD):
+**Status.** The restore is built, tested in a sandbox and delivered as an `ems-update.zip` (§15, 2026-11-24). **This issue stays open until the owner confirms on the live site:** `/api/health` shows `build` `10`, a test call can be created, and an available unit can be assigned to it. Then move it to §15 as fixed.
 
-- the server **accepts assigning an out-of-service unit** to a call (HTTP 201);
-- **completing a call twice succeeds and rewrites `closed_at`**, which corrupts response-time data;
-- a unit with no call can be set straight to `on_scene` (HTTP 200);
-- there is no `GET /incidents/:id/events`, no `X-Server-Time` header and no `incidents.dispatched_at`;
-- the board is "newest 100" (issue 7), so an old open call can fall off it;
-- the table `incident_events` **does not exist in any database built through the pipeline**.
+**What was wrong at `c767532`** (all **[verified]** 2026-11-23, by the test file and by live probes):
 
-`backend/tests/dispatch-lifecycle.test.js` shows it: **1 of 11 pass** (the one that passes is the unit double-booking race, which the database already prevents with a unique index). Test 10, "another company can't see…", fails at HEAD only at its first assertion, which calls the missing events endpoint — it is not an isolation breach (the isolation suite passes 18 / 18) and it passes once Sprint 1 is restored.
+- the server accepted assigning an **out-of-service** unit to a call (HTTP 201);
+- **completing a call twice succeeded and rewrote `closed_at`**, which corrupts response-time data;
+- a unit with no call could be set straight to `on_scene` (HTTP 200);
+- there was no `GET /incidents/:id/events`, no `X-Server-Time` header and no `incidents.dispatched_at`;
+- the board was "newest 100", so an old open call could fall off it;
+- the table `incident_events` **did not exist in any database built through the pipeline**.
+
+`backend/tests/dispatch-lifecycle.test.js` showed it before the restore: **1 of 11 pass** (the one that passes is the unit double-booking race, which the database already prevents with a unique index). Test 10, "another company can't see…", fails at HEAD only at its first assertion, which calls the missing events endpoint — it is not an isolation breach (the isolation suite passes 18 / 18) and it passes once Sprint 1 is restored.
 
 **How it was lost** (from git history; commit messages are useless, so these are reconstructed from diffs):
 
@@ -415,25 +423,20 @@ Priority: **P0** = unsafe or wrong behaviour in the dispatch path today · **P1*
 | `1b0ecbb` | Nov 3 | Sprint 1 delivered: `backend_dispatch.js`, route changes, `upgrade_dispatch.js`, the test, `package.json` test list, `migrate.js` wiring |
 | `5720fca` | Nov 3 | The "reports + schedule" update overwrote `backend_routes_example.js`, `backend_routes_units.js`, `migrate.js` and `package.json` from a base that lacked Sprint 1 — **first silent loss** |
 | `8443a29` | Nov 8 | A zip re-applied Sprint 1, plus map/units/schedule work and a *different* per-unit vehicle design (`unit_vehicle_history`) |
-| `22ca61b` … `cc8205e` | Nov 8 | Manual uploads — apparently of files from a ZIP download of `5720fca` (a file named `EMS-5720fca….zip` was uploaded and deleted that day) — reverted that update **wholesale** — Sprint 1 again, and the unrelated map/units/schedule work, tests and consoles — **second loss**. The reason is not recorded (§14) |
+| `22ca61b` … `cc8205e` | Nov 8 | Manual uploads, apparently of files from a ZIP download of `5720fca` (a file named `EMS-5720fca….zip` was uploaded and deleted that day), reverted that update **wholesale**: Sprint 1 again, plus the unrelated map/units/schedule work, tests and consoles — **second loss**. The reason is not recorded (§14) |
 
-`backend/backend_dispatch.js` and `backend/scripts/upgrade_dispatch.js` are leftovers that nothing imports or runs. **No version of the workflow ever contained an `upgrade_dispatch.js` step**, although the Sprint 1 document says it does.
+`backend/backend_dispatch.js` and `backend/scripts/upgrade_dispatch.js` were leftovers that nothing imported or ran. **No version of the workflow ever contained an `upgrade_dispatch.js` step**, although the old Sprint 1 document said it did.
 
-**Verified recovery path** — restore only the Sprint 1 delta, never whole files from old commits (the Nov 8 files carry the discarded vehicle design and would collide with `fleet_vehicles`):
+**What the restore consisted of** — only the Sprint 1 delta, merged onto the current code, never whole files from old commits (the Nov 8 files carry the discarded vehicle design and would collide with `fleet_vehicles`):
 
-```bash
-git diff 0375503 1b0ecbb -- backend/backend_routes_example.js backend/backend_routes_units.js \
-        backend/migrate.js backend/package.json | git apply --3way
-```
+1. `git diff 0375503 1b0ecbb` for `backend_routes_example.js`, `backend_routes_units.js`, `migrate.js` and `package.json`, merged three-way onto `69d4b37`. The first three applied cleanly (the newer `GET /units` with fleet-vehicle fields was kept); in `package.json` the test list gained `tests/dispatch-lifecycle.test.js`.
+2. `scripts/upgrade.js` now imports and runs `UPGRADE_DISPATCH_SQL` right after `UPGRADE_SQL`. **This is the line that matters in production:** on an existing database the workflow runs only `upgrade.js`, so without it `incident_events` is never created.
+3. `tests/dispatch-lifecycle.test.js`: the two expected permission failures are wrapped in `SAVEPOINT` / `ROLLBACK TO SAVEPOINT`. Before, the second statement failed with "current transaction is aborted" instead of "permission denied" — a **test bug**; the application was right.
+4. `server.js`: `build` 9 → 10. `docs/DISPATCH_SPRINT1.md` rewritten to say what is true. This file updated.
 
-1. Three files apply cleanly. `backend/package.json` conflicts trivially: keep HEAD's four test files and **add `tests/dispatch-lifecycle.test.js`**.
-2. `backend/scripts/upgrade.js`: import `UPGRADE_DISPATCH_SQL` from `./upgrade_dispatch.js` and run it right after `UPGRADE_SQL` in the main block. **Required** — on an existing database the workflow runs only `upgrade.js`, so otherwise production never gets `incident_events`.
-3. `backend/tests/dispatch-lifecycle.test.js`, the last test: wrap each of the two expected failures in `SAVEPOINT` / `ROLLBACK TO SAVEPOINT`. As written, the second statement fails with "current transaction is aborted" instead of "permission denied" — a **test bug**; the application behaviour is correct.
-4. Delete nothing; `backend_dispatch.js` becomes used again.
+**Verified in the sandbox 2026-11-24:** backend `npm test` **85 / 85** (74 existing + 11); web 55 / 55 and build OK; a database built from `69d4b37` (no `incident_events`) upgraded with **only** `node scripts/upgrade.js` from the new build gets the table with row-level security, the `tenant_isolation` policy and INSERT/SELECT-only for the app login, re-runs cleanly, and keeps its data; a live server on that database passed **20 / 20** probes — an unavailable unit is refused, a unit with no call cannot go on scene, the status chain moves forward, "Available" mid-call is refused with a plain message, clearing from at destination frees the unit and leaves the call open, a second complete and a cancel-after-close are refused with `closed_at` unchanged, `dispatched_at` is stamped, the timeline is in order, `X-Server-Time` is present.
 
-**Result, tried in a scratch clone and not committed anywhere [verified]:** all **85 / 85** backend tests pass (74 existing + 11); on a database built at HEAD, the chained `upgrade.js` creates `incident_events` with RLS enabled and **INSERT/SELECT only** for the runtime role, and a second run succeeds. Size of the change: 6 files, about 210 lines added and 141 removed.
-
-**Not verified:** any console against the restored rules. Known behaviour changes (from `docs/DISPATCH_SPRINT1.md`): a unit on a call cannot be set `available`/`out_of_service` from the status dropdown; assigning requires the unit to be `available`, so a unit must be staffed into service first (bootstrap creates units `out_of_service`) **[code]**. The dispatch console still needs its follow-ups (R6). **Restoring Sprint 1 does not fix issue 2.** Afterwards correct `docs/DISPATCH_SPRINT1.md` (its status key cites a missing `AGENTS.md`).
+**Not verified:** the live site (deploy, Neon, Actions); any console in a real browser or on a phone against the new refusals (**[code]**: the dispatch board and the field screen both show the server's message instead of faking a result); the dispatch-console follow-ups (R6) are still to do. **Behaviour changes** to expect are listed in `docs/DISPATCH_SPRINT1.md` — notably a unit must be staffed into service before it can be assigned, and a crew pressing Available before "at destination" is refused. **Creating a call now also writes a timeline row, so a call cannot be created until the database step has run** (issue 15). This restore does **not** fix issue 2.
 
 ### 2. The server does not enforce who may dispatch — **P0, authorization**
 
@@ -443,30 +446,30 @@ Why it matters: `App.jsx` states that the server enforces what a role may do, th
 
 Proposed fix (**[owner]** to confirm the matrix): create/patch/cancel/assign/release/complete → `dispatcher`, `supervisor`, `it_admin` (the same set that sees the call-draft tray and that Sprint 1 treats as override roles); unit status → those roles for any unit, crew only their own; decide per role what `GET /incidents` may return and strip patient/contact fields where the role has no need. Add a negative test per role to `api-client.test.js`: mint a session for a user with that role and expect 403.
 
-### 3. `npm test` is green while skipping the dispatch tests — **P1**
+### 3. `npm test` was green while skipping the dispatch tests — **fixed 2026-11-24; a weaker form remains (P1)**
 
-The script hard-codes four files. `dispatch-lifecycle.test.js` was in it at `1b0ecbb` and was dropped when `package.json` was overwritten (`5720fca`, again `22ca61b`). Result: 74 passing tests coexisting with a broken dispatch path. Fix with issue 1; better, run `node --test tests/` so a new test file cannot be forgotten.
+The script hard-coded four files. `dispatch-lifecycle.test.js` was in it at `1b0ecbb` and was dropped when `package.json` was overwritten (`5720fca`, again `22ca61b`). Result: 74 passing tests coexisted with a broken dispatch path. **The restore puts the fifth file back in the list.** What remains: the list is still hand-written, so a new test file is silently not run until someone adds it — replace it with `node --test tests/` (R3).
 
 ### 4. Documentation is stale and some referenced files do not exist — **P1**
 
 - `README.md`, `DEPLOYMENT.md` and `backend/README.md` were last edited on **2026-10-29**, the first day. They still say: four consoles (there are 10 screens), 50 backend tests (there are 85) and 6 web tests (55), that sign-in is a pasted development token and that there is no user management (both long since built), that crew/facilities routes are unbuilt (built), and that incidents have no BLS/ALS-needed column (it exists).
-- `docs/DISPATCH_SPRINT1.md` says Sprint 1 is implemented (issue 1).
+- `docs/DISPATCH_SPRINT1.md` claimed Sprint 1 was implemented while it was not; **corrected 2026-11-24** with the restore.
 - `backend/.env.example` is referenced seven times and **does not exist**; §10 is the current variable list.
 - `docker-compose.yml` sets no `SESSION_SECRET`, so nobody can sign in, and no `GEOCODE_ENABLED`; the Dockerfile and compose file were never built or tested **[docs]**.
 - Stale comments: `backend_routes_compliance.js` says approving a chart is not built (QA approve/reopen exist in `backend_routes_qa.js`).
-- `docs/DISPATCH_SPRINT1.md` cites **`AGENTS.md` section 3** as the "status key"; **no `AGENTS.md` has ever been committed** (history searched). The status vocabulary (`verified`, `implemented, not yet run`, `not done`) was reconstructed from that document.
+- The old `docs/DISPATCH_SPRINT1.md` cited **`AGENTS.md` section 3** as its "status key"; **no `AGENTS.md` has ever been committed** (history searched). The corrected document points at the evidence tags in this file instead.
 
 ### 5. The delivery pipeline fails silently in several ways — **P1**
 
-(a) New `.sql` files are dropped without warning **[verified]**. (b) A zip cannot delete or rename, so orphans accumulate (`backend_dispatch.js`). (c) A zip cannot change workflow files (§4.3). (d) "Create / reset the company owner login" is ticked by default and resets the owner's password (§4.2). (e) Nothing guards against building an update from a stale copy — it happened twice (issue 1). (f) A zip uploaded but never run just sits in the repo: the Nov 17 `ems-update.zip` stayed unapplied for five days and was deleted on Nov 22; its files reached the repo through manual uploads and **nothing was lost — HEAD contains each file, identical or newer [verified]**. (g) If a database step fails, the code is already pushed. (h) `scripts/upgrade.js` only runs its main block when `` import.meta.url === `file://${process.argv[1]}` ``, which works on the Linux runner but silently does nothing on Windows or in paths with spaces (`migrate.js` and `upgrade_dispatch.js` already use the robust `pathToFileURL` form). Ideas: R5.
+(a) New `.sql` files are dropped without warning **[verified]**. (b) A zip cannot delete or rename, so orphans accumulate (`backend_dispatch.js` was one until 2026-11-24). (c) A zip cannot change workflow files (§4.3). (d) "Create / reset the company owner login" is ticked by default and resets the owner's password (§4.2). (e) Nothing guards against building an update from a stale copy — it happened twice (issue 1). (f) A zip uploaded but never run just sits in the repo: the Nov 17 `ems-update.zip` stayed unapplied for five days and was deleted on Nov 22; its files reached the repo through manual uploads and **nothing was lost — HEAD contains each file, identical or newer [verified]**. (g) If a database step fails — or simply finishes after Vercel has deployed — the new code runs against the old database (issue 15). (h) `scripts/upgrade.js` only runs its main block when `` import.meta.url === `file://${process.argv[1]}` ``, which works on the Linux runner but silently does nothing on Windows or in paths with spaces (`migrate.js` and `upgrade_dispatch.js` already use the robust `pathToFileURL` form). Ideas: R5.
 
 ### 6. `SESSION_SECRET` is also the MFA encryption key — **P1**
 
 Rotating it, or setting a different value in a new environment while keeping the database, makes every stored authenticator secret undecryptable (the `v1:` format has no key id). Fix idea: introduce a separate `MFA_ENCRYPTION_KEY` that falls back to `SESSION_SECRET`, and support more than one key version so a rotation does not force re-enrolment.
 
-### 7. The call board is "newest 100", all statuses, all fields — **P1**
+### 7. The call board was "newest 100", all statuses, all fields — **board fixed by the 2026-11-24 restore (awaiting live confirmation); field exposure remains (P1)**
 
-`GET /incidents` is `ORDER BY call_received_at DESC LIMIT 100` with no open/closed filter and no paging **[code, verified by the failing board test]**. An open call older than the 100th newest disappears from the dispatch board. Sprint 1 fixes the "every open call, plus the last 24 h of closed ones" part; the patient-field exposure is part of issue 2.
+Before the restore `GET /incidents` was `ORDER BY call_received_at DESC LIMIT 100` with no open/closed filter, so an open call older than the 100th newest vanished from the board **[code; shown by the failing board test]**. Now it returns every open call plus calls closed in the last 24 hours (`?closedHours=`, up to 168), open calls first, capped at 500 **[verified 2026-11-24]**. Still open: `SELECT i.*` returns patient and contact fields to every role — part of issue 2.
 
 ### 8. There is no continuous integration — **P1**
 
@@ -496,6 +499,12 @@ The session token lives in `localStorage["ems:session"]` (readable by any script
 
 `DATE` columns reach JSON as timestamps and can be off by a day in some time zones **[docs]**. Tests reset the cluster-wide runtime-role password (§5.2). Two files are over 1,000 lines (`dispatch_console.jsx`, `epcr_charting.jsx`): whole-file replacement of such files is exactly how work got lost. Response-time intervals exist only when dispatchers assign and crews tap statuses; Sprint 1's call timeline would make them reliable (R7).
 
+### 15. The new code can go live before the database upgrade has run — **P1**
+
+The workflow pushes the zip's files first (Vercel starts deploying at once) and runs the database step afterwards. For a short window — a minute or two, longer if the database step fails — new code can run against the old schema. With Sprint 1 restored, `POST /incidents` writes a timeline row, so **a call cannot be created until `incident_events` exists**; assigning, releasing, completing and cancelling fail the same way. **[verified 2026-11-24]** against a database without the table: `/api/health` returned 200 with `build` 10, reads worked, and creating a call returned HTTP 500 "Internal server error" with `relation "incident_events" does not exist` in the log; the failed request rolled back cleanly (no half-saved call). **A health check therefore cannot prove this deploy** — the owner's check is to create a test call (§4.2).
+
+This is very likely the failure the earlier Sprint 1 deliveries had: their routes wrote to a table the workflow never created **[hypothesis — §14, question 1]**. Mitigations now: run the workflow with "Set up / upgrade the database too" ticked, wait for the green tick before using the board, roll back in Vercel if calls fail (§4.5). Fixes (R5, workflow edits made by the owner in the GitHub UI): run the database upgrade *before* the commit and push, and have `/api/health` report whether the schema is current (for example whether `incident_events` exists).
+
 ---
 
 ## 12. Roadmap (proposed — the owner decides; confirm before starting large work)
@@ -506,11 +515,11 @@ Sources: the repo's own documents **[docs]** and what was verified on 2026-11-23
 
 | # | Item | Why | Done when | Size |
 |---|---|---|---|---|
-| **R1** | **Restore Dispatch Sprint 1** (issue 1) using the verified recipe | A dispatcher can currently send an out-of-service unit and close a call twice | All backend suites pass **including `dispatch-lifecycle`** (85 / 85 expected); `GET /incidents/:id/events` answers 200 on the live site; `docs/DISPATCH_SPRINT1.md` corrected; `build` bumped to 10 | S |
+| **R1** | **Restore Dispatch Sprint 1** (issue 1) | A dispatcher could send an out-of-service unit and close a call twice | **Delivered 2026-11-24** as an `ems-update.zip` (85 / 85 in the sandbox). **Done when the owner confirms live:** `/api/health` shows `build` 10, a test call can be created and an available unit assigned, and the timeline endpoint answers | S |
 | **R2** | **Enforce roles on dispatch routes** (issue 2) | Any signed-in role can create, assign and complete calls | Matrix agreed with the owner and written into §7; a negative test per role passes; read access to patient/contact fields decided | M |
 | **R3** | **Complete the test list and add CI** (issues 3, 8) | A green run hid a broken dispatch path | `npm test` runs every file in `tests/`; a workflow with a PostGIS service container runs backend tests, web tests and the build on every push (uploaded through the GitHub UI) | M |
 | **R4** | **Refresh the documentation** (issue 4) | New chats and people are misled by three-week-old claims | `README.md` short, accurate and linking here; `DEPLOYMENT.md` and `backend/README.md` match §4 and §10; `backend/.env.example` exists; compose fixed or removed; `.gitignore` gains `node_modules/` and `dist/`; stale comments fixed | S |
-| **R5** | **Harden the pipeline** (issue 5) — workflow edits are made in the GitHub UI | Silent failure modes cost work twice | "Create / reset the company owner login" defaults to **off**; a post-deploy step prints `/api/health`'s `build`; the apply step honours a deletion list (for example `ems-delete.txt`) and refuses a zip containing new `.sql` or workflow files; `upgrade.js` uses the robust main-guard | M |
+| **R5** | **Harden the pipeline** (issues 5, 15) — workflow edits are made in the GitHub UI | Silent failure modes cost work twice | "Create / reset the company owner login" defaults to **off**; the database upgrade runs **before** the push; `/api/health` also reports whether the schema is current; a post-deploy step prints `build`; the apply step honours a deletion list (for example `ems-delete.txt`) and refuses a zip containing new `.sql` or workflow files; `upgrade.js` uses the robust main-guard | M |
 
 ### Next — finish what Sprint 1 started and close visible gaps
 
@@ -558,6 +567,7 @@ PHI field encryption with key management · signature capture on object storage 
 6. **Tests find real bugs** (`backend/README.md` lists twelve, including views leaking across companies and an audit chain that forked under concurrency) — keep testing against real Postgres, not mocks.
 7. From `backend/README.md`: *a fix that exists only in a running environment is not safe until it is committed somewhere durable*, and *a test that leaks a database connection when it fails does not fail — it hangs*.
 8. **Very large files are the riskiest to replace whole** (`dispatch_console.jsx` 1,055 lines, `epcr_charting.jsx` 1,091). Prefer targeted edits.
+9. **Ship the schema before, or together with, the code that needs it — and prove it on an existing database** (§9.3). The earlier Sprint 1 deliveries wired routes to a table the workflow never created, and a green health check cannot reveal that (issue 15).
 
 ---
 
@@ -565,10 +575,10 @@ PHI field encryption with key management · signature capture on object storage 
 
 Ask these once, then record the answers in §15 and remove the question. Items 1–3 change what a chat should do next.
 
-1. **Why was the Nov 8 update rolled back** (`22ca61b` … `cc8205e`)? What broke? It decides whether anything from `8443a29` (map/unit/schedule changes) should return, and whether the Sprint 1 restore is safe to ship on top of what is live. **[owner]**
-2. **What does `https://ems-delta-indol.vercel.app/api/health` show right now** (`build` should be `9`; `sessionSecret` should be `valid`)? Did the last "Update and set up" run finish green? **[owner]** A chat cannot see the live site, Vercel, Neon or Actions.
+1. **Why was the Nov 8 update rolled back** (`22ca61b` … `cc8205e`)? What broke? It decides whether anything from `8443a29` (map/unit/schedule changes) should return, and whether the Sprint 1 restore is safe to ship on top of what is live. **Hypothesis to confirm or reject:** the Sprint 1 routes write to `incident_events`, a table the workflow never created, so creating a call would have failed live (reproduced in the sandbox as HTTP 500). If that is what you saw, the 2026-11-24 restore is built to avoid it (issue 15). **[owner]**
+2. **What does `https://ems-delta-indol.vercel.app/api/health` show right now** (`build` should be `9` before the 2026-11-24 restore is applied and `10` after; `sessionSecret` should be `valid`)? Did the last "Update and set up" run finish green? **[owner]** A chat cannot see the live site, Vercel, Neon or Actions.
 3. **Is this a demo or pilot with invented data, or will real patient or staff data go in?** (Issue 11 and R2 depend on it.)
-4. **Is there an `AGENTS.md` outside the repo?** The Sprint 1 document cites its section 3 ("status key"). If yes, commit it or paste it; its rules should be merged into §1.
+4. **Is there an `AGENTS.md` outside the repo?** The old Sprint 1 document cited its section 3 ("status key"). If yes, commit it or paste it; its rules should be merged into §1.
 5. **Which environment variables and secrets are actually set** in Vercel and GitHub (§10) — in particular `GEOCODE_ENABLED`, `ALLOWED_ORIGIN`, `VITE_TOMTOM_KEY`? Which Vercel and Neon plans are in use?
 6. **Who may do what on dispatch?** Confirm or edit the matrix in §11, issue 2.
 7. **Should the repository stay public?** (Nothing secret is committed, but the platform handles safety-critical workflows and the plan is to hold patient data.)
@@ -581,6 +591,7 @@ Ask these once, then record the answers in §15 and remove the question. Items 1
 
 | Date | Commit | Entry |
 |---|---|---|
+| 2026-11-24 | `69d4b37` (baseline) | **R1 delivered as `ems-update.zip`** — Dispatch Sprint 1 restored on top of the current code (§11, issue 1): the Sprint 1 delta merged into `backend_routes_example.js`, `backend_routes_units.js`, `migrate.js` and `package.json`; `scripts/upgrade.js` now applies `upgrade_dispatch.js`; the savepoint test bug fixed; `build` 9 → 10; `docs/DISPATCH_SPRINT1.md` and this file corrected. **Verified in the sandbox:** backend 85 / 85; web 55 / 55 and build OK; a production-style upgrade of a `69d4b37` database; a live probe 20 / 20; and the new code on an un-upgraded database fails call creation with HTTP 500 while `/api/health` stays green (issue 15). **Not verified: the live site** — pending the owner applying the zip. Still open: issue 2 (no role checks on dispatch), issue 15, R2–R5. `HANDOFF.md` itself was uploaded as `69d4b37` |
 | 2026-11-23 | `c767532` (baseline) | **HANDOFF.md created** by a Claude chat; it is the only addition — **no application code was changed.** Verified in a sandbox (Node 22.23, PostgreSQL 16.15 + PostGIS 3.4.2): backend `npm test` 74 / 74; `dispatch-lifecycle` 1 / 11; web tests 55 / 55; web build OK; fresh-database migrate → upgrade ×2 → bootstrap ×2 OK; live smoke test 13 / 13 including MFA sign-in; `npm audit` clean. Found: Sprint 1 missing and lost twice (issue 1) with a verified recovery path giving 85 / 85; no role enforcement on dispatch writes (issue 2); stale docs and a missing `.env.example` (issue 4); pipeline traps (issue 5). Not verified: anything live (Vercel, Neon, Actions). Open questions in §14 |
 
 ---
@@ -599,6 +610,8 @@ Ask these once, then record the answers in §15 and remove the question. Items 1
 | 2026-11-08 | `22ca61b` … `cc8205e` | Manual rollback to the `5720fca` state — second loss of Sprint 1 |
 | 2026-11-17 | `f0035c3` | `ems-update.zip` uploaded; the workflow was never run on it |
 | 2026-11-22 | `902f7c4` … `c767532` | Zip deleted; files uploaded by hand: Census-first geocoding with precision, fleet vehicles and swaps (`fleet_vehicles`), rewritten inspections, map kit, Team and OPS updates. `build: 9`. The last five commits are empty |
+| 2026-11-24 | `69d4b37` | `HANDOFF.md` added |
+| 2026-11-24 | (restore zip) | Dispatch Sprint 1 restored; `build: 10` — delivered as `ems-update.zip`, awaiting live confirmation |
 
 ## Appendix B — Delivery checklist (copy into your reply and tick it)
 

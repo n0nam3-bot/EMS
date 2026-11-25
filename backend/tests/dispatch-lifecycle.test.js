@@ -201,8 +201,13 @@ test("the call timeline is append-only for the app's database login", async () =
   try {
     await app.query("BEGIN");
     await app.query("SELECT set_config('app.current_tenant_id', $1, true)", [TA]);
+    // Each expected refusal aborts the transaction, so isolate them with savepoints.
+    await app.query("SAVEPOINT a");
     await assert.rejects(() => app.query("UPDATE incident_events SET note = 'x'"), /permission denied/i);
+    await app.query("ROLLBACK TO SAVEPOINT a");
+    await app.query("SAVEPOINT b");
     await assert.rejects(() => app.query("DELETE FROM incident_events"), /permission denied/i);
+    await app.query("ROLLBACK TO SAVEPOINT b");
     await app.query("ROLLBACK");
   } finally { await app.end(); }
 });
