@@ -56,6 +56,7 @@ export default function OpsConsole({ session }) {
       ]);
       setUnits(u); setPool(r); setSpare(f); setChecks(Object.fromEntries(c.map((x) => [x.unit_id, x])));
       setError("");
+      return u;
     } catch (e) { setError(e.message); }
   }, [session]);
   useEffect(() => { load(); }, [load, q]);
@@ -75,7 +76,7 @@ export default function OpsConsole({ session }) {
     return run(() => apiRequest(session, "PUT", `/crew/${person.crewMemberId ?? person.crew_member_id}/unit`, { unitId: unit.unit_id, seatRole: defaultSeat(level, unit) }));
   };
   const remove = (crewMemberId) => run(() => apiRequest(session, "PUT", `/crew/${crewMemberId}/unit`, { unitId: null }));
-  const setVehicle = (unit, body) => run(() => apiRequest(session, "PUT", `/units/${unit.unit_id}/vehicle`, body), body.markOldOutOfService ? `${unit.unit_designation} is on its new vehicle and still active. The old one is out of service.` : "Vehicle updated.");
+  const setVehicle = (unit, body) => run(() => apiRequest(session, "PUT", `/units/${unit.unit_id}/vehicle`, body), body.markOldOutOfService ? `${unit.unit_designation} is on its new vehicle and still active. The old one is out of service.` : body.fleetVehicleId === null ? "Vehicle released." : "Vehicle updated.");
   const toggleSeat = (c) => run(() => apiRequest(session, "PATCH", `/crew/${c.crewMemberId}/seat`, { seatRole: c.role === "driver" ? "non_driver" : "driver" }));
 
   const onDragStart = (e, person, fromUnitId) => {
@@ -99,13 +100,14 @@ export default function OpsConsole({ session }) {
     setError(""); setNotice("");
     try {
       const r = await apiRequest(session, "POST", "/schedule/apply", {});
-      setPlan(null); await load();
-      setNotice(`Crewed as scheduled: ${r.placed} placed, ${r.removed} taken off.${r.skipped.length ? ` ${r.skipped.length} couldn't be done: ${r.skipped.map((x) => `${x.name} (${x.reason})`).join("; ")}` : ""}`);
+      setPlan(null); const fresh = await load();
+      const needVehicle = (fresh || []).filter((x) => x.crew.length > 0 && !x.fleet_vehicle_id).length;
+      setNotice(`Crewed as scheduled: ${r.placed} placed, ${r.removed} taken off.${r.skipped.length ? ` ${r.skipped.length} couldn't be done: ${r.skipped.map((x) => `${x.name} (${x.reason})`).join("; ")}` : ""}${needVehicle ? ` Now pick a vehicle for ${needVehicle === 1 ? "the crewed unit" : `each of the ${needVehicle} crewed units`} that still need${needVehicle === 1 ? "s one" : ""}.` : ""}`);
     } catch (e) { setError(e.message); }
   };
   const shownUnits = useMemo(() => (units || []).filter((u) => {
     if (unitQ && !u.unit_designation.toLowerCase().includes(unitQ.toLowerCase())) return false;
-    if (onlyAttention) { const c = checks[u.unit_id]; if (!(u.current_status === "out_of_service" || c?.check_due || c?.any_failed || !u.fleet_vehicle_id)) return false; }
+    if (onlyAttention) { const c = checks[u.unit_id]; if (!(u.current_status === "out_of_service" || c?.check_due || c?.any_failed || (u.crew.length > 0 && !u.fleet_vehicle_id))) return false; }
     return true;
   }), [units, unitQ, onlyAttention, checks]);
 
@@ -219,11 +221,25 @@ function UnitCard({ unit, check, picked, dragOver, onOver, onLeave, onDrop, onTa
           <span className="text-xs px-1.5 py-0.5 rounded" style={{ color, border: `1px solid ${HAIRLINE}` }}>{label}</span>
         </div>
       </div>
-      <div className="flex items-center justify-between gap-2" onClick={(e) => e.stopPropagation()}>
-        <span className="text-xs" style={{ color: unit.fleet_vehicle_id ? TEXT_SECONDARY : AMBER }}>{unit.fleet_vehicle_id ? `Vehicle ${unit.vehicle_number}` : "No vehicle assigned"}</span>
-        <button onClick={() => setChanging(!changing)} className="text-xs px-2 py-1 rounded" style={{ color: BLUE, border: `1px solid ${HAIRLINE}` }}>{unit.fleet_vehicle_id ? "Switch vehicle" : "Assign vehicle"}</button>
-      </div>
-      {changing && <VehiclePanel unit={unit} spare={spare} onClose={() => setChanging(false)} onSubmit={(body) => { setChanging(false); onVehicle(unit, body); }} />}
+      {/* A vehicle goes with the crew: it is picked here, like the crew, once people are on the unit, and it is released when the last one comes off. */}
+      {unit.fleet_vehicle_id ? (
+        <div className="flex items-center justify-between gap-2" onClick={(e) => e.stopPropagation()}>
+          <span className="text-xs" style={{ color: TEXT_SECONDARY }}>{`Vehicle ${unit.vehicle_number}`}</span>
+          <div className="flex gap-1.5">
+            {unit.crew.length === 0 && <button onClick={() => onVehicle(unit, { fleetVehicleId: null })} className="text-xs px-2 py-1 rounded" style={{ color: AMBER, border: `1px solid ${HAIRLINE}` }}>Release vehicle</button>}
+            <button onClick={() => setChanging(!changing)} className="text-xs px-2 py-1 rounded" style={{ color: BLUE, border: `1px solid ${HAIRLINE}` }}>Switch vehicle</button>
+          </div>
+        </div>
+      ) : unit.crew.length > 0 ? (
+        <div className="flex items-center justify-between gap-2" onClick={(e) => e.stopPropagation()}>
+          <span className="text-xs" style={{ color: AMBER }}>Which vehicle is this crew taking?</span>
+          <select aria-label={`Vehicle for ${unit.unit_designation}`} value="" onChange={(e) => e.target.value && onVehicle(unit, { fleetVehicleId: e.target.value })} className="text-xs rounded px-1.5 py-1 min-w-0" style={{ backgroundColor: SUNKEN, border: `1px solid ${AMBER}`, color: TEXT_PRIMARY }}>
+            <option value="">{spare.length ? "Pick a vehicle…" : "No vehicle is free"}</option>
+            {spare.map((v) => <option key={v.fleet_vehicle_id} value={v.fleet_vehicle_id}>{v.vehicle_number}{v.make_model ? ` · ${v.make_model}` : ""}</option>)}
+          </select>
+        </div>
+      ) : null}
+      {changing && unit.fleet_vehicle_id && <VehiclePanel unit={unit} spare={spare} onClose={() => setChanging(false)} onSubmit={(body) => { setChanging(false); onVehicle(unit, body); }} />}
       <div className="flex flex-col gap-1.5">
         {slots.map((c, i) => c ? (
           <div key={c.crewMemberId} draggable onDragStart={(e) => onDragStart(e, c, unit.unit_id)} onClick={(e) => e.stopPropagation()}

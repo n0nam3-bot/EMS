@@ -409,6 +409,8 @@ test("checks: the driver does the vehicle, an EMT the BLS equipment, the paramed
   s = await row("Medic 1");
   assert.equal(s.checks.vehicle.due, true, "the new vehicle needs its own vehicle check");
   assert.equal(s.checks.bls.due, false, "the equipment didn't change, so those checks stand");
+  // A vehicle goes with the crew, so Rig 9 needs someone aboard before it can take one (taken off again below).
+  assert.equal((await call("PUT", `/crew/${ctx.emt2.crew_member_id}/unit`, { unitId: blsUnit.unit_id, seatRole: "driver" }, a)).status, 200);
   assert.equal((await call("PUT", `/units/${blsUnit.unit_id}/vehicle`, { fleetVehicleId: old.fleet_vehicle_id }, disp)).status, 409, "an out-of-service vehicle can't be assigned");
   assert.equal((await call("POST", `/fleet/${old.fleet_vehicle_id}/return-to-service`, {}, disp)).status, 200);
   assert.equal((await call("PUT", `/units/${blsUnit.unit_id}/vehicle`, { fleetVehicleId: v2.fleet_vehicle_id }, disp)).status, 409, "a vehicle can only be on one unit");
@@ -421,6 +423,7 @@ test("checks: the driver does the vehicle, an EMT the BLS equipment, the paramed
   const comp = (await call("GET", "/vehicles", null, a)).body.find((v) => v.unit_designation === "215");
   assert.equal(String(comp.next_inspection_due).slice(0, 10), "2027-06-30");
   assert.equal((await call("PUT", `/units/${blsUnit.unit_id}/vehicle`, { fleetVehicleId: null }, disp)).status, 200, "a vehicle can be taken off");
+  assert.equal((await call("PUT", `/crew/${ctx.emt2.crew_member_id}/unit`, { unitId: null }, a)).status, 200);   // Rig 9 is empty again for the tests that follow
 });
 
 test("saved places: a supervisor keeps the list, anyone searches it, and a call can point at one as its destination (which the chart then starts from)", async () => {

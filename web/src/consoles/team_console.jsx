@@ -376,11 +376,12 @@ function UnitRow({ u, status, open, toggle, act, session }) {
     <div className="border-b last:border-b-0" style={{ borderColor: "#1B2330" }}>
       <button onClick={toggle} aria-expanded={open} className="w-full flex items-center gap-3 px-3 py-2.5 text-left" style={{ backgroundColor: open ? "#17202C" : "transparent" }}>
         <span className="min-w-0 flex-1 text-sm font-medium truncate">{u.unit_designation} <span className="text-xs" style={{ color: TEXT_SECONDARY }}>{u.capability_level}</span></span>
-        <span className="text-xs shrink-0" style={{ color: u.vehicle_number ? TEXT_SECONDARY : AMBER }}>{u.vehicle_number ? `Vehicle ${u.vehicle_number}` : "No vehicle"}</span>
+        {u.vehicle_number ? <span className="text-xs shrink-0" style={{ color: TEXT_SECONDARY }}>{`Vehicle ${u.vehicle_number}`}</span>
+          : (u.crew || []).length > 0 ? <span className="text-xs shrink-0" style={{ color: AMBER }}>Needs a vehicle</span> : null}
         {chip && <Chip color={chip[1]}>{chip[0]}</Chip>}
         {next && <span className="hidden sm:inline text-xs" style={{ color: nd < 0 ? RED : nd <= 30 ? AMBER : TEXT_FAINT }}>{KIND_LABEL[next.kind]} {nd < 0 ? `${-nd} d overdue` : `in ${nd} d`}</span>}
         <span className="text-xs shrink-0" style={{ color: u.current_status === "out_of_service" ? AMBER : TEXT_SECONDARY }}>{STATUS_LABEL[u.current_status] || u.current_status}</span>
-        <span className="text-xs w-12 text-right shrink-0" style={{ color: TEXT_FAINT }}>{u.crew.length} crew</span>
+        <span className="text-xs w-12 text-right shrink-0" style={{ color: TEXT_FAINT }}>{(u.crew || []).length} crew</span>
         <span className="text-xs shrink-0" style={{ color: TEXT_FAINT }}>{open ? "▲" : "▼"}</span>
       </button>
       {open && <UnitDetails u={u} status={status} act={act} session={session} />}
@@ -402,8 +403,8 @@ function UnitDetails({ u, status, act, session }) {
         {dirty && <button onClick={() => act(() => apiRequest(session, "PATCH", `/units/${u.unit_id}`, editing), "Unit updated.")} className="text-sm px-3 py-1.5 rounded" style={btnGreen}>Save</button>}
         {dirty && <button onClick={() => setEditing({ designation: u.unit_designation, capabilityLevel: u.capability_level })} className="text-sm px-3 py-1.5 rounded" style={btn}>Undo</button>}
       </div>
-      <div className="text-xs" style={{ color: TEXT_SECONDARY }}>Crew: {u.crew.length ? u.crew.map((c) => `${c.name} (${c.role === "driver" ? "driver" : "non-driver"})`).join(", ") : "nobody yet. Use OPS to crew it."}</div>
-      <div className="text-xs" style={{ color: u.vehicle_number ? TEXT_SECONDARY : AMBER }}>{u.vehicle_number ? `Vehicle ${u.vehicle_number}${u.vehicle_status === "out_of_service" ? " (out of service)" : ""}. Change it in OPS.` : "No vehicle assigned. Assign one in OPS."}</div>
+      <div className="text-xs" style={{ color: TEXT_SECONDARY }}>Crew: {(u.crew || []).length ? u.crew.map((c) => `${c.name} (${c.role === "driver" ? "driver" : "non-driver"})`).join(", ") : "nobody yet. Use OPS to crew it."}</div>
+      <div className="text-xs" style={{ color: u.vehicle_number ? TEXT_SECONDARY : (u.crew || []).length > 0 ? AMBER : TEXT_FAINT }}>{u.vehicle_number ? `Vehicle ${u.vehicle_number}${u.vehicle_status === "out_of_service" ? " (out of service)" : ""}. It goes with the crew; change it in OPS.` : (u.crew || []).length > 0 ? "Crewed, but no vehicle yet. Pick one in OPS." : "Not crewed. A vehicle is picked in OPS when the unit is crewed."}</div>
 
       <div className="flex flex-col gap-1">
         <div className="text-xs font-semibold tracking-wide" style={{ color: TEXT_FAINT }}>SHIFT CHECKS</div>
@@ -431,6 +432,7 @@ function UnitDetails({ u, status, act, session }) {
       {u.fleet_vehicle_id && (adding ? (
         <InspectionForm f={f} setF={setF} onSave={async () => { if (await act(() => apiRequest(session, "POST", "/unit-checks/inspection", { fleetVehicleId: u.fleet_vehicle_id, ...f, performedOn: f.performedOn || undefined, nextDue: f.nextDue || undefined }), "Inspection recorded.")) setAdding(false); }} onCancel={() => setAdding(false)} />
       ) : <button onClick={() => setAdding(true)} className="self-start text-xs px-2 py-1 rounded" style={btn}>+ Record an inspection of vehicle {u.vehicle_number}</button>)}
+      {!u.fleet_vehicle_id && <div className="text-xs" style={{ color: TEXT_FAINT }}>Vehicle inspections belong to the vehicle: record them here once the unit has one, or on the Vehicles tab.</div>}
 
       <div className="flex items-center gap-2 flex-wrap pt-2" style={{ borderTop: "1px solid #1B2330" }}>
         {confirmDelete ? (

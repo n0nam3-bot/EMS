@@ -184,6 +184,7 @@ router.patch("/users/:id", ADMIN, handle(async (req, res) => {
       [req.params.id])).rows[0];
     if (!cur) return null;
     const sets = [], vals = [];
+    const freed = [];   // units this person's seat just left: each must be re-evaluated (crew, service, vehicle)
     const add = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
     if (b.displayName !== undefined) { if (String(b.displayName).trim().length < 2) fail(400, "Enter the person's full name"); add("display_name", String(b.displayName).trim()); }
     if (b.email !== undefined) {
@@ -200,7 +201,7 @@ router.patch("/users/:id", ADMIN, handle(async (req, res) => {
       newLevel = r.level;
       // Taking someone off the field takes them off their unit.
       if (!r.level) {
-        await c.query("UPDATE unit_crew_assignments SET assigned_to = now() WHERE assigned_to IS NULL AND crew_member_id IN (SELECT crew_member_id FROM crew_members WHERE user_id = $1)", [req.params.id]);
+        freed.push(...(await c.query("UPDATE unit_crew_assignments SET assigned_to = now() WHERE assigned_to IS NULL AND crew_member_id IN (SELECT crew_member_id FROM crew_members WHERE user_id = $1) RETURNING unit_id", [req.params.id])).rows.map((x) => x.unit_id));
       }
     }
     if (b.isActive !== undefined) add("is_active", Boolean(b.isActive));
@@ -214,13 +215,14 @@ router.patch("/users/:id", ADMIN, handle(async (req, res) => {
     }
     if (b.employeeNumber !== undefined) await c.query("UPDATE crew_members SET employee_number = $1 WHERE user_id = $2", [String(b.employeeNumber).trim() || null, req.params.id]);
     if (b.isActive === false) {
-      await c.query(
+      freed.push(...(await c.query(
         `UPDATE unit_crew_assignments SET assigned_to = now()
-         WHERE assigned_to IS NULL AND crew_member_id IN (SELECT crew_member_id FROM crew_members WHERE user_id = $1)`, [req.params.id]);
+         WHERE assigned_to IS NULL AND crew_member_id IN (SELECT crew_member_id FROM crew_members WHERE user_id = $1) RETURNING unit_id`, [req.params.id])).rows.map((x) => x.unit_id));
       await c.query("UPDATE crew_members SET is_active = FALSE WHERE user_id = $1", [req.params.id]);
     } else if (b.isActive === true) {
       await c.query("UPDATE crew_members SET is_active = TRUE WHERE user_id = $1", [req.params.id]);
     }
+    for (const unitId of new Set(freed)) await reconcileUnit(c, req.user.tenantId, unitId, req.user.userId);
     const row = (await c.query(
       `SELECT u.user_id, u.email, u.display_name, u.role, u.extra_roles::text[] AS extra_roles, u.is_active, cm.field_level
        FROM users u LEFT JOIN crew_members cm ON cm.user_id = u.user_id WHERE u.user_id = $1`, [req.params.id])).rows[0];
@@ -269,7 +271,7 @@ router.patch("/units/:id", ADMIN, handle(async (req, res) => {
       if (dup.rows.length) fail(409, `A unit named "${designation}" already exists`);
     }
     await c.query("UPDATE vehicles SET unit_designation = COALESCE($1, unit_designation), capability_level = COALESCE($2, capability_level) WHERE vehicle_id = $3", [designation ?? null, level ?? null, cur.vehicle_id]);
-    if (level !== undefined) await reconcileUnit(c, req.user.tenantId, req.params.id);
+    if (level !== undefined) await reconcileUnit(c, req.user.tenantId, req.params.id, req.user.userId);
   });
   res.json({ ok: true });
 }));
@@ -312,7 +314,7 @@ router.put("/crew/:crewMemberId/unit", STAFFING, handle(async (req, res) => {
   const { unitId, seatRole } = req.body || {};
   if (!UUID_RE.test(req.params.crewMemberId)) fail(400, "Bad crew member id");
   if (unitId !== null && !UUID_RE.test(String(unitId))) fail(400, "Pick a unit");
-  const warning = await withTenant(req.user.tenantId, (c) => placeCrewMember(c, req.user.tenantId, req.params.crewMemberId, unitId, seatRole));
+  const warning = await withTenant(req.user.tenantId, (c) => placeCrewMember(c, req.user.tenantId, req.params.crewMemberId, unitId, seatRole, req.user.userId));
   res.json({ ok: true, ...(warning ? { warning } : {}) });
 }));
 
@@ -320,7 +322,7 @@ router.put("/crew/:crewMemberId/unit", STAFFING, handle(async (req, res) => {
 // the caller's transaction. Used by the OPS board and by "crew units as scheduled". Throws an HttpError
 // with plain words when a rule is broken; returns a warning string when it worked but the unit still can't
 // go in service.
-export async function placeCrewMember(c, tenantId, crewMemberId, unitId, seatRole) {
+export async function placeCrewMember(c, tenantId, crewMemberId, unitId, seatRole, by = null) {
   let seat = seatRole === "driver" ? "driver" : "non_driver";
   let warning = null;
   const cm = (await c.query("SELECT first_name, last_name, field_level FROM crew_members WHERE crew_member_id = $1 AND is_active", [crewMemberId])).rows[0];
@@ -363,7 +365,7 @@ export async function placeCrewMember(c, tenantId, crewMemberId, unitId, seatRol
     );
   }
   for (const id of new Set([...freed, ...(unitId ? [unitId] : [])])) {
-    const w = await reconcileUnit(c, tenantId, id);
+    const w = await reconcileUnit(c, tenantId, id, by);
     if (w && id === unitId) warning = w;
   }
   return warning;
@@ -389,7 +391,7 @@ router.patch("/crew/:crewMemberId/seat", STAFFING, handle(async (req, res) => {
       if (d) fail(409, `That unit already has a driver (${d.first_name} ${d.last_name}). Make them non-driver first.`);
     }
     await c.query("UPDATE unit_crew_assignments SET seat_role = $1 WHERE assignment_id = $2", [seat, row.assignment_id]);
-    warning = await reconcileUnit(c, req.user.tenantId, row.unit_id);
+    warning = await reconcileUnit(c, req.user.tenantId, row.unit_id, req.user.userId);
   });
   res.json({ ok: true, ...(warning ? { warning } : {}) });
 }));
@@ -397,9 +399,11 @@ router.patch("/crew/:crewMemberId/seat", STAFFING, handle(async (req, res) => {
 // Decides whether an idle unit should be in or out of service from who is on it.
 // A unit can take calls when it has a driver, someone who can treat (EMT or above), and, if it's
 // an ALS or CCT unit, a paramedic. (A mid-call unit is left alone.)
-async function reconcileUnit(c, tenantId, unitId) {
+// A vehicle goes with the crew: when the last person comes off an idle unit, its vehicle is released
+// back to the pool and the history records it.
+async function reconcileUnit(c, tenantId, unitId, by = null) {
   const u = (await c.query(
-    `SELECT un.current_status, v.capability_level, v.unit_designation FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1`, [unitId])).rows[0];
+    `SELECT un.current_status, un.fleet_vehicle_id, v.capability_level, v.unit_designation FROM units un JOIN vehicles v ON v.vehicle_id = un.vehicle_id WHERE un.unit_id = $1`, [unitId])).rows[0];
   if (!u || !["available", "out_of_service"].includes(u.current_status)) return null;   // mid-call: leave it alone
   const crew = (await c.query(
     `SELECT count(*) AS n,
@@ -413,6 +417,12 @@ async function reconcileUnit(c, tenantId, unitId) {
   if (Number(crew.clinical) === 0) missing.push("an EMT or above");
   if (u.capability_level !== "BLS" && Number(crew.medics) === 0) missing.push("a paramedic");
   const ready = Number(crew.n) > 0 && missing.length === 0;
+  if (Number(crew.n) === 0 && u.fleet_vehicle_id) {
+    await c.query("UPDATE units SET fleet_vehicle_id = NULL WHERE unit_id = $1", [unitId]);
+    await c.query(
+      "INSERT INTO unit_vehicle_log (tenant_id, unit_id, from_vehicle_id, to_vehicle_id, reason, by_user_id) VALUES ($1, $2, $3, NULL, $4, $5)",
+      [tenantId, unitId, u.fleet_vehicle_id, "Crew taken off: vehicle released", by]);
+  }
   const want = ready ? "available" : "out_of_service";
   if (want !== u.current_status) await setStatus(c, tenantId, unitId, want);
   return Number(crew.n) > 0 && !ready ? `${u.unit_designation} stays out of service until it has ${missing.join(" and ")}.` : null;

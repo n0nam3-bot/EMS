@@ -158,11 +158,11 @@ router.post("/schedule/apply", STAFFING, handle(async (req, res) => {
 
   const skipped = []; let removed = 0, placed = 0;
   for (const r of plan.remove) {
-    try { await withTenant(req.user.tenantId, (c) => placeCrewMember(c, req.user.tenantId, r.crewMemberId, null)); removed++; }
+    try { await withTenant(req.user.tenantId, (c) => placeCrewMember(c, req.user.tenantId, r.crewMemberId, null, undefined, req.user.userId)); removed++; }
     catch (e) { skipped.push({ name: r.name, unit: r.unit, reason: e.message }); }
   }
   for (const p of plan.place) {
-    try { await withTenant(req.user.tenantId, (c) => placeCrewMember(c, req.user.tenantId, p.crewMemberId, p.unitId, p.seat)); placed++; }
+    try { await withTenant(req.user.tenantId, (c) => placeCrewMember(c, req.user.tenantId, p.crewMemberId, p.unitId, p.seat, req.user.userId)); placed++; }
     catch (e) { skipped.push({ name: p.name, unit: p.unit, reason: e.message }); }
   }
   res.json({ removed, placed, skipped });

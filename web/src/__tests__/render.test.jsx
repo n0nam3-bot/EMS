@@ -739,6 +739,7 @@ describe("OPS and the schedule", () => {
     expect(calls.filter((c) => c.key === "POST /schedule/apply").every((c) => c.body.dryRun === true)).toBe(true);   // nothing applied yet
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     expect(await screen.findByText(/1 placed, 1 taken off/)).toBeTruthy();
+    expect(screen.getByText(/pick a vehicle for the crewed unit that still needs one/)).toBeTruthy();   // a vehicle goes with the crew, and scheduled crewing can't choose one
   });
 });
 
@@ -876,14 +877,107 @@ describe("OPS: vehicles", () => {
     await waitFor(() => expect(calls.find((c) => c.key === "PUT /units/u1/vehicle")?.body).toEqual({ fleetVehicleId: "f9", markOldOutOfService: true, reason: "Mechanical issue: overheating" }));
     expect(await screen.findByText(/still active/)).toBeTruthy();
   });
-  it("assigns a vehicle to a unit that has none (no 'out of service' question: there's no old vehicle)", async () => {
-    const calls = fakeServer(base({ "PUT /units/u2/vehicle": { ok: true } }));
+  // BLS 2 (the second unit of the fixture), with whatever the test needs changed about it.
+  const withU2 = (u2) => { const b = base({ "PUT /units/u2/vehicle": { ok: true } }); b["GET /units"] = [b["GET /units"][0], { ...b["GET /units"][1], ...u2 }]; return b; };
+  it("a vehicle goes with the crew: a crewed unit with none asks which vehicle the crew is taking, picking one assigns it, and only free in-service vehicles are offered", async () => {
+    const calls = fakeServer(withU2({ current_status: "available", crew: [{ employeeId: "9", name: "Eli Emt", role: "driver", cert: null, crewMemberId: "c3", fieldLevel: "emt" }] }));
     render(<OpsConsole session={liveSession()} />);
-    expect(await screen.findByText("No vehicle assigned")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Assign vehicle" }));
-    expect(screen.queryByLabelText("Why")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Vehicle"), { target: { value: "f9" } });
-    fireEvent.click(screen.getByRole("button", { name: "Assign" }));
+    expect(await screen.findByText("Which vehicle is this crew taking?")).toBeTruthy();
+    expect(calls.some((c) => c.key === "GET /fleet" && c.url.includes("available=1"))).toBe(true);   // the server lists only vehicles in service and not on a unit
+    const pick = screen.getByLabelText("Vehicle for BLS 2");
+    expect([...pick.options].map((o) => o.textContent)).toEqual(["Pick a vehicle…", "215 · Ford E-450"]);
+    expect(screen.queryByRole("button", { name: "Assign vehicle" })).toBeNull();                      // no second step: picking one assigns it, like seating a person
+    fireEvent.change(pick, { target: { value: "f9" } });
     await waitFor(() => expect(calls.find((c) => c.key === "PUT /units/u2/vehicle")?.body).toEqual({ fleetVehicleId: "f9" }));
+  });
+  it("an empty unit shows no vehicle row at all: no crew, so no vehicle to pick", async () => {
+    fakeServer(base());
+    render(<OpsConsole session={liveSession()} />);
+    expect(await screen.findByText("Vehicle 214")).toBeTruthy();                                       // Medic 7 is crewed and has one
+    expect(screen.queryByText("No vehicle assigned")).toBeNull();
+    expect(screen.queryByText("Which vehicle is this crew taking?")).toBeNull();
+    expect(screen.queryByLabelText("Vehicle for BLS 2")).toBeNull();
+  });
+  it("a vehicle left on a unit after its crew went can be released by hand", async () => {
+    const calls = fakeServer(withU2({ fleet_vehicle_id: "f9", vehicle_number: "215", crew: [] }));
+    render(<OpsConsole session={liveSession()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Release vehicle" }));
+    await waitFor(() => expect(calls.find((c) => c.key === "PUT /units/u2/vehicle")?.body).toEqual({ fleetVehicleId: null }));
+    expect(await screen.findByText("Vehicle released.")).toBeTruthy();
+  });
+});
+
+describe("Team: units don't look tied to a vehicle", () => {
+  const row = (id, name, over) => ({ unit_id: id, unit_designation: name, capability_level: "ALS", current_status: "available", fleet_vehicle_id: null, vehicle_number: null, vehicle_status: null, crew: [], ...over });
+  const status = (u) => ({ unit_id: u.unit_id, unit_designation: u.unit_designation, capability_level: u.capability_level, crew_count: u.crew.length, check_due: false, any_failed: false, fleet_vehicle_id: u.fleet_vehicle_id, vehicle_number: u.vehicle_number, checks: { vehicle: CHK(), bls: CHK(), als: CHK() }, periodic: [] });
+  it("shows a vehicle only on a crewed unit, flags a crewed unit that has none, and says nothing about vehicles on an empty one", async () => {
+    const aboard = [{ employeeId: "7", name: "Pat Medic", role: "driver", cert: "EMT" }];
+    const units = [
+      row("u1", "Medic 1", { crew: aboard, fleet_vehicle_id: "f1", vehicle_number: "214" }),
+      row("u2", "Medic 2", { crew: aboard }),
+      row("u3", "Medic 3", { current_status: "out_of_service" }),
+    ];
+    fakeServer(TEAM_ROUTES({ "GET /units": units, "GET /unit-checks/status": units.map(status) }));
+    render(<TeamConsole session={liveSession()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Units & inspections" }));
+    expect(await screen.findByText("Vehicle 214")).toBeTruthy();
+    expect(screen.getAllByText("Needs a vehicle")).toHaveLength(1);                                    // Medic 2 only
+    expect(screen.queryByText("No vehicle")).toBeNull();                                               // an empty unit is not a problem
+    fireEvent.click(screen.getByText("Medic 3"));
+    expect(await screen.findByText("Not crewed. A vehicle is picked in OPS when the unit is crewed.")).toBeTruthy();
+  });
+});
+
+describe("dispatch board: long lists stay usable", () => {
+  const u = (i, over) => UNIT({ unit_id: `u${i}`, unit_designation: `Medic ${i}`, ...over });
+  const idle = { current_status: "out_of_service", crew: [], fleet_vehicle_id: null, vehicle_number: null };
+  const names = () => screen.getAllByText(/^Medic \d+$/).map((e) => e.textContent);
+  it("lists available units first, then those on a call, then out of service; chips count them and narrow the list", async () => {
+    fakeServer({ "GET /units": [u(1, idle), u(2, { current_status: "en_route" }), u(3), u(4, idle), u(5), u(6, { current_status: "on_scene" }), u(7)], "GET /incidents": [] });
+    render(<DispatchConsole session={liveSession()} />);
+    const chips = await screen.findByRole("group", { name: "Filter the unit board" });
+    for (const t of [/All\s*7/, /Available\s*3/, /On a call\s*2/, /Out of service\s*2/]) expect(chips.textContent).toMatch(t);
+    expect(names()).toEqual(["Medic 3", "Medic 5", "Medic 7", "Medic 2", "Medic 6", "Medic 1", "Medic 4"]);   // nothing is hidden by default
+    fireEvent.click(screen.getByRole("button", { name: /Out of service\s*2/ }));
+    expect(names()).toEqual(["Medic 1", "Medic 4"]);
+    expect(screen.getByRole("button", { name: /Out of service\s*2/ }).getAttribute("aria-pressed")).toBe("true");
+  });
+  it("shows a crew member without an employee number by name only, never 'null -'", async () => {
+    fakeServer({ "GET /units": [UNIT({ crew: [{ employeeId: null, name: "Pat Medic", role: "driver", cert: "ALS" }] })], "GET /incidents": [] });
+    render(<DispatchConsole session={liveSession()} />);
+    expect(await screen.findByText("Pat Medic")).toBeTruthy();
+    expect(screen.queryByText(/null/)).toBeNull();
+  });
+  it("warns 'no vehicle' only on a crewed unit: an empty unit has no vehicle by design", async () => {
+    fakeServer({ "GET /units": [u(1, { fleet_vehicle_id: null, vehicle_number: null }), u(2, idle)], "GET /incidents": [] });
+    render(<DispatchConsole session={liveSession()} />);
+    await screen.findByText("Medic 1");
+    expect(screen.getAllByText("no vehicle")).toHaveLength(1);
+  });
+  it("a long queue gets chips; a call already covered at the level it needs hides its extra suggestion, one that is not covered keeps it", async () => {
+    const call = (i, over) => ({ ...INCIDENT, incident_id: `i${i}`, scene_address: `${i} Test Street`, scene_detail: "", destination_text: "", ...over });
+    fakeServer({
+      "GET /units": [u(1, { capability_level: "ALS", current_status: "on_scene" }), u(2, { capability_level: "BLS", current_status: "en_route" }), u(3, { capability_level: "BLS", current_status: "available" })],
+      "GET /incidents": [
+        call(1, { capability_needed: "BLS", assigned_units: [{ unitId: "u1", role: "primary" }] }),   // an ALS unit covers a BLS call
+        call(2, { capability_needed: "ALS", assigned_units: [{ unitId: "u2", role: "primary" }] }),   // a BLS unit does not cover an ALS call
+        call(3), call(4), call(5),
+      ],
+    });
+    render(<DispatchConsole session={liveSession()} />);
+    const chips = await screen.findByRole("group", { name: "Filter the transport queue" });
+    expect(chips.textContent).toMatch(/Needs a unit\s*3/);
+    expect(chips.textContent).toMatch(/Has a unit\s*2/);
+    await screen.findByText("1 Test Street");
+    expect(screen.getAllByText(/Nearest additional unit/)).toHaveLength(1);                           // only the ALS call still lacking ALS
+    fireEvent.click(screen.getByRole("button", { name: /Needs a unit\s*3/ }));                       // the chips narrow the queue
+    expect(screen.queryByText("1 Test Street")).toBeNull();
+    expect(screen.getByText("3 Test Street")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Has a unit\s*2/ }));
+    expect(screen.getByText("1 Test Street")).toBeTruthy();
+    expect(screen.queryByText("3 Test Street")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /All\s*5/ }));
+    fireEvent.click(screen.getByText("1 Test Street"));                                               // opening the covered call shows its suggestion too
+    await waitFor(() => expect(screen.getAllByText(/Nearest additional unit/)).toHaveLength(2));
   });
 });

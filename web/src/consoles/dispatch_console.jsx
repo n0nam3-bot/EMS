@@ -274,6 +274,8 @@ export default function DispatchConsole({ session }) {
   const [actionError, setActionError] = useState("");
   const [selIncidentId, setSelIncidentId] = useState(null);
   const [selUnitId, setSelUnitId] = useState(null);
+  const [queueFilter, setQueueFilter] = useState("all"); // all | needs | covered
+  const [unitFilter, setUnitFilter] = useState("all");   // all | available | oncall | out
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
@@ -390,6 +392,16 @@ export default function DispatchConsole({ session }) {
   // Where each unit is, for the map and for "nearest unit": a recent GPS fix if there is one, otherwise
   // inferred from its status and its call (on scene = at the pickup, at destination = at the drop-off...).
   const minute = Math.floor(now.getTime() / 60000);       // re-check "is the GPS still fresh" once a minute, not every second (the map redraws when this changes)
+  // Long lists stay usable: available units first, then those on a call, then out of service; chips narrow either list.
+  const unitGroup = (u) => (u.status === "available" ? "available" : u.status === "out_of_service" ? "out" : "oncall");
+  const GROUP_RANK = { available: 0, oncall: 1, out: 2 };
+  const unitCounts = { all: units.length, available: 0, oncall: 0, out: 0 };
+  units.forEach((u) => { unitCounts[unitGroup(u)] += 1; });
+  const unitsShown = units
+    .filter((u) => unitFilter === "all" || unitGroup(u) === unitFilter)
+    .sort((a, b) => (GROUP_RANK[unitGroup(a)] - GROUP_RANK[unitGroup(b)]) || a.designation.localeCompare(b.designation, undefined, { numeric: true }));
+  const needsUnit = activeIncidents.filter((i) => i.assignedUnits.length === 0);
+  const queueShown = queueFilter === "needs" ? needsUnit : queueFilter === "covered" ? activeIncidents.filter((i) => i.assignedUnits.length > 0) : activeIncidents;
   const placedUnits = useMemo(() => units.map((u) => {
     const call = incidents.find((i) => i.assignedUnits.some((a) => a.unitId === u.id));
     const pos = effectivePosition(u, call, minute * 60000);
@@ -488,7 +500,7 @@ export default function DispatchConsole({ session }) {
   }
 
   return (
-    <div style={{ backgroundColor: VOID, color: TEXT_PRIMARY, fontFamily: "'Inter', system-ui, -apple-system, sans-serif" }} className="min-h-screen w-full dispatch-root">
+    <div style={{ backgroundColor: VOID, color: TEXT_PRIMARY, fontFamily: "'Inter', system-ui, -apple-system, sans-serif" }} className="min-h-[calc(100vh_-_2.75rem)] w-full dispatch-root">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
         .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
@@ -563,34 +575,62 @@ export default function DispatchConsole({ session }) {
             onClear={() => { setSelIncidentId(null); setSelUnitId(null); }}
           />
         </div>
-        <div className="flex flex-col gap-4 min-w-0">
-        <div className="rounded-lg border" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
-          <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: HAIRLINE }}>
-            <div className="text-sm font-semibold tracking-wide">TRANSPORT QUEUE</div>
+        {/* One screen tall on a desktop: each list scrolls inside its own panel, so the page does not grow with the number of calls and units. */}
+        <div className="flex flex-col gap-3 min-w-0 lg:sticky lg:top-3 lg:h-[calc(100vh_-_9.5rem)] lg:min-h-[26rem]">
+        <div className="rounded-lg border flex flex-col lg:flex-[3_1_0%] lg:min-h-0" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
+          <div className="flex items-center justify-between gap-2 px-4 py-2.5 border-b shrink-0" style={{ borderColor: HAIRLINE }}>
+            <div className="flex items-baseline gap-2 min-w-0">
+              <div className="text-sm font-semibold tracking-wide">TRANSPORT QUEUE</div>
+              <span className="mono text-xs" style={{ color: TEXT_FAINT }}>{activeIncidents.length}</span>
+            </div>
             <button onClick={openNewCall} className="flex items-center gap-1 text-xs font-medium px-3 py-1.5 rounded-md" style={{ backgroundColor: SUNKEN, color: TEXT_PRIMARY, border: `1px solid ${HAIRLINE}` }}>
               <Plus size={14} /> New Call
             </button>
           </div>
-          <div>
+          {(activeIncidents.length > 4 || queueFilter !== "all") && (
+            <FilterChips label="Filter the transport queue" value={queueFilter} onChange={setQueueFilter} options={[
+              { key: "all", label: "All", count: activeIncidents.length },
+              { key: "needs", label: "Needs a unit", count: needsUnit.length },
+              { key: "covered", label: "Has a unit", count: activeIncidents.length - needsUnit.length },
+            ]} />
+          )}
+          <div className="overflow-y-auto max-h-[60vh] lg:max-h-none lg:flex-1 lg:min-h-0">
             {live && connectionStatus === "connecting" && (
               <div className="px-4 py-8 text-center text-sm" style={{ color: TEXT_FAINT }}>Loading your calls and units…</div>
             )}
             {activeIncidents.length === 0 && !(live && connectionStatus === "connecting") && (
               <div className="px-4 py-8 text-center text-sm" style={{ color: TEXT_FAINT }}>Queue clear. No active calls.</div>
             )}
-            {activeIncidents.map((incident) => (
+            {queueShown.length === 0 && activeIncidents.length > 0 && (
+              <div className="px-4 py-6 text-center text-sm" style={{ color: TEXT_FAINT }}>No calls match this filter.</div>
+            )}
+            {queueShown.map((incident) => (
               <IncidentRow key={incident.id} incident={incident} now={now} units={placedUnits} onAssign={handleAssign} onRelease={handleRelease} onComplete={handleComplete} onEdit={openEdit} onCancel={handleCancelCall} selected={incident.id === selIncidentId} onSelect={toggleIncident} />
             ))}
           </div>
         </div>
 
-        <div className="rounded-lg border" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
-          <div className="px-4 py-3 border-b text-sm font-semibold tracking-wide" style={{ borderColor: HAIRLINE }}>UNIT BOARD</div>
-          <div className="p-3 flex flex-col gap-2">
+        <div className="rounded-lg border flex flex-col lg:flex-[2_1_0%] lg:min-h-0" style={{ backgroundColor: PANEL, borderColor: HAIRLINE }}>
+          <div className="flex items-baseline gap-2 px-4 py-2.5 border-b shrink-0" style={{ borderColor: HAIRLINE }}>
+            <div className="text-sm font-semibold tracking-wide">UNIT BOARD</div>
+            <span className="mono text-xs" style={{ color: TEXT_FAINT }}>{units.length}</span>
+          </div>
+          {(units.length > 6 || unitFilter !== "all") && (
+            <FilterChips label="Filter the unit board" value={unitFilter} onChange={setUnitFilter} options={[
+              { key: "all", label: "All", count: unitCounts.all },
+              { key: "available", label: "Available", count: unitCounts.available },
+              { key: "oncall", label: "On a call", count: unitCounts.oncall },
+              { key: "out", label: "Out of service", count: unitCounts.out },
+            ]} />
+          )}
+          <div className="p-2 flex flex-col gap-1.5 overflow-y-auto max-h-[50vh] lg:max-h-none lg:flex-1 lg:min-h-0">
             {live && units.length === 0 && connectionStatus !== "connecting" && (
               <div className="px-1 py-4 text-sm" style={{ color: TEXT_FAINT }}>No units yet. A supervisor adds them under Team.</div>
             )}
-            {units.map((unit) => (
+            {unitsShown.length === 0 && units.length > 0 && (
+              <div className="px-1 py-4 text-sm" style={{ color: TEXT_FAINT }}>No units match this filter.</div>
+            )}
+            {unitsShown.map((unit) => (
               <UnitCard key={unit.id} unit={unit} onStatusChange={handleStatusChange} selected={unit.id === selUnitId} onSelect={toggleUnit} />
             ))}
           </div>
@@ -598,6 +638,23 @@ export default function DispatchConsole({ session }) {
         </div>
       </div>
 
+    </div>
+  );
+}
+
+// One tap narrows a long list; the counts stay visible so nothing is hidden by surprise.
+function FilterChips({ label, options, value, onChange }) {
+  return (
+    <div role="group" aria-label={label} className="flex gap-1.5 flex-wrap px-3 py-2 border-b shrink-0" style={{ borderColor: HAIRLINE }}>
+      {options.map((o) => {
+        const on = value === o.key;
+        return (
+          <button key={o.key} type="button" aria-pressed={on} onClick={() => onChange(o.key)} className="text-xs px-2 py-1 rounded-full"
+            style={{ backgroundColor: on ? "rgba(78,161,240,0.15)" : SUNKEN, border: `1px solid ${on ? BLUE : HAIRLINE}`, color: on ? TEXT_PRIMARY : TEXT_SECONDARY }}>
+            {o.label} <span className="mono" style={{ color: on ? BLUE : TEXT_FAINT }}>{o.count}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -919,6 +976,9 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, on
   const [confirming, setConfirming] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [reason, setReason] = useState("");
+  const rowRef = useRef(null);
+  // The lists scroll inside their panels now, so a call picked on the map is brought into view.
+  useEffect(() => { if (selected) rowRef.current?.scrollIntoView?.({ block: "nearest" }); }, [selected]);
   const elapsedMs = now - incident.callReceivedAt;
   const target = PRIORITY_CONFIG[incident.priority].targetMin * 60 * 1000;
   const ratio = elapsedMs / target;
@@ -931,9 +991,14 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, on
   const expanded = more || selected || confirming || cancelling;
   const hasMore = Boolean(incident.destination || incident.patientName || incident.contactName || incident.contactPhone || incident.notes);
   const noCrewAtAll = units.length > 0 && units.every((u) => u.crew.length === 0);
+  // A call already covered at the level it needs doesn't need a second suggestion on every row: it shows when the
+  // call is opened, or whenever the call still lacks the level it needs (an ALS call with only a BLS unit, say).
+  const CAP_RANK = { BLS: 1, ALS: 2, CCT: 3 };
+  const covered = assignedUnits.length > 0 && assignedUnits.some((a) => (CAP_RANK[a.unit.capability] || 0) >= (CAP_RANK[incident.capabilityNeeded] || 0));
+  const showRec = !covered || expanded;
 
   return (
-    <div className="px-4 py-3 border-b" onClick={() => onSelect && onSelect(incident.id)} style={{ borderColor: "#1B2330", cursor: "pointer", backgroundColor: selected ? "rgba(78,161,240,0.10)" : undefined, boxShadow: selected ? `inset 4px 0 0 ${BLUE}` : undefined }}>
+    <div ref={rowRef} className="px-4 py-2.5 border-b" onClick={() => onSelect && onSelect(incident.id)} style={{ borderColor: "#1B2330", cursor: "pointer", backgroundColor: selected ? "rgba(78,161,240,0.10)" : undefined, boxShadow: selected ? `inset 4px 0 0 ${BLUE}` : undefined }}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
@@ -973,6 +1038,7 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, on
         </div>
       )}
 
+      {showRec && (
       <div className="mt-2 flex flex-col gap-1">
         {rec?.best ? (
           <div className="flex items-center gap-2 flex-wrap">
@@ -999,6 +1065,7 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, on
           </div>
         )}
       </div>
+      )}
 
       {expanded && <div className="mt-2 flex items-center gap-2 flex-wrap" onClick={(e) => e.stopPropagation()}>
         {assignedUnits.length > 0 && !cancelling && (confirming ? (
@@ -1026,30 +1093,39 @@ function IncidentRow({ incident, now, units, onAssign, onRelease, onComplete, on
 function UnitCard({ unit, onStatusChange, selected, onSelect }) {
   const cfg = STATUS_CONFIG[unit.status];
   const Icon = cfg.icon;
+  const rowRef = useRef(null);
+  // The lists scroll inside their panels now, so a unit picked on the map is brought into view.
+  useEffect(() => { if (selected) rowRef.current?.scrollIntoView?.({ block: "nearest" }); }, [selected]);
+  const crewName = (c) => (c.employeeId ? `${c.employeeId} - ${c.name}` : c.name);   // "employee id - full name", or just the name when there is no number
+  const crewLine = (c) => `${crewName(c)} \u2014 ${CREW_LABELS[c.role] || c.role}${c.cert ? ` ${c.cert}` : ""}`;
   return (
-    <div className="rounded-md px-3 py-2 flex items-center justify-between gap-2" onClick={() => onSelect && onSelect(unit.id)} style={{ backgroundColor: SUNKEN, border: `1px solid ${selected ? BLUE : HAIRLINE}`, cursor: "pointer", boxShadow: selected ? `0 0 0 1px ${BLUE}` : undefined }}>
-      <div className="flex items-center gap-2 min-w-0">
-        <Icon size={16} color={cfg.color} className="shrink-0" />
-        <div className="min-w-0">
-          <div className="flex items-center gap-1.5">
-            <span className="mono text-sm font-medium">{unit.designation}</span>
-            <span className="text-xs px-1 rounded" style={{ color: TEXT_SECONDARY, backgroundColor: PANEL }}>{unit.capability}</span>
-            {unit.vehicleNumber && <span className="text-xs" style={{ color: TEXT_FAINT }}>veh {unit.vehicleNumber}</span>}
-            {unit.vehicleNumber === null && <span className="text-xs" style={{ color: AMBER }}>no vehicle</span>}
-          </div>
-          <div className="flex flex-col">
-            {unit.crew.length === 0 ? (
-              <span className="text-xs" style={{ color: TEXT_FAINT }}>No crew — out of service</span>
-            ) : (
-              unit.crew.map((c, i) => <span key={i} className="text-xs mono truncate" style={{ color: TEXT_FAINT }}>{c.employeeId} - {c.name} — {CREW_LABELS[c.role] || c.role} {c.cert}</span>)
-            )}
+    <div ref={rowRef} className="rounded-md px-3 py-1.5" onClick={() => onSelect && onSelect(unit.id)} style={{ backgroundColor: SUNKEN, border: `1px solid ${selected ? BLUE : HAIRLINE}`, cursor: "pointer", boxShadow: selected ? `0 0 0 1px ${BLUE}` : undefined }}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <Icon size={16} color={cfg.color} className="shrink-0" />
+          <div className="min-w-0 flex-1 flex flex-col sm:flex-row sm:items-baseline sm:gap-2">
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="mono text-sm font-medium">{unit.designation}</span>
+              <span className="text-xs px-1 rounded" style={{ color: TEXT_SECONDARY, backgroundColor: PANEL }}>{unit.capability}</span>
+              {unit.vehicleNumber && <span className="text-xs" style={{ color: TEXT_FAINT }}>veh {unit.vehicleNumber}</span>}
+              {unit.vehicleNumber === null && unit.crew.length > 0 && <span className="text-xs" style={{ color: AMBER }}>no vehicle</span>}
+            </div>
+            {!selected && (unit.crew.length === 0
+              ? <span className="text-xs" style={{ color: TEXT_FAINT }}>No crew</span>
+              : <span className="text-xs truncate min-w-0" style={{ color: TEXT_FAINT }} title={unit.crew.map(crewLine).join("\n")}>{unit.crew.map(crewName).join(" \u00b7 ")}</span>)}
           </div>
         </div>
+        <select value={unit.status} onChange={(e) => onStatusChange(unit.id, e.target.value)} className="text-xs rounded px-1.5 py-1 shrink-0" style={{ backgroundColor: PANEL, color: cfg.color, border: `1px solid ${HAIRLINE}` }}>
+          {Object.entries(STATUS_CONFIG).map(([key, c]) => <option key={key} value={key} style={{ color: "#000" }}>{c.label}</option>)}
+        </select>
       </div>
-      <select value={unit.status} onChange={(e) => onStatusChange(unit.id, e.target.value)} className="text-xs rounded px-1.5 py-1 shrink-0" style={{ backgroundColor: PANEL, color: cfg.color, border: `1px solid ${HAIRLINE}` }}>
-        {Object.entries(STATUS_CONFIG).map(([key, c]) => <option key={key} value={key} style={{ color: "#000" }}>{c.label}</option>)}
-      </select>
+      {selected && (
+        <div className="mt-1 pl-6 flex flex-col">
+          {unit.crew.length === 0
+            ? <span className="text-xs" style={{ color: TEXT_FAINT }}>No crew \u2014 out of service</span>
+            : unit.crew.map((c, i) => <span key={i} className="text-xs mono truncate" style={{ color: TEXT_FAINT }}>{crewLine(c)}</span>)}
+        </div>
+      )}
     </div>
   );
 }
-

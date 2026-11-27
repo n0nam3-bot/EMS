@@ -7,10 +7,10 @@
 
 | | |
 |---|---|
-| Repo | https://github.com/n0nam3-bot/EMS — **public**, default branch `main`, 85 commits since 2026-10-29 |
+| Repo | https://github.com/n0nam3-bot/EMS — **public**, default branch `main`, 88 commits since 2026-10-29 |
 | Live site | https://ems-delta-indol.vercel.app/ (the repo's "homepage" field). A chat cannot check it — see §14 |
-| Verified against | the code of commit `c767532` (2026-11-22); `69d4b37` (2026-11-24) added only this file. The Sprint 1 restore (§15, 2026-11-24) is **verified in a sandbox and awaits confirmation on the live site** |
-| Last full verification | 2026-11-23 and 2026-11-24, by a Claude chat, in a Linux sandbox: Node 22.23, PostgreSQL 16.15, PostGIS 3.4.2 |
+| Verified against | the code at `b491bbb` (2026-11-25: the Sprint 1 restore, **confirmed live by the owner**) plus the 2026-11-25 changes in §15, which are **verified in a sandbox and await confirmation on the live site** |
+| Last full verification | 2026-11-23, 2026-11-24 and 2026-11-25, by a Claude chat, in a Linux sandbox: Node 22.23, PostgreSQL 16.15, PostGIS 3.4.2, a preinstalled Chromium |
 
 **Evidence tags used in this file**
 
@@ -48,7 +48,7 @@ Tip: save the first four lines in Claude's user preferences (Settings) so every 
 5. **The owner works from a phone** (inferred from the workflow header and `DEPLOYMENT.md` — **[owner]** confirm). Never hand over terminal commands as instructions. Deliver changes as in §4: an `ems-update.zip` with repo-relative paths, an explicit list of any file to **delete** (a zip cannot delete), no new `.sql` files, no `.github/workflows` files.
 6. **Database changes go only in `UPGRADE_SQL` in `backend/scripts/upgrade.js`**, written to be safe to run repeatedly. Any new table with a `tenant_id` column needs row-level security and the `tenant_isolation` policy, plus explicit `GRANT`s to `ems_app_runtime` (and `REVOKE UPDATE, DELETE` if it is append-only). **Tests will not catch a missing grant** — see §4.4.
 7. **Never change or rotate `SESSION_SECRET`** without a plan for re-enrolling every user's two-step sign-in. It is the key that encrypts the stored MFA secrets (§5.3).
-8. **Bump `build` in `backend/server.js` (the `/api/health` response) on every release**, and tell the owner which number to expect, so a deploy can be proven. It is `10` once the 2026-11-24 restore is applied (`9` before).
+8. **Bump `build` in `backend/server.js` (the `/api/health` response) on every release**, and tell the owner which number to expect, so a deploy can be proven. It is `11` once the 2026-11-25 changes are applied (`10` before).
 9. **No secrets, no real patient data and no real staff data in the repo.** It is public. The platform is **not approved for real patient data** (§11, issue 11).
 10. **Trust the code over any document.** If you find a doc that is wrong, fix it or add it to §11.
 11. **Keep this file true.** Whenever a change affects status, known issues, roadmap, env vars, the pipeline or a decision, update the section and add a line to §15 **in the same delivery**. When you fix something from §11, move it to §15 with the commit hash.
@@ -68,22 +68,23 @@ Tip: save the first four lines in Claude's user preferences (Settings) so every 
 
 | Check (date in each row) | Result |
 |---|---|
-| Backend `npm test` — 5 files: isolation 18, api-client 32, auth-admin 18, geocode 6, dispatch-lifecycle 11 | **85 / 85 pass**, about 40 s **[verified 2026-11-24, with the Sprint 1 restore applied]**. Before the restore: 74 / 74, the fifth file not being in the script **[verified 2026-11-23]** |
+| Backend `npm test` — 6 files: isolation 18, api-client 32, auth-admin 18, geocode 6, dispatch-lifecycle 11, manning 3 | **88 / 88 pass**, about 50 s **[verified 2026-11-25]**. Before the 2026-11-25 changes: 85 / 85 |
 | `dispatch-lifecycle.test.js` on the code before the restore (`c767532`) | 1 / 11 pass **[verified 2026-11-23]** — §11, issue 1 |
 | Production-style upgrade: a database built from `69d4b37`, then **only** `node scripts/upgrade.js` from the restore build, three times | `incident_events` created with row-level security, the tenant policy and INSERT/SELECT-only for the app login; repeatable; existing data untouched **[verified 2026-11-24]** |
 | Live server on that database: create → assign → status chain → clear → complete, with the refusals and the timeline | 20 / 20 **[verified 2026-11-24]** |
 | The restore build against a database that has **not** been upgraded | `/api/health` still says OK and reads work, but **creating a call returns HTTP 500** (rolled back cleanly) **[verified 2026-11-24]** — §11, issue 15 |
-| Web `npm test` (Vitest, jsdom) | 55 / 55 pass **[verified]** |
-| Web `npm run build` | OK — 446 kB JS (129 kB gzip) **[verified]** |
+| Real Chromium on your actual app (real backend, built web app, real sign-in) with a seeded 28-unit / 24-call agency | The dispatch page went from **7.0 to 1.0 screens** on a 1440×900 desktop and from **10.3 to 2.6** at phone width (390×844); a unit tapped on the map scrolls its row into view; the OPS vehicle picker offered only free in-service vehicles, and picking one and "Release vehicle" were checked in the database **[verified 2026-11-25]** |
+| Web `npm test` (Vitest, jsdom) | **62 / 62 pass** **[verified 2026-11-25]** (55 before) |
+| Web `npm run build` | OK — 451 kB JS (131 kB gzip) **[verified 2026-11-25]** |
 | Fresh database: `npm run migrate`, then `scripts/upgrade.js` twice, then `scripts/bootstrap.js` twice | OK and repeatable **[verified]** |
 | Live server on that database: sign-in with MFA enrolment, `/auth/me`, units, users, fleet, schedule, create a call | 13 / 13 **[verified]** |
 | `npm audit --omit=dev` (backend and web) | 0 vulnerabilities **[verified]** |
 | Web `apiRequest` call sites vs backend routes (77 call sites, static check) | no mismatches **[verified, static only]** |
-| Real browsers and phones, the Vercel deployment, Neon, Actions runs, env vars, TomTom/OSRM/Leaflet at runtime | **not checked** — impossible from a chat **[unverified]** |
+| Real phones, browsers other than the sandbox's Chromium, the Vercel deployment, Neon, Actions runs, env vars, TomTom/OSRM at runtime (OpenStreetMap tiles and the Leaflet CDN were stubbed in the sandbox) | **not checked** **[unverified]** |
 
-**Works** (covered by the passing automated suite and the live smoke test above): two-step sign-in (password + authenticator code, 8 recovery codes) and a separate platform-admin session; per-company data isolation enforced by the database; company administration (users with several roles, field levels, units, crew seating, certifications, fleet vehicles, facilities, checklists); creating calls with address search; assigning, releasing, completing and cancelling; unit status and location; mutual-aid grants; the field-unit screen; ePCR from draft to submit to QA approve/reopen with finalized charts locked; shifts; response-time report; hash-chained audit log with a verify endpoint.
+**Works** (covered by the passing automated suites, the live smoke tests and the browser runs above): two-step sign-in (password + authenticator code, 8 recovery codes) and a separate platform-admin session; per-company data isolation enforced by the database; company administration (users with several roles, field levels, units, crew seating, certifications, fleet vehicles, facilities, checklists); **a vehicle goes with the crew** (picked in OPS, released when the last person comes off); creating calls with address search; assigning, releasing, completing and cancelling with the Sprint 1 protections; a one-screen dispatch board with filters; unit status and location; mutual-aid grants; the field-unit screen; ePCR from draft to submit to QA approve/reopen with finalized charts locked; shifts; response-time report; hash-chained audit log with a verify endpoint.
 
-**Broken or dangerous** (details and evidence in §11): **any signed-in role, including a read-only auditor, can create, assign and complete calls** (issue 2); the documentation was three weeks stale (issue 4; R4); the pipeline has silent-failure traps (issues 5 and 15). The Sprint 1 dispatch protections were missing until the 2026-11-24 restore (issue 1) — **verified in a sandbox, not yet confirmed on the live site**.
+**Broken or dangerous** (details and evidence in §11): **any signed-in role, including a read-only auditor, can create, assign and complete calls** (issue 2); a unit whose crew came off mid-call returns **available with nobody aboard** when the call ends (issue 16); the documentation is stale (issue 4; R4); the pipeline has silent-failure traps (issues 5 and 15). The Sprint 1 dispatch protections were missing until the 2026-11-24 restore (issue 1) and are now **confirmed live by the owner**.
 
 ---
 
@@ -125,7 +126,7 @@ Steps 2–3 use the files as unpacked in step 1 (same workspace), so a zip that 
    - **Create / reset the company owner login** — **untick for routine updates** (see the trap below);
    - platform administrator email — blank.
 4. Wait for every step to go green. Vercel then redeploys by itself.
-5. Owner opens `https://ems-delta-indol.vercel.app/api/health`. **`build` must equal the number the chat promised** (rule 8; it is `10` after the Sprint 1 restore). Also check `sessionSecret` is `valid`. **This proves the code, not the database** (issue 15).
+5. Owner opens `https://ems-delta-indol.vercel.app/api/health`. **`build` must equal the number the chat promised** (rule 8; it is `11` after the 2026-11-25 changes). Also check `sessionSecret` is `valid`. **This proves the code, not the database** (issue 15).
 6. **Create a test call, then assign an available unit to it.** If creating the call fails with "Internal server error", the database step has not finished or has failed: open the workflow run, wait for the green tick (or copy the red log to the chat) and try again. If no unit shows as available, that is the new rule working: a unit must be staffed into service first, so seat a crew on one in OPS.
 7. If a step is red, the owner copies that step's log into the chat. The code is **already pushed** by the time a later database step fails, so Vercel may be running new code against an old database; fix forward quickly, or roll back in Vercel (§4.5).
 
@@ -199,7 +200,7 @@ backend/
   scripts/upgrade_dispatch.js            incident_events DDL (the call timeline) — applied by upgrade.js and migrate.js
   scripts/bootstrap.js, bootstrap_platform.js   create the company + owner / platform admin from env vars
   scripts/dev_token.js, bootstrap_example.sql    legacy helpers for the old RS256 token path
-  tests/*.test.js                        isolation, api-client, auth-admin, geocode, dispatch-lifecycle (§9)
+  tests/*.test.js                        isolation, api-client, auth-admin, geocode, dispatch-lifecycle, manning (§9)
   Dockerfile, docker-compose.yml         local container setup — stale and unverified (§11, issue 4)
 web/
   src/App.jsx                            sign-in (2-step), session, role → screens, demo mode
@@ -252,9 +253,10 @@ Hash-routed single page (`#/dispatch`, `#/ops`, …). `App.jsx` shows each role 
 |---|---|
 | **Company / agency / tenant** | One customer. Everything below belongs to exactly one. A **platform admin** manages companies and accounts but has no route to a call or a chart |
 | **Unit** | A *crewed team* ("Medic 1", "BLS 2") with a capability level `BLS`, `ALS` or `CCT`. Status: `available`, `assigned`, `en_route`, `on_scene`, `transporting`, `at_destination`, `out_of_service` |
-| **Fleet vehicle** | The *physical ambulance* with a number painted on it (`fleet_vehicles`). A unit has one at a time and it can be swapped mid-shift (`unit_vehicle_log`). **Inspections belong to the vehicle.** (Nov 22 design; it replaced an earlier `unit_vehicle_history` design from Nov 8 that no longer exists) |
+| **Fleet vehicle** | The *physical ambulance* with a number painted on it (`fleet_vehicles`). **A vehicle goes with the crew** (2026-11-25, from the owner): only a crewed unit can be given one, it is picked in OPS in the same moment as the crew, the picker offers only vehicles that are in service and not on another unit, and it is released automatically when the last person comes off an idle unit (history row "Crew taken off: vehicle released"). It can be swapped mid-shift (`unit_vehicle_log`). **Inspections belong to the vehicle.** (Nov 22 design; it replaced an earlier `unit_vehicle_history` design from Nov 8 that no longer exists) |
 | `vehicles` table | **Legacy name for the unit's definition** — it holds `unit_designation` and `capability_level`. Not the ambulance. Easy to confuse with `fleet_vehicles` |
 | **Crew seat** | `driver` or `non_driver`; at most 3 people per unit. An MVO always drives; an EMT/AEMT may drive on an ALS/CCT unit paired with a paramedic |
+| **Unit position** | There is no GPS tracking yet, so the map **infers** a position (on scene = at the pickup, transporting = half-way between pickup and drop-off, at destination = at the drop-off) and draws inferred positions **dashed**. A real fix newer than 5 minutes always wins; a crew member can opt in with "Share my location with dispatch" on the Field screen (the phone's browser location, at most every 10 s). Tracking tied to a **vehicle number** is R13 **[code]** |
 | **Staffing rule** | An ALS unit needs a paramedic to go in service; an EMT or MVO may ride with one. `reconcileUnit` keeps a unit's in-service state in step with its crew **[code, tested]** |
 | **Certification** | A database trigger refuses to seat crew with a missing or lapsed certification for the unit's level |
 | **Incident (call)** | `incident_type`: `emergency_911`, `ift_scheduled`, `ift_on_demand`, `mutual_aid`. `priority`: `critical`, `emergent`, `urgent`, `routine`. `capability_needed`: BLS/ALS/CCT. Has a scene and optional destination (a saved **facility** or free text) |
@@ -286,8 +288,8 @@ Every router except sign-in demands a valid session (`router.use(requireAuth)`);
 | Admin (`…_admin`) | `GET/POST /users`, `PATCH /users/:id`; `POST /units`, `PATCH/DELETE /units/:id`; `PATCH /vehicles/:id`; `POST /certification-types`, `POST /certifications`, `DELETE /certifications/:id` | ADMIN |
 | | `GET /ops/roster`, `PUT /crew/:id/unit`, `PATCH /crew/:id/seat` | STAFFING |
 | | `GET /geocode`, `GET /certification-types` | any role |
-| Fleet (`…_fleet`) | `GET /fleet`; `POST /fleet`, `PATCH/DELETE /fleet/:id` | any / ADMIN |
-| | `POST /fleet/:id/out-of-service`, `…/return-to-service`, `PUT /units/:id/vehicle` | STAFFING |
+| Fleet (`…_fleet`) | `GET /fleet` (`?available=1` = in service and not on a unit, which is what the OPS picker uses); `POST /fleet`, `PATCH/DELETE /fleet/:id` | any / ADMIN |
+| | `POST /fleet/:id/out-of-service`, `…/return-to-service`, `PUT /units/:id/vehicle` (409 unless the unit has crew; an out-of-service or already-used vehicle is refused; `null` takes it off) | STAFFING |
 | Inspections (`…_inspections`) | `GET /checklist`, `GET /unit-checks/status`, `POST /unit-checks` | any role (who may run which check is enforced inside) |
 | | `POST /checklist`, `PATCH /checklist/:id`, `POST /checklist/import`, `POST /unit-checks/inspection` | ADMIN |
 | Facilities (`…_facilities`) | `GET /facilities`; `POST /facilities`, `PATCH /facilities/:id` | any / ADMIN |
@@ -308,22 +310,22 @@ Every router except sign-in demands a valid session (`router.use(requireAuth)`);
 
 | Screen | File (lines) | Seen by | What it does |
 |---|---|---|---|
-| **Dispatch** | `dispatch_console.jsx` (1055) + `call_form.jsx`, `map_kit.jsx` | dispatcher, supervisor | Live call queue and unit board, new-call form and draft tray, assign/release/complete/cancel, map with address search, trip preview, optional traffic layer. Refreshes every 10 s. Has a demo mode |
-| **OPS** | `ops_console.jsx` (282) | dispatcher, supervisor, it_admin | Crew units: put people on units and seats, vehicles; refreshes every 15 s |
+| **Dispatch** | `dispatch_console.jsx` (1131) + `call_form.jsx`, `map_kit.jsx` | dispatcher, supervisor | Map on the left; on the right the **transport queue** and **unit board**, each a panel that scrolls inside itself (one screen tall on a desktop, so the page does not grow with the agency). Chips with counts narrow either list once it is long; available units sort first; a call already covered at the level it needs hides its extra "nearest additional unit" suggestion until it is opened, while a call lacking the level it needs keeps it; a unit picked on the map scrolls into view. New-call form and draft tray, assign/release/complete/cancel, address search, trip preview, optional traffic layer. Refreshes every 10 s. Has a demo mode |
+| **OPS** | `ops_console.jsx` (298) | dispatcher, supervisor, it_admin | Crew units: put people on units and seats. **The vehicle is picked here, like the crew:** a crewed unit with none shows "Which vehicle is this crew taking?" with a picker of free in-service vehicles; an empty unit shows no vehicle row (one still holding a vehicle can release it); "Switch vehicle" handles breakdowns. Refreshes every 15 s |
 | **Schedule** | `schedule_console.jsx` (185) | dispatcher, supervisor, it_admin | Shifts, with overlap warnings |
 | **Field Unit** | `field_unit_console.jsx` (476) | crew | Driven by `/auth/me`: your unit, your current call, status buttons, unit checks, shifts, profile and stats. Demo mode uses sample data only |
 | **ePCR** | `epcr_charting.jsx` (1091) | emt, aemt, paramedic | Patient chart: vitals, procedures, medications, narrative, disposition, submit. **Patient-identifying fields are not stored encrypted (§11, issue 11)** |
 | **QA/QI** | `qa_console.jsx` (142) | qa_qi | Review submitted charts, approve or send back |
 | **Reports** | `reports_console.jsx` (84) | supervisor, it_admin, compliance_officer, auditor | Response-time medians and 90th percentiles |
 | **Compliance** | `compliance_console.jsx` (352) | supervisor, compliance_officer, biller, auditor | Certifications and fleet are live. Per `backend/README.md`, *Investigations is demo data with no backing table* and **no screen shows the audit trail** although `GET /audit` exists **[docs — re-verify]** |
-| **Team** | `team_console.jsx` (682) | supervisor, it_admin | People (roles, field levels, certifications, password and 2-step resets), units, fleet vehicles, checklists, saved places |
+| **Team** | `team_console.jsx` (684) | supervisor, it_admin | People (roles, field levels, certifications, password and 2-step resets), units (a vehicle shows only while the unit is crewed; "Needs a vehicle" if crewed without one), fleet vehicles, checklists, saved places |
 | **Platform** | `platform_console.jsx` (148) | platform admin only | Companies and accounts; deliberately cannot read a call or a chart |
 
 ---
 
 ## 9. Testing
 
-### 9.1 Inventory **[verified 2026-11-23]**
+### 9.1 Inventory **[verified 2026-11-25]**
 
 | File | Tests | Covers |
 |---|---|---|
@@ -332,14 +334,15 @@ Every router except sign-in demands a valid session (`router.use(requireAuth)`);
 | `backend/tests/auth-admin.test.js` | 18 | two-step sign-in; multiple roles; staffing and seat rules; user editing and lists; unit checks by role; saved places; schedule; response report; unit rename/delete/retire; lockout after 8 bad passwords; resets; platform admin |
 | `backend/tests/geocode.test.js` | 6 | address labelling and ordering, with `fetch` mocked |
 | `backend/tests/dispatch-lifecycle.test.js` | 11 | Sprint 1 rules (assignment guard, races, status rules, board, closed-call refusal, timeline append-only). **In the `npm test` script since 2026-11-24; 11 / 11 pass (it was 1 / 11 before the restore)** |
-| `web/src/__tests__/render.test.jsx` | 55 | every console rendering and basic interaction in jsdom, sign-in, role routing |
+| `backend/tests/manning.test.js` | 3 | a vehicle goes with the crew: refused for an empty unit, the picker's list (in service and free only), released with a history row when the last person comes off; deactivating someone or taking them off the field puts the unit out of service; a mid-call unit is left alone; manual release |
+| `web/src/__tests__/render.test.jsx` | 62 | every console rendering and basic interaction in jsdom, sign-in, role routing; the OPS vehicle picker, Team vehicle labels, and the dispatch board's ordering, chips and collapse rules |
 
 ### 9.2 Blind spots — a green run does **not** prove these
 
 1. **The `npm test` script is a hand-written list of five files.** A new test file is not run until someone adds it — that is how the dispatch tests were dropped before (§11, issue 3). R3 replaces the list with a directory run.
 2. **Missing database grants** pass every test (§4.4).
 3. **Tests need a disposable server**: each suite runs `DROP SCHEMA public CASCADE` on `TEST_DATABASE_URL` and resets the cluster-wide `ems_app_runtime` password (§5.2).
-4. **No real browser or phone.** Web tests run in jsdom; Leaflet, OSRM, TomTom and print layouts are not exercised.
+4. **jsdom has no layout.** Layout was checked in the sandbox's Chromium (§9.4), not on real phones; OSRM, TomTom and print layouts are not exercised.
 5. **Geocoding is mocked.** The live Census and Nominatim services are never called by tests.
 6. **Vercel serverless mode** is only partly covered (some suites set `VERCEL=1`); the deployed topology is untested.
 7. **No continuous integration** — nothing runs the tests on a push (§11, issue 8).
@@ -370,6 +373,15 @@ cd ../web && npm test && npm run build
 
 Sandbox notes: `/bin/sh` is `dash` (use `bash` for scripts); background processes do not survive between tool calls; `https://api.github.com` is rate-limited for unauthenticated use; the chat's fetch tool cannot open `vercel.app` or `github.com` pages, so the live site cannot be checked from a chat.
 
+
+### 9.4 Visual check recipe **[verified 2026-11-25]**
+
+jsdom has no layout, so look at the screen. A Chromium build is **preinstalled** in the sandbox (`/opt/pw-browsers/chromium-*/chrome-linux64/chrome`); `npm i playwright-core` (npm works) drives it with `executablePath` and `--no-sandbox`. None of the scripts belong in the repo. The recipe that was used:
+
+1. Build a database from the current code (`npm run migrate`, `node scripts/upgrade.js`, `scripts/bootstrap.js`) and seed it **through the API** as the owner so every rule applies: units, fleet vehicles, people (`POST /users`), **paramedic certifications** (the database refuses to seat a paramedic on an ALS unit without a current ALS-level certification), crew (`PUT /crew/:id/unit`), vehicles (`PUT /units/:id/vehicle`), calls (`POST /incidents`, sending `lat`, `lon`, `destLat`, `destLon`), then assignments and status moves. Print **every** failure, not the tail of the log: a `tail` once hid that all paramedic placements had failed.
+2. Do everything in one script, because background processes die between tool calls: spawn `node server.js` as the `ems_app_runtime` login, serve `web/dist` from a tiny Node server that proxies `/api` to it, sign in through the real API (`/auth/login`, then `/auth/mfa/verify` with a code from `backend_mfa.js`; reset `mfa_last_step` to 0 first), and put the returned `{kind, token, expiresAt, user, agency}` into `localStorage["ems:session"]` with `addInitScript`.
+3. The sandbox cannot reach the internet: route the Leaflet CDN requests to the `leaflet` npm package and answer tile requests with a blank PNG.
+4. Screenshot at 1440×900 and 390×844 and read `document.documentElement.scrollHeight` (the dispatch page went 6307 px → 900 px on desktop and 8719 px → 2211 px on a phone). Drive flows with real clicks and check the database after each one.
 ---
 
 ## 10. Environment variables and secrets
@@ -401,42 +413,9 @@ Sandbox notes: `/bin/sh` is `dash` (use `bash` for scripts); background processe
 
 Priority: **P0** = unsafe or wrong behaviour in the dispatch path today · **P1** = fix soon, it will bite · **P2** = hygiene. Numbers are referenced from other sections — do not renumber; append new issues at the end and mark fixed ones in §15.
 
-### 1. Dispatch Reliability Sprint 1 was missing from the code — **restored 2026-11-24; awaiting confirmation on the live site**
+### 1. Dispatch Reliability Sprint 1 was missing from the code — **fixed; confirmed live by the owner 2026-11-25**
 
-**Status.** The restore is built, tested in a sandbox and delivered as an `ems-update.zip` (§15, 2026-11-24). **This issue stays open until the owner confirms on the live site:** `/api/health` shows `build` `10`, a test call can be created, and an available unit can be assigned to it. Then move it to §15 as fixed.
-
-**What was wrong at `c767532`** (all **[verified]** 2026-11-23, by the test file and by live probes):
-
-- the server accepted assigning an **out-of-service** unit to a call (HTTP 201);
-- **completing a call twice succeeded and rewrote `closed_at`**, which corrupts response-time data;
-- a unit with no call could be set straight to `on_scene` (HTTP 200);
-- there was no `GET /incidents/:id/events`, no `X-Server-Time` header and no `incidents.dispatched_at`;
-- the board was "newest 100", so an old open call could fall off it;
-- the table `incident_events` **did not exist in any database built through the pipeline**.
-
-`backend/tests/dispatch-lifecycle.test.js` showed it before the restore: **1 of 11 pass** (the one that passes is the unit double-booking race, which the database already prevents with a unique index). Test 10, "another company can't see…", fails at HEAD only at its first assertion, which calls the missing events endpoint — it is not an isolation breach (the isolation suite passes 18 / 18) and it passes once Sprint 1 is restored.
-
-**How it was lost** (from git history; commit messages are useless, so these are reconstructed from diffs):
-
-| Commit | Date | What happened |
-|---|---|---|
-| `1b0ecbb` | Nov 3 | Sprint 1 delivered: `backend_dispatch.js`, route changes, `upgrade_dispatch.js`, the test, `package.json` test list, `migrate.js` wiring |
-| `5720fca` | Nov 3 | The "reports + schedule" update overwrote `backend_routes_example.js`, `backend_routes_units.js`, `migrate.js` and `package.json` from a base that lacked Sprint 1 — **first silent loss** |
-| `8443a29` | Nov 8 | A zip re-applied Sprint 1, plus map/units/schedule work and a *different* per-unit vehicle design (`unit_vehicle_history`) |
-| `22ca61b` … `cc8205e` | Nov 8 | Manual uploads, apparently of files from a ZIP download of `5720fca` (a file named `EMS-5720fca….zip` was uploaded and deleted that day), reverted that update **wholesale**: Sprint 1 again, plus the unrelated map/units/schedule work, tests and consoles — **second loss**. The reason is not recorded (§14) |
-
-`backend/backend_dispatch.js` and `backend/scripts/upgrade_dispatch.js` were leftovers that nothing imported or ran. **No version of the workflow ever contained an `upgrade_dispatch.js` step**, although the old Sprint 1 document said it did.
-
-**What the restore consisted of** — only the Sprint 1 delta, merged onto the current code, never whole files from old commits (the Nov 8 files carry the discarded vehicle design and would collide with `fleet_vehicles`):
-
-1. `git diff 0375503 1b0ecbb` for `backend_routes_example.js`, `backend_routes_units.js`, `migrate.js` and `package.json`, merged three-way onto `69d4b37`. The first three applied cleanly (the newer `GET /units` with fleet-vehicle fields was kept); in `package.json` the test list gained `tests/dispatch-lifecycle.test.js`.
-2. `scripts/upgrade.js` now imports and runs `UPGRADE_DISPATCH_SQL` right after `UPGRADE_SQL`. **This is the line that matters in production:** on an existing database the workflow runs only `upgrade.js`, so without it `incident_events` is never created.
-3. `tests/dispatch-lifecycle.test.js`: the two expected permission failures are wrapped in `SAVEPOINT` / `ROLLBACK TO SAVEPOINT`. Before, the second statement failed with "current transaction is aborted" instead of "permission denied" — a **test bug**; the application was right.
-4. `server.js`: `build` 9 → 10. `docs/DISPATCH_SPRINT1.md` rewritten to say what is true. This file updated.
-
-**Verified in the sandbox 2026-11-24:** backend `npm test` **85 / 85** (74 existing + 11); web 55 / 55 and build OK; a database built from `69d4b37` (no `incident_events`) upgraded with **only** `node scripts/upgrade.js` from the new build gets the table with row-level security, the `tenant_isolation` policy and INSERT/SELECT-only for the app login, re-runs cleanly, and keeps its data; a live server on that database passed **20 / 20** probes — an unavailable unit is refused, a unit with no call cannot go on scene, the status chain moves forward, "Available" mid-call is refused with a plain message, clearing from at destination frees the unit and leaves the call open, a second complete and a cancel-after-close are refused with `closed_at` unchanged, `dispatched_at` is stamped, the timeline is in order, `X-Server-Time` is present.
-
-**Not verified:** the live site (deploy, Neon, Actions); any console in a real browser or on a phone against the new refusals (**[code]**: the dispatch board and the field screen both show the server's message instead of faking a result); the dispatch-console follow-ups (R6) are still to do. **Behaviour changes** to expect are listed in `docs/DISPATCH_SPRINT1.md` — notably a unit must be staffed into service before it can be assigned, and a crew pressing Available before "at destination" is refused. **Creating a call now also writes a timeline row, so a call cannot be created until the database step has run** (issue 15). This restore does **not** fix issue 2.
+Restored by the `ems-update.zip` of 2026-11-24 (applied as commit `b491bbb`). **Owner confirmation, 2026-11-25:** `/api/health` showed `build` 10, a test call could be created, and a unit could be assigned to it. For history: Sprint 1 was delivered 2026-11-03 (`1b0ecbb`), silently overwritten the same day (`5720fca`), re-applied 2026-11-08 (`8443a29`) and rolled back by hand the same day (`22ca61b` … `cc8205e`) — Appendix A has the dates, §13 lessons 1, 2 and 9 the causes, and `docs/DISPATCH_SPRINT1.md` the rules and behaviour changes. The restore was the Sprint 1 delta merged onto the current code; `scripts/upgrade.js` applying `upgrade_dispatch.js` (the line that matters in production, because the workflow runs only `upgrade.js` on an existing database); a fix to a test bug (`SAVEPOINT`s); and `build` 9 → 10. Before shipping it passed 85 / 85 backend tests, a production-style upgrade of an existing database, and a 20 / 20 live probe in the sandbox. **Still open from Sprint 1:** the dispatch-console follow-ups (R6) and role checks on the dispatch routes (issue 2).
 
 ### 2. The server does not enforce who may dispatch — **P0, authorization**
 
@@ -503,7 +482,11 @@ The session token lives in `localStorage["ems:session"]` (readable by any script
 
 The workflow pushes the zip's files first (Vercel starts deploying at once) and runs the database step afterwards. For a short window — a minute or two, longer if the database step fails — new code can run against the old schema. With Sprint 1 restored, `POST /incidents` writes a timeline row, so **a call cannot be created until `incident_events` exists**; assigning, releasing, completing and cancelling fail the same way. **[verified 2026-11-24]** against a database without the table: `/api/health` returned 200 with `build` 10, reads worked, and creating a call returned HTTP 500 "Internal server error" with `relation "incident_events" does not exist` in the log; the failed request rolled back cleanly (no half-saved call). **A health check therefore cannot prove this deploy** — the owner's check is to create a test call (§4.2).
 
-This is very likely the failure the earlier Sprint 1 deliveries had: their routes wrote to a table the workflow never created **[hypothesis — §14, question 1]**. Mitigations now: run the workflow with "Set up / upgrade the database too" ticked, wait for the green tick before using the board, roll back in Vercel if calls fail (§4.5). Fixes (R5, workflow edits made by the owner in the GitHub UI): run the database upgrade *before* the commit and push, and have `/api/health` report whether the schema is current (for example whether `incident_events` exists).
+This is very likely the failure the earlier Sprint 1 deliveries had: their routes wrote to a table the workflow never created **[hypothesis — §14, question 1]**. Mitigations now: run the workflow with "Set up / upgrade the database too" ticked, wait for the green tick before using the board, roll back in Vercel if calls fail (§4.5). Fixes (R5, workflow edits made by the owner in the GitHub UI): run the database upgrade *before* the commit and push, and have `/api/health` report whether the schema is current (for example whether `incident_events` exists). The 2026-11-24 restore went out following those steps, and creating a call worked afterwards (owner, 2026-11-25).
+
+### 16. A unit whose crew came off mid-call comes back "available" with nobody aboard — **P2**
+
+**[verified 2026-11-25]** Sandbox probe: a crewed unit holding a vehicle is assigned to a call; its crew is taken off mid-call (allowed — OPS says "On a call. Crew changes apply immediately"); the call is completed. Result: `complete` returned 200, the unit is **`available` with 0 crew and still holding its vehicle**, and a dispatcher can **assign it to a new call (HTTP 201)**. Cause: `reconcileUnit` deliberately leaves mid-call units alone, nothing re-evaluates a unit when a call frees it, and the assignment guard checks status, not crew (`docs/DISPATCH_SPRINT1.md` explains why: existing tests assign uncrewed seeded units). Fix path (R14): after a call frees a unit (complete, cancel, release, "available" from at destination) re-run the crew and vehicle reconcile so an empty unit goes out of service and releases its vehicle; the tests that seed uncrewed `available` units must crew them first. Workaround today: OPS shows "Release vehicle" on a crewless unit that still holds one, and a dispatcher can set the unit out of service.
 
 ---
 
@@ -515,7 +498,7 @@ Sources: the repo's own documents **[docs]** and what was verified on 2026-11-23
 
 | # | Item | Why | Done when | Size |
 |---|---|---|---|---|
-| **R1** | **Restore Dispatch Sprint 1** (issue 1) | A dispatcher could send an out-of-service unit and close a call twice | **Delivered 2026-11-24** as an `ems-update.zip` (85 / 85 in the sandbox). **Done when the owner confirms live:** `/api/health` shows `build` 10, a test call can be created and an available unit assigned, and the timeline endpoint answers | S |
+| **R1** | **Restore Dispatch Sprint 1** (issue 1) | A dispatcher could send an out-of-service unit and close a call twice | **Done.** Delivered 2026-11-24; the owner confirmed it live on 2026-11-25 (`build` 10, a test call created, a unit assigned) | — |
 | **R2** | **Enforce roles on dispatch routes** (issue 2) | Any signed-in role can create, assign and complete calls | Matrix agreed with the owner and written into §7; a negative test per role passes; read access to patient/contact fields decided | M |
 | **R3** | **Complete the test list and add CI** (issues 3, 8) | A green run hid a broken dispatch path | `npm test` runs every file in `tests/`; a workflow with a PostGIS service container runs backend tests, web tests and the build on every push (uploaded through the GitHub UI) | M |
 | **R4** | **Refresh the documentation** (issue 4) | New chats and people are misled by three-week-old claims | `README.md` short, accurate and linking here; `DEPLOYMENT.md` and `backend/README.md` match §4 and §10; `backend/.env.example` exists; compose fixed or removed; `.gitignore` gains `node_modules/` and `dist/`; stale comments fixed | S |
@@ -525,13 +508,15 @@ Sources: the repo's own documents **[docs]** and what was verified on 2026-11-23
 
 | # | Item | Notes | Size |
 |---|---|---|---|
-| **R6** | **Dispatch console reliability UI** | From Sprint 1's "not done": stale-data indicator using `X-Server-Time`, double-submit locks on assign/complete/cancel, remove the dead capability heuristic, show the server's refusal messages. **Test in a real browser and on a phone** — no such test exists | M |
+| **R6** | **Dispatch console reliability UI** | From Sprint 1's "not done": stale-data indicator using `X-Server-Time`, double-submit locks on assign/complete/cancel, remove the dead capability heuristic, show the server's refusal messages. **Test in a real browser and on a phone** — no such test exists Partly done 2026-11-25: the queue and unit board are bounded, filterable panes and the layout was checked in a real Chromium; the stale indicator, double-submit locks and capability heuristic remain. | M |
 | **R7** | **Reports from the call timeline** | Compute dispatch/turnout/travel/response from `incident_events` and `dispatched_at` instead of inferring them from status taps; add a per-call timeline view | M |
 | **R8** | **Audit-trail screen** and a decision on the demo-data *Investigations* tab | `GET /audit` and `/audit/verify` exist; no screen shows them **[docs]** | M |
 | **R9** | **Real-time decision** (issue 10) | Managed pub/sub, a separate always-on Node host, or keep polling with the stale indicator | S to decide, L to build |
 | **R10** | **Mutual-aid screen and wiring** | Grant routes exist; there is no console, and the socket rooms are not connected to the grant routes **[docs]** | M |
 | **R11** | **Protect the secret** (issue 6) | Separate `MFA_ENCRYPTION_KEY` with key versions so a rotation does not lock everyone out | M |
 | **R12** | **Replace public free geo services** (issue 9) | A paid or self-hosted tile, routing and geocoding provider; caching; visible fallback | M |
+| **R13** | **Vehicle-bound location** | Today a unit's position is inferred (drawn dashed) unless a crew member opts in on the Field screen. A tracker — a tablet, a phone or an AVL box — assigned to a **vehicle number** fits the new rule that a vehicle goes with the crew: the unit's position becomes its current vehicle's device position, so swaps and crew changes need no extra step. Needs a device registration step, a device credential (not a person's sign-in), a location endpoint keyed by vehicle, and the map reading the position through the unit's current vehicle | L |
+| **R14** | **Reconcile units when a call frees them** (issue 16) | An empty unit must not come back as available or keep a vehicle. Done when the "crew came off mid-call" probe returns an out-of-service unit with its vehicle released, and the tests that seed uncrewed units crew them first | M |
 
 ### Later — from the master plan **[docs]**, only after the patient-data decisions in issue 11
 
@@ -556,6 +541,8 @@ PHI field encryption with key management · signature capture on object storage 
 9. **Honest status labelling** in every document; same wording for any failure that could reveal whether an account exists.
 10. **`/api/health` carries a hand-bumped `build` number** so a deploy can be proven (history: 3 → 5 → 6 → 7 → 8 → 9).
 11. **Free public map and geocoding services for now** (zero cost, zero setup) — a conscious trade-off recorded as issue 9.
+12. **A vehicle goes with the crew** (2026-11-25, from the owner). A unit has no vehicle of its own: OPS picks one when the unit is crewed (only vehicles in service and free are offered), the server refuses one for an empty unit, and it is released when the last person comes off an idle unit. Whether a crewed unit with no vehicle may still go in service is open (§14).
+13. **Dispatch lists are bounded panes** (2026-11-25, from the owner's feedback). Each list scrolls inside its own panel; nothing is hidden by default; chips show counts; a safety hint (a call lacking the capability it needs) is never collapsed.
 
 ### Lessons from the project's own history
 
@@ -568,22 +555,23 @@ PHI field encryption with key management · signature capture on object storage 
 7. From `backend/README.md`: *a fix that exists only in a running environment is not safe until it is committed somewhere durable*, and *a test that leaks a database connection when it fails does not fail — it hangs*.
 8. **Very large files are the riskiest to replace whole** (`dispatch_console.jsx` 1,055 lines, `epcr_charting.jsx` 1,091). Prefer targeted edits.
 9. **Ship the schema before, or together with, the code that needs it — and prove it on an existing database** (§9.3). The earlier Sprint 1 deliveries wired routes to a table the workflow never created, and a green health check cannot reveal that (issue 15).
+10. **Look at the screen.** A real Chromium run on a seeded agency turned "a lot of scrolling" into numbers (7.0 → 1.0 screens) and caught defects the tests could not: a literal "null -" in the crew line and a 43 px overflow from `min-h-screen` sitting under a navigation bar (§9.4).
 
 ---
 
 ## 14. Open questions for the owner
 
-Ask these once, then record the answers in §15 and remove the question. Items 1–3 change what a chat should do next.
+Ask these once, then record the answers in §15 and remove the question. Items 1–2 change what a chat should do next.
 
 1. **Why was the Nov 8 update rolled back** (`22ca61b` … `cc8205e`)? What broke? It decides whether anything from `8443a29` (map/unit/schedule changes) should return, and whether the Sprint 1 restore is safe to ship on top of what is live. **Hypothesis to confirm or reject:** the Sprint 1 routes write to `incident_events`, a table the workflow never created, so creating a call would have failed live (reproduced in the sandbox as HTTP 500). If that is what you saw, the 2026-11-24 restore is built to avoid it (issue 15). **[owner]**
-2. **What does `https://ems-delta-indol.vercel.app/api/health` show right now** (`build` should be `9` before the 2026-11-24 restore is applied and `10` after; `sessionSecret` should be `valid`)? Did the last "Update and set up" run finish green? **[owner]** A chat cannot see the live site, Vercel, Neon or Actions.
-3. **Is this a demo or pilot with invented data, or will real patient or staff data go in?** (Issue 11 and R2 depend on it.)
-4. **Is there an `AGENTS.md` outside the repo?** The old Sprint 1 document cited its section 3 ("status key"). If yes, commit it or paste it; its rules should be merged into §1.
-5. **Which environment variables and secrets are actually set** in Vercel and GitHub (§10) — in particular `GEOCODE_ENABLED`, `ALLOWED_ORIGIN`, `VITE_TOMTOM_KEY`? Which Vercel and Neon plans are in use?
-6. **Who may do what on dispatch?** Confirm or edit the matrix in §11, issue 2.
-7. **Should the repository stay public?** (Nothing secret is committed, but the platform handles safety-critical workflows and the plan is to hold patient data.)
-8. **Is polling every 10 s acceptable for dispatch, or is true real-time push a requirement?** (R9.)
-9. **Do you want informative commit messages?** The GitHub upload box takes a one-line description; the chat can supply the text to paste.
+2. **Is this a demo or pilot with invented data, or will real patient or staff data go in?** (Issue 11 and R2 depend on it.)
+3. **Is there an `AGENTS.md` outside the repo?** The old Sprint 1 document cited its section 3 ("status key"). If yes, commit it or paste it; its rules should be merged into §1.
+4. **Which environment variables and secrets are actually set** in Vercel and GitHub (§10) — in particular `GEOCODE_ENABLED`, `ALLOWED_ORIGIN`, `VITE_TOMTOM_KEY`? Which Vercel and Neon plans are in use?
+5. **Who may do what on dispatch?** Confirm or edit the matrix in §11, issue 2.
+6. **Should the repository stay public?** (Nothing secret is committed, but the platform handles safety-critical workflows and the plan is to hold patient data.)
+7. **Is polling every 10 s acceptable for dispatch, or is true real-time push a requirement?** (R9.)
+8. **Do you want informative commit messages?** The GitHub upload box takes a one-line description; the chat can supply the text to paste.
+9. **Should a crewed unit with no vehicle be blocked from going in service?** Today it can: "Crew units as scheduled" crews units without choosing vehicles, so a hard rule would leave them out of service until someone picks one. A hard rule is safer for dispatch (a unit with no truck cannot respond) but adds a step to every scheduled crewing.
 
 ---
 
@@ -591,7 +579,9 @@ Ask these once, then record the answers in §15 and remove the question. Items 1
 
 | Date | Commit | Entry |
 |---|---|---|
-| 2026-11-24 | `69d4b37` (baseline) | **R1 delivered as `ems-update.zip`** — Dispatch Sprint 1 restored on top of the current code (§11, issue 1): the Sprint 1 delta merged into `backend_routes_example.js`, `backend_routes_units.js`, `migrate.js` and `package.json`; `scripts/upgrade.js` now applies `upgrade_dispatch.js`; the savepoint test bug fixed; `build` 9 → 10; `docs/DISPATCH_SPRINT1.md` and this file corrected. **Verified in the sandbox:** backend 85 / 85; web 55 / 55 and build OK; a production-style upgrade of a `69d4b37` database; a live probe 20 / 20; and the new code on an un-upgraded database fails call creation with HTTP 500 while `/api/health` stays green (issue 15). **Not verified: the live site** — pending the owner applying the zip. Still open: issue 2 (no role checks on dispatch), issue 15, R2–R5. `HANDOFF.md` itself was uploaded as `69d4b37` |
+| 2026-11-25 | `b491bbb` (baseline) | **Delivered as `ems-update.zip` (`build` 11), awaiting the owner to apply.** (1) *A vehicle goes with the crew:* the server refuses a vehicle for an empty unit; the last person coming off releases it (logged); OPS picks the vehicle inline (only free in-service vehicles); Team no longer shows empty units as "No vehicle"; the scheduled-crewing summary says how many crewed units still need one. (2) *Bug fixed:* deactivating someone, or taking them off the field, left their unit **available** with nobody aboard — it is now re-evaluated (out of service, vehicle released). (3) *Dispatch board:* the queue and unit board are bounded panes with filter chips and counts, available units first, compact rows, covered calls collapse their extra suggestion, a unit picked on the map scrolls into view; the page is exactly one screen on a desktop. (4) New `manning.test.js` (3) and 7 new web tests; one existing backend test now crews Rig 9 first. **Verified in the sandbox:** backend 88 / 88; web 62 / 62 and build OK; the new tests fail on the old code (checked); real Chromium on a seeded 28-unit / 24-call agency: dispatch page 7.0 → 1.0 screens (phone 10.3 → 2.6), picker contents, pick and release checked in the database, map tap scrolls its row into view. **Not verified:** the live site, real phones, an agency with real data. **Found, not fixed:** issue 16. **No database change** in this release |
+| 2026-11-25 | `b491bbb` | **The owner confirmed the 2026-11-24 restore live:** `build` 10, a test call created, a unit assigned (issue 1 fixed; the build-ordering risk in issue 15 stays open until R5). The owner's feedback that led to the delivery above: positions are estimated between pickup and drop-off until vehicle-bound devices exist (R13); the transport queue and unit board were too long to scan (dispatch board); vehicles should belong to a unit only while OPS has crewed it, be picked there, and never be offered when out of service (a vehicle goes with the crew) |
+| 2026-11-24 | `69d4b37` (baseline) | **R1 delivered as `ems-update.zip`** — Dispatch Sprint 1 restored on top of the current code (§11, issue 1): the Sprint 1 delta merged into `backend_routes_example.js`, `backend_routes_units.js`, `migrate.js` and `package.json`; `scripts/upgrade.js` now applies `upgrade_dispatch.js`; the savepoint test bug fixed; `build` 9 → 10; `docs/DISPATCH_SPRINT1.md` and this file corrected. **Verified in the sandbox:** backend 85 / 85; web 55 / 55 and build OK; a production-style upgrade of a `69d4b37` database; a live probe 20 / 20; and the new code on an un-upgraded database fails call creation with HTTP 500 while `/api/health` stays green (issue 15). **Not verified: the live site** — pending the owner applying the zip (**confirmed live on 2026-11-25** — see the entry above). Still open: issue 2 (no role checks on dispatch), issue 15, R2–R5. `HANDOFF.md` itself was uploaded as `69d4b37` |
 | 2026-11-23 | `c767532` (baseline) | **HANDOFF.md created** by a Claude chat; it is the only addition — **no application code was changed.** Verified in a sandbox (Node 22.23, PostgreSQL 16.15 + PostGIS 3.4.2): backend `npm test` 74 / 74; `dispatch-lifecycle` 1 / 11; web tests 55 / 55; web build OK; fresh-database migrate → upgrade ×2 → bootstrap ×2 OK; live smoke test 13 / 13 including MFA sign-in; `npm audit` clean. Found: Sprint 1 missing and lost twice (issue 1) with a verified recovery path giving 85 / 85; no role enforcement on dispatch writes (issue 2); stale docs and a missing `.env.example` (issue 4); pipeline traps (issue 5). Not verified: anything live (Vercel, Neon, Actions). Open questions in §14 |
 
 ---
@@ -612,6 +602,9 @@ Ask these once, then record the answers in §15 and remove the question. Items 1
 | 2026-11-22 | `902f7c4` … `c767532` | Zip deleted; files uploaded by hand: Census-first geocoding with precision, fleet vehicles and swaps (`fleet_vehicles`), rewritten inspections, map kit, Team and OPS updates. `build: 9`. The last five commits are empty |
 | 2026-11-24 | `69d4b37` | `HANDOFF.md` added |
 | 2026-11-24 | (restore zip) | Dispatch Sprint 1 restored; `build: 10` — delivered as `ems-update.zip`, awaiting live confirmation |
+| 2026-11-24 | `c8154a3` | The restore zip uploaded by the owner |
+| 2026-11-25 | `b491bbb` | Workflow "Apply update": the restore is live (`build: 10`) |
+| 2026-11-25 | (this delivery) | A vehicle goes with the crew; one-screen dispatch board; deactivation fix; `build: 11` — awaiting the owner to apply |
 
 ## Appendix B — Delivery checklist (copy into your reply and tick it)
 

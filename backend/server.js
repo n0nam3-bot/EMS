@@ -94,7 +94,7 @@ if (!ON_VERCEL) {
 }
 
 // Before the routers: they require a login, health must not.
-app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok", build: 10, jwtKey: publicKeyStatus(), sessionSecret: sessionSecretStatus() }));
+app.get(["/health", "/api/health"], (req, res) => res.json({ status: "ok", build: 11, jwtKey: publicKeyStatus(), sessionSecret: sessionSecretStatus() }));
 
 // Sign-in first: every router below demands a session, login is the one thing that can't.
 app.use("/api", authRoutes);

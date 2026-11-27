@@ -4,6 +4,8 @@
 // time. Dispatchers and supervisors can swap it from OPS when a vehicle breaks down or is in an
 // accident, and the unit stays active: the crew moves to another vehicle, the old one is marked
 // out of service with the reason, and the new vehicle gets its own vehicle check.
+// A vehicle goes with the crew: only a manned unit can be given one, and it is released again when
+// the last person comes off the unit (see reconcileUnit in backend_routes_admin.js).
 // -----------------------------------------------------------------------
 
 import express from "express";
@@ -131,6 +133,8 @@ router.put("/units/:id/vehicle", STAFFING, handle(async (req, res) => {
     if (!unit) fail(404, "Unit not found");
     if ((unit.fleet_vehicle_id || null) === (fleetVehicleId || null)) fail(400, "The unit already has that vehicle");
     if (fleetVehicleId) {
+      const aboard = Number((await c.query("SELECT count(*) AS n FROM unit_crew_assignments WHERE unit_id = $1 AND assigned_to IS NULL", [req.params.id])).rows[0].n);
+      if (aboard === 0) fail(409, `Put crew on ${unit.unit_designation} first. A vehicle goes with the crew.`);
       const f = (await c.query("SELECT vehicle_number, status, retired_at FROM fleet_vehicles WHERE fleet_vehicle_id = $1", [fleetVehicleId])).rows[0];
       if (!f || f.retired_at) fail(404, "Vehicle not found");
       if (f.status !== "in_service") fail(409, `Vehicle ${f.vehicle_number} is out of service. Return it to service first.`);
